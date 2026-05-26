@@ -52,6 +52,8 @@ class ParsedUpload:
 class ListAssetsQuery(BaseModel):
     include_tags: list[str] = Field(default_factory=list)
     exclude_tags: list[str] = Field(default_factory=list)
+    asset_type: Literal["model", "input", "output", "temp"] | None = None
+    model_folder: str | None = None
     name_contains: str | None = None
 
     # Accept either a JSON string (query param) or a dict
@@ -80,6 +82,20 @@ class ListAssetsQuery(BaseModel):
                     out.extend([t.strip() for t in item.split(",") if t.strip()])
             return out
         return v
+
+    @field_validator("model_folder", mode="before")
+    @classmethod
+    def _normalize_model_folder(cls, v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @model_validator(mode="after")
+    def _validate_path_filters(self):
+        if self.model_folder and self.asset_type != "model":
+            raise ValueError("model_folder can only be used with asset_type=model")
+        return self
 
     @field_validator("metadata_filter", mode="before")
     @classmethod
@@ -300,14 +316,23 @@ class UploadAssetSpec(BaseModel):
         else:
             return []
 
-        # normalize + dedupe
+        # Normalize the root tag, but preserve path/destination components. Tags
+        # are normalized again before storage; this parser also feeds upload
+        # destination routing where registered model folder names are exact.
+        normalized_items: list[str] = []
+        for index, item in enumerate(items):
+            stripped = str(item).strip()
+            if not stripped:
+                continue
+            normalized_items.append(stripped.lower() if index == 0 else stripped)
+
+        # Dedupe exact tokens while preserving order.
         norm = []
         seen = set()
-        for t in items:
-            tnorm = str(t).strip().lower()
-            if tnorm and tnorm not in seen:
-                seen.add(tnorm)
-                norm.append(tnorm)
+        for token in normalized_items:
+            if token not in seen:
+                seen.add(token)
+                norm.append(token)
         return norm
 
     @field_validator("user_metadata", mode="before")

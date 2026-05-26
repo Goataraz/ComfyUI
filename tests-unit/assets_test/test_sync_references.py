@@ -23,8 +23,58 @@ from app.assets.database.queries.asset_reference import (
     get_unenriched_references,
     restore_references_by_paths,
 )
-from app.assets.scanner import sync_references_with_filesystem
+from app.assets.scanner import (
+    collect_paths_for_roots,
+    get_all_known_prefixes,
+    sync_references_with_filesystem,
+)
 from app.assets.services.file_utils import get_mtime_ns
+
+
+def test_collect_paths_for_roots_deduplicates_overlapping_roots(tmp_path: Path):
+    model_file = tmp_path / "output" / "checkpoints" / "saved.safetensors"
+    model_file.parent.mkdir(parents=True)
+    model_file.write_bytes(b"model")
+
+    with (
+        patch("app.assets.scanner.collect_models_files", return_value=[str(model_file)]),
+        patch(
+            "app.assets.scanner.list_files_recursively",
+            return_value=[str(model_file)],
+        ),
+        patch("app.assets.scanner.folder_paths") as mock_folder_paths,
+    ):
+        mock_folder_paths.get_output_directory.return_value = str(tmp_path / "output")
+
+        paths = collect_paths_for_roots(("models", "output"))
+
+    assert paths == [str(model_file)]
+
+
+def test_all_known_prefixes_include_temp_root(tmp_path: Path):
+    models_dir = tmp_path / "models" / "checkpoints"
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    temp_dir = tmp_path / "temp"
+    for directory in (models_dir, input_dir, output_dir, temp_dir):
+        directory.mkdir(parents=True)
+
+    with (
+        patch("app.assets.scanner.get_comfy_models_folders", return_value=[("checkpoints", [str(models_dir)])]),
+        patch("app.assets.scanner.folder_paths") as mock_folder_paths,
+    ):
+        mock_folder_paths.get_input_directory.return_value = str(input_dir)
+        mock_folder_paths.get_output_directory.return_value = str(output_dir)
+        mock_folder_paths.get_temp_directory.return_value = str(temp_dir)
+
+        prefixes = get_all_known_prefixes()
+
+    assert prefixes == [
+        str(models_dir),
+        str(input_dir),
+        str(output_dir),
+        str(temp_dir),
+    ]
 
 
 @pytest.fixture
@@ -97,6 +147,40 @@ def _ensure_missing_tag(session: Session):
     if not session.get(Tag, "missing"):
         session.add(Tag(name="missing", tag_type="system"))
         session.flush()
+
+
+def test_sync_reclassifies_existing_references_for_registered_model_roots(
+    session: Session, temp_dir: Path
+):
+    model_dir = temp_dir / "models" / "checkpoints"
+    model_path = _create_file(model_dir, "saved.safetensors")
+    _make_asset(
+        session,
+        "asset-1",
+        model_path,
+        "ref-1",
+        mtime_ns=_stat_mtime_ns(model_path),
+    )
+    session.commit()
+
+    registered = [("checkpoints", [str(model_dir)])]
+    with (
+        patch("app.assets.scanner.get_comfy_models_folders", return_value=registered),
+        patch(
+            "app.assets.services.path_utils.get_comfy_models_folders",
+            return_value=registered,
+        ),
+    ):
+        survivors = sync_references_with_filesystem(
+            session, "models", collect_existing_paths=True
+        )
+        session.commit()
+
+    ref = session.get(AssetReference, "ref-1")
+    assert survivors == {model_path}
+    assert ref is not None
+    assert ref.asset_type == "model"
+    assert ref.model_folder == "checkpoints"
 
 
 class _VerifyCase:

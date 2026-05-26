@@ -255,6 +255,31 @@ class TestMarkReferencesMissingOutsidePrefixes:
 
         assert marked == 0
 
+    def test_prefix_matching_is_case_exact(self, session: Session, tmp_path):
+        asset = _make_asset(session, "hash1")
+        valid_dir = tmp_path / "models" / "checkpoints"
+        case_sibling_dir = tmp_path / "MODELS" / "checkpoints"
+        valid_dir.mkdir(parents=True)
+        case_sibling_dir.mkdir(parents=True)
+
+        valid_path = str(valid_dir / "file.bin")
+        case_sibling_path = str(case_sibling_dir / "file.bin")
+
+        _make_reference(session, asset, valid_path, name="valid")
+        _make_reference(session, asset, case_sibling_path, name="case_sibling")
+        session.commit()
+
+        marked = mark_references_missing_outside_prefixes(session, [str(valid_dir)])
+        session.commit()
+
+        assert marked == 1
+        valid_ref = session.query(AssetReference).filter_by(file_path=valid_path).one()
+        case_sibling_ref = (
+            session.query(AssetReference).filter_by(file_path=case_sibling_path).one()
+        )
+        assert valid_ref.is_missing is False
+        assert case_sibling_ref.is_missing is True
+
 
 class TestGetUnreferencedUnhashedAssetIds:
     def test_returns_unreferenced_unhashed_assets(self, session: Session):

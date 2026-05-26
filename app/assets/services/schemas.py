@@ -21,6 +21,8 @@ class ReferenceData:
     id: str
     name: str
     file_path: str | None
+    asset_type: str | None
+    model_folder: str | None
     user_metadata: UserMetadata
     preview_id: str | None
     created_at: datetime
@@ -93,6 +95,8 @@ def extract_reference_data(ref: AssetReference) -> ReferenceData:
         id=ref.id,
         name=ref.name,
         file_path=ref.file_path,
+        asset_type=ref.asset_type,
+        model_folder=ref.model_folder,
         user_metadata=ref.user_metadata,
         preview_id=ref.preview_id,
         system_metadata=ref.system_metadata,

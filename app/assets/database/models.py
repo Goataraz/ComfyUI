@@ -76,6 +76,8 @@ class AssetReference(Base):
 
     # Cache state fields (from former AssetCacheState)
     file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    asset_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model_folder: Mapped[str | None] = mapped_column(String(512), nullable=True)
     mtime_ns: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     needs_verify: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_missing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -144,6 +146,8 @@ class AssetReference(Base):
         Index("uq_asset_references_file_path", "file_path", unique=True),
         Index("ix_asset_references_asset_id", "asset_id"),
         Index("ix_asset_references_owner_id", "owner_id"),
+        Index("ix_asset_references_asset_type", "asset_type"),
+        Index("ix_asset_references_model_folder", "model_folder"),
         Index("ix_asset_references_name", "name"),
         Index("ix_asset_references_is_missing", "is_missing"),
         Index("ix_asset_references_enrichment_level", "enrichment_level"),

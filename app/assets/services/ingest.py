@@ -31,6 +31,7 @@ from app.assets.services.bulk_ingest import batch_insert_seed_assets
 from app.assets.services.file_utils import get_size_and_mtime_ns
 from app.assets.services.path_utils import (
     compute_relative_filename,
+    get_asset_path_info,
     get_name_and_tags_from_asset_path,
     resolve_destination_from_tags,
     validate_path_within_base,
@@ -70,6 +71,14 @@ def _ingest_file_from_path(
     reference_id: str | None = None
 
     with create_session() as session:
+        try:
+            path_info = get_asset_path_info(locator)
+            asset_type = path_info.asset_type
+            model_folder = path_info.model_folder
+        except ValueError:
+            asset_type = None
+            model_folder = None
+
         if preview_id:
             if not reference_exists(session, preview_id):
                 preview_id = None
@@ -88,6 +97,8 @@ def _ingest_file_from_path(
             name=info_name or os.path.basename(locator),
             mtime_ns=mtime_ns,
             owner_id=owner_id,
+            asset_type=asset_type,
+            model_folder=model_folder,
         )
 
         # Get the reference we just created/updated
@@ -186,6 +197,13 @@ def ingest_existing_file(
             now = get_utc_now()
             existing_ref.mtime_ns = mtime_ns
             existing_ref.job_id = job_id
+            try:
+                path_info = get_asset_path_info(locator)
+                existing_ref.asset_type = path_info.asset_type
+                existing_ref.model_folder = path_info.model_folder
+            except ValueError:
+                existing_ref.asset_type = None
+                existing_ref.model_folder = None
             existing_ref.is_missing = False
             existing_ref.deleted_at = None
             existing_ref.updated_at = now

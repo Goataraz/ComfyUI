@@ -20,6 +20,7 @@ from app.assets.database.queries import (
     restore_references_by_paths,
 )
 from app.assets.helpers import get_utc_now
+from app.assets.services.path_utils import get_asset_path_info
 
 if TYPE_CHECKING:
     from app.assets.services.metadata_extract import ExtractedMetadata
@@ -56,6 +57,8 @@ class ReferenceRow(TypedDict):
     id: str
     asset_id: str
     file_path: str
+    asset_type: str | None
+    model_folder: str | None
     mtime_ns: int
     owner_id: str
     name: str
@@ -125,6 +128,18 @@ def batch_insert_seed_assets(
     if not specs:
         return BulkInsertResult(inserted_refs=0, won_paths=0, lost_paths=0)
 
+    deduped_specs: list[SeedAssetSpec] = []
+    seen_paths: set[str] = set()
+    for spec in specs:
+        absolute_path = os.path.abspath(spec["abs_path"])
+        if absolute_path in seen_paths:
+            continue
+        seen_paths.add(absolute_path)
+        deduped_specs.append(spec)
+    specs = deduped_specs
+    if not specs:
+        return BulkInsertResult(inserted_refs=0, won_paths=0, lost_paths=0)
+
     current_time = get_utc_now()
     asset_rows: list[AssetRow] = []
     reference_rows: list[ReferenceRow] = []
@@ -140,6 +155,13 @@ def batch_insert_seed_assets(
         path_to_asset_id[absolute_path] = asset_id
 
         mime_type = spec.get("mime_type")
+        try:
+            path_info = get_asset_path_info(absolute_path)
+            asset_type = path_info.asset_type
+            model_folder = path_info.model_folder
+        except ValueError:
+            asset_type = None
+            model_folder = None
         asset_rows.append(
             {
                 "id": asset_id,
@@ -164,6 +186,8 @@ def batch_insert_seed_assets(
                 "id": reference_id,
                 "asset_id": asset_id,
                 "file_path": absolute_path,
+                "asset_type": asset_type,
+                "model_folder": model_folder,
                 "mtime_ns": spec["mtime_ns"],
                 "owner_id": owner_id,
                 "name": spec["info_name"],

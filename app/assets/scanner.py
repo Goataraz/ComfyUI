@@ -9,6 +9,7 @@ from app.assets.database.queries import (
     bulk_update_enrichment_level,
     bulk_update_is_missing,
     bulk_update_needs_verify,
+    bulk_update_reference_classification,
     delete_orphaned_seed_asset,
     delete_references_by_ids,
     ensure_tags_exist,
@@ -36,6 +37,7 @@ from app.assets.services.hashing import HashCheckpoint, compute_blake3_hash
 from app.assets.services.metadata_extract import extract_file_metadata
 from app.assets.services.path_utils import (
     compute_relative_filename,
+    get_asset_path_info,
     get_comfy_models_folders,
     get_name_and_tags_from_asset_path,
 )
@@ -48,6 +50,8 @@ class _RefInfo(TypedDict):
     exists: bool
     stat_unchanged: bool
     needs_verify: bool
+    asset_type: str | None
+    model_folder: str | None
 
 
 class _AssetAccumulator(TypedDict):
@@ -56,7 +60,7 @@ class _AssetAccumulator(TypedDict):
     refs: list[_RefInfo]
 
 
-RootType = Literal["models", "input", "output"]
+RootType = Literal["models", "input", "output", "temp"]
 
 
 def get_prefixes_for_root(root: RootType) -> list[str]:
@@ -69,12 +73,14 @@ def get_prefixes_for_root(root: RootType) -> list[str]:
         return [os.path.abspath(folder_paths.get_input_directory())]
     if root == "output":
         return [os.path.abspath(folder_paths.get_output_directory())]
+    if root == "temp":
+        return [os.path.abspath(folder_paths.get_temp_directory())]
     return []
 
 
 def get_all_known_prefixes() -> list[str]:
     """Get all known asset prefixes across all root types."""
-    all_roots: tuple[RootType, ...] = ("models", "input", "output")
+    all_roots: tuple[RootType, ...] = ("models", "input", "output", "temp")
     return [p for root in all_roots for p in get_prefixes_for_root(root)]
 
 
@@ -162,6 +168,8 @@ def sync_references_with_filesystem(
                 "exists": exists,
                 "stat_unchanged": stat_unchanged,
                 "needs_verify": row.needs_verify,
+                "asset_type": row.asset_type,
+                "model_folder": row.model_folder,
             }
         )
 
@@ -170,6 +178,7 @@ def sync_references_with_filesystem(
     stale_ref_ids: list[str] = []
     to_mark_missing: list[str] = []
     to_clear_missing: list[str] = []
+    classification_updates: list[dict[str, str | None]] = []
     survivors: set[str] = set()
 
     for aid, acc in by_asset.items():
@@ -182,6 +191,21 @@ def sync_references_with_filesystem(
             if not r["exists"]:
                 to_mark_missing.append(r["ref_id"])
                 continue
+            try:
+                path_info = get_asset_path_info(r["file_path"])
+                asset_type = path_info.asset_type
+                model_folder = path_info.model_folder
+            except ValueError:
+                asset_type = None
+                model_folder = None
+            if asset_type != r["asset_type"] or model_folder != r["model_folder"]:
+                classification_updates.append(
+                    {
+                        "reference_id": r["ref_id"],
+                        "asset_type": asset_type,
+                        "model_folder": model_folder,
+                    }
+                )
             if r["stat_unchanged"]:
                 to_clear_missing.append(r["ref_id"])
                 if r["needs_verify"]:
@@ -226,6 +250,7 @@ def sync_references_with_filesystem(
     bulk_update_is_missing(session, to_clear_missing, value=False)
     bulk_update_needs_verify(session, to_set_verify, value=True)
     bulk_update_needs_verify(session, to_clear_verify, value=False)
+    bulk_update_reference_classification(session, classification_updates)
 
     return survivors if collect_existing_paths else None
 
@@ -274,7 +299,18 @@ def collect_paths_for_roots(roots: tuple[RootType, ...]) -> list[str]:
         paths.extend(list_files_recursively(folder_paths.get_input_directory()))
     if "output" in roots:
         paths.extend(list_files_recursively(folder_paths.get_output_directory()))
-    return paths
+    if "temp" in roots:
+        paths.extend(list_files_recursively(folder_paths.get_temp_directory()))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        abs_path = os.path.abspath(path)
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        deduped.append(abs_path)
+    return deduped
 
 
 def build_asset_specs(

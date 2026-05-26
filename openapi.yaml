@@ -1511,7 +1511,7 @@ paths:
           in: query
           schema:
             type: integer
-            default: 50
+            default: 20
         - name: offset
           in: query
           schema:
@@ -1535,6 +1535,17 @@ paths:
           style: form
           explode: true
           description: Tags that assets must not have
+        - name: asset_type
+          in: query
+          schema:
+            type: string
+            enum: [model, input, output, temp]
+          description: Filter by path-derived asset type. Model classification is based on registered ComfyUI model folder roots, not tags.
+        - name: model_folder
+          in: query
+          schema:
+            type: string
+          description: Filter model assets by exact registered ComfyUI model folder name. Requires asset_type=model.
         - name: name_contains
           in: query
           schema:
@@ -6607,10 +6618,23 @@ components:
         id:
           type: string
           format: uuid
-          description: Unique identifier for the asset
+          description: AssetReference ID. Use this as the stable identity; logical file_path is not unique.
         name:
           type: string
           description: Name of the asset file
+        file_path:
+          type: string
+          description: Logical asset namespace path. Model assets use `models/<model_folder>/<relative_path>`; input/output/temp assets use `<asset_type>/<relative_path>`. Omitted when the asset has no resolvable filesystem path. Not unique; use `id` for stable asset-reference operations.
+        display_name:
+          type: string
+          description: Human-facing path below the matched asset root or model folder. Omitted when the asset has no resolvable filesystem path.
+        asset_type:
+          type: string
+          enum: [model, input, output, temp]
+          description: Path-derived asset type. Model classification is based on registered ComfyUI model folder roots, not tags. Omitted when the asset has no resolvable filesystem path.
+        model_folder:
+          type: string
+          description: Exact, case-sensitive registered ComfyUI model folder name for model assets. Present only when asset_type is `model`.
         hash:
           type: string
           nullable: true

@@ -64,6 +64,44 @@ class TestBatchInsertSeedAssets:
         assert len(assets) == 1
         assert assets[0].mime_type is None
 
+    def test_duplicate_paths_in_same_batch_preserve_first_spec(
+        self, session: Session, temp_dir: Path
+    ):
+        file_path = temp_dir / "duplicate.safetensors"
+        file_path.write_bytes(b"fake safetensors content")
+
+        specs: list[SeedAssetSpec] = [
+            {
+                "abs_path": str(file_path),
+                "size_bytes": 24,
+                "mtime_ns": 1234567890000000000,
+                "info_name": "first",
+                "tags": ["models", "checkpoints"],
+                "fname": "duplicate.safetensors",
+                "metadata": None,
+                "hash": None,
+                "mime_type": "application/safetensors",
+            },
+            {
+                "abs_path": str(file_path),
+                "size_bytes": 24,
+                "mtime_ns": 1234567890000000000,
+                "info_name": "second",
+                "tags": ["output"],
+                "fname": "duplicate.safetensors",
+                "metadata": None,
+                "hash": None,
+                "mime_type": "application/safetensors",
+            },
+        ]
+
+        result = batch_insert_seed_assets(session, specs=specs, owner_id="")
+
+        assert result.inserted_refs == 1
+        refs = session.query(AssetReference).all()
+        assert len(refs) == 1
+        assert refs[0].name == "first"
+
     def test_various_model_mime_types(self, session: Session, temp_dir: Path):
         """Verify various model file types get correct mime_type."""
         test_cases = [

@@ -24,6 +24,7 @@ from app.assets.database.models import (
 )
 from app.assets.database.queries.common import (
     MAX_BIND_PARAMS,
+    apply_asset_path_filters,
     apply_metadata_filter,
     apply_tag_filters,
     build_prefix_like_conditions,
@@ -166,6 +167,8 @@ def insert_reference(
     name: str,
     owner_id: str = "",
     file_path: str | None = None,
+    asset_type: str | None = None,
+    model_folder: str | None = None,
     mtime_ns: int | None = None,
     preview_id: str | None = None,
 ) -> AssetReference | None:
@@ -178,6 +181,8 @@ def insert_reference(
                 name=name,
                 owner_id=owner_id,
                 file_path=file_path,
+                asset_type=asset_type,
+                model_folder=model_folder,
                 mtime_ns=mtime_ns,
                 preview_id=preview_id,
                 created_at=now,
@@ -197,6 +202,8 @@ def get_or_create_reference(
     name: str,
     owner_id: str = "",
     file_path: str | None = None,
+    asset_type: str | None = None,
+    model_folder: str | None = None,
     mtime_ns: int | None = None,
     preview_id: str | None = None,
 ) -> tuple[AssetReference, bool]:
@@ -214,6 +221,8 @@ def get_or_create_reference(
         name=name,
         owner_id=owner_id,
         file_path=file_path,
+        asset_type=asset_type,
+        model_folder=model_folder,
         mtime_ns=mtime_ns,
         preview_id=preview_id,
     )
@@ -263,6 +272,8 @@ def list_references_page(
     name_contains: str | None = None,
     include_tags: Sequence[str] | None = None,
     exclude_tags: Sequence[str] | None = None,
+    asset_type: str | None = None,
+    model_folder: str | None = None,
     metadata_filter: dict | None = None,
     sort: str | None = None,
     order: str | None = None,
@@ -285,6 +296,7 @@ def list_references_page(
         base = base.where(AssetReference.name.ilike(f"%{escaped}%", escape=esc))
 
     base = apply_tag_filters(base, include_tags, exclude_tags)
+    base = apply_asset_path_filters(base, asset_type=asset_type, model_folder=model_folder)
     base = apply_metadata_filter(base, metadata_filter)
 
     sort = (sort or "created_at").lower()
@@ -315,6 +327,9 @@ def list_references_page(
             AssetReference.name.ilike(f"%{escaped}%", escape=esc)
         )
     count_stmt = apply_tag_filters(count_stmt, include_tags, exclude_tags)
+    count_stmt = apply_asset_path_filters(
+        count_stmt, asset_type=asset_type, model_folder=model_folder
+    )
     count_stmt = apply_metadata_filter(count_stmt, metadata_filter)
 
     total = int(session.execute(count_stmt).scalar_one() or 0)
@@ -571,6 +586,8 @@ class CacheStateRow(NamedTuple):
     file_path: str
     mtime_ns: int | None
     needs_verify: bool
+    asset_type: str | None
+    model_folder: str | None
     asset_id: str
     asset_hash: str | None
     size_bytes: int | None
@@ -619,6 +636,8 @@ def upsert_reference(
     name: str,
     mtime_ns: int,
     owner_id: str = "",
+    asset_type: str | None = None,
+    model_folder: str | None = None,
 ) -> tuple[bool, bool]:
     """Upsert a reference by file_path. Returns (created, updated).
 
@@ -628,6 +647,8 @@ def upsert_reference(
     vals = {
         "asset_id": asset_id,
         "file_path": file_path,
+        "asset_type": asset_type,
+        "model_folder": model_folder,
         "name": name,
         "owner_id": owner_id,
         "mtime_ns": int(mtime_ns),
@@ -653,6 +674,8 @@ def upsert_reference(
         .where(
             sa.or_(
                 AssetReference.asset_id != asset_id,
+                AssetReference.asset_type.is_distinct_from(asset_type),
+                AssetReference.model_folder.is_distinct_from(model_folder),
                 AssetReference.mtime_ns.is_(None),
                 AssetReference.mtime_ns != int(mtime_ns),
                 AssetReference.is_missing == True,  # noqa: E712
@@ -660,8 +683,13 @@ def upsert_reference(
             )
         )
         .values(
-            asset_id=asset_id, mtime_ns=int(mtime_ns), is_missing=False,
-            deleted_at=None, updated_at=now,
+            asset_id=asset_id,
+            asset_type=asset_type,
+            model_folder=model_folder,
+            mtime_ns=int(mtime_ns),
+            is_missing=False,
+            deleted_at=None,
+            updated_at=now,
         )
     )
     res2 = session.execute(upd)
@@ -780,6 +808,8 @@ def get_references_for_prefixes(
             AssetReference.file_path,
             AssetReference.mtime_ns,
             AssetReference.needs_verify,
+            AssetReference.asset_type,
+            AssetReference.model_folder,
             AssetReference.asset_id,
             Asset.hash,
             Asset.size_bytes,
@@ -803,12 +833,37 @@ def get_references_for_prefixes(
             file_path=row[1],
             mtime_ns=row[2],
             needs_verify=row[3],
-            asset_id=row[4],
-            asset_hash=row[5],
-            size_bytes=int(row[6]) if row[6] is not None else None,
+            asset_type=row[4],
+            model_folder=row[5],
+            asset_id=row[6],
+            asset_hash=row[7],
+            size_bytes=int(row[8]) if row[8] is not None else None,
         )
         for row in rows
     ]
+
+
+def bulk_update_reference_classification(
+    session: Session,
+    updates: list[dict[str, str | None]],
+) -> int:
+    """Update persisted asset_type/model_folder for existing references."""
+    if not updates:
+        return 0
+
+    total = 0
+    for row in updates:
+        result = session.execute(
+            sa.update(AssetReference)
+            .where(AssetReference.id == row["reference_id"])
+            .values(
+                asset_type=row["asset_type"],
+                model_folder=row["model_folder"],
+                updated_at=get_utc_now(),
+            )
+        )
+        total += result.rowcount
+    return total
 
 
 def bulk_update_needs_verify(
@@ -993,7 +1048,7 @@ def bulk_insert_references_ignore_conflicts(
     ins = sqlite.insert(AssetReference).on_conflict_do_nothing(
         index_elements=[AssetReference.file_path]
     )
-    for chunk in iter_chunks(enriched_rows, calculate_rows_per_statement(14)):
+    for chunk in iter_chunks(enriched_rows, calculate_rows_per_statement(16)):
         session.execute(ins, chunk)
 
 

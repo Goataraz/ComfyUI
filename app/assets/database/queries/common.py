@@ -8,7 +8,7 @@ import sqlalchemy as sa
 from sqlalchemy import exists
 
 from app.assets.database.models import AssetReference, AssetReferenceMeta, AssetReferenceTag
-from app.assets.helpers import escape_sql_like_string, normalize_tags
+from app.assets.helpers import normalize_tags
 
 MAX_BIND_PARAMS = 800
 
@@ -45,15 +45,32 @@ def build_visible_owner_clause(owner_id: str) -> sa.sql.ClauseElement:
 def build_prefix_like_conditions(
     prefixes: list[str],
 ) -> list[sa.sql.ColumnElement]:
-    """Build LIKE conditions for matching file paths under directory prefixes."""
+    """Build case-exact conditions for matching file paths under directory prefixes."""
     conds = []
     for p in prefixes:
         base = os.path.abspath(p)
         if not base.endswith(os.sep):
             base += os.sep
-        escaped, esc = escape_sql_like_string(base)
-        conds.append(AssetReference.file_path.like(escaped + "%", escape=esc))
+        conds.append(sa.func.substr(AssetReference.file_path, 1, len(base)) == base)
     return conds
+
+
+def apply_asset_path_filters(
+    stmt: sa.sql.Select,
+    asset_type: str | None = None,
+    model_folder: str | None = None,
+) -> sa.sql.Select:
+    """Filter references using classification persisted at ingest time."""
+    if asset_type is None and model_folder is None:
+        return stmt
+    if model_folder and asset_type != "model":
+        raise ValueError("model_folder can only be used with asset_type=model")
+
+    if asset_type is not None:
+        stmt = stmt.where(AssetReference.asset_type == asset_type)
+    if model_folder is not None:
+        stmt = stmt.where(AssetReference.model_folder == model_folder)
+    return stmt
 
 
 def apply_tag_filters(

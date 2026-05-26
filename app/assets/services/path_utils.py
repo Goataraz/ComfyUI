@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -6,7 +7,29 @@ import folder_paths
 from app.assets.helpers import normalize_tags
 
 
-_NON_MODEL_FOLDER_NAMES = frozenset({"custom_nodes"})
+# These names are bootstrapped into folder_names_and_paths by core but are not
+# model folders (matching /api/experiment/models' exclusion). Intentionally
+# duplicated here so the assets layer stays decoupled from the legacy
+# model-manager code it will eventually replace.
+_NON_MODEL_FOLDER_NAMES = frozenset({"configs", "custom_nodes"})
+
+
+@dataclass(frozen=True)
+class AssetPathInfo:
+    asset_type: Literal["input", "output", "temp", "model"]
+    model_folder: str | None
+
+
+@dataclass(frozen=True)
+class AssetResponsePathInfo(AssetPathInfo):
+    file_path: str
+    display_name: str | None
+
+
+@dataclass(frozen=True)
+class AssetPathContext(AssetPathInfo):
+    base_path: str
+    relative_path: str
 
 
 def get_comfy_models_folders() -> list[tuple[str, list[str]]]:
@@ -14,7 +37,7 @@ def get_comfy_models_folders() -> list[tuple[str, list[str]]]:
 
     Includes every category registered in folder_names_and_paths,
     regardless of whether its paths are under the main models_dir,
-    but excludes non-model entries like custom_nodes.
+    but excludes non-model entries like configs and custom_nodes.
     """
     targets: list[tuple[str, list[str]]] = []
     for name, values in folder_paths.folder_names_and_paths.items():
@@ -67,28 +90,109 @@ def validate_path_within_base(candidate: str, base: str) -> None:
 
 def compute_relative_filename(file_path: str) -> str | None:
     """
-    Return the model's path relative to the last well-known folder (the model category),
-    using forward slashes, eg:
+    Return the path relative to the matched asset root or model folder, using
+    forward slashes, eg:
       /.../models/checkpoints/flux/123/flux.safetensors -> "flux/123/flux.safetensors"
       /.../models/text_encoders/clip_g.safetensors -> "clip_g.safetensors"
+      /.../input/sub/image.png -> "sub/image.png"
 
-    For non-model paths, returns None.
+    For unknown paths, returns None.
     """
     try:
-        root_category, rel_path = get_asset_category_and_relative_path(file_path)
+        context = resolve_asset_path_context(file_path)
     except ValueError:
         return None
 
-    p = Path(rel_path)
-    parts = [seg for seg in p.parts if seg not in (".", "..", p.anchor)]
+    return _normalize_relative_path(context.relative_path)
+
+
+def _normalize_relative_path(relative_path: str) -> str | None:
+    parts = [
+        seg
+        for seg in Path(relative_path).parts
+        if seg not in (".", "..", Path(relative_path).anchor)
+    ]
     if not parts:
         return None
 
-    if root_category == "models":
-        # parts[0] is the category ("checkpoints", "vae", etc) – drop it
-        inside = parts[1:] if len(parts) > 1 else [parts[0]]
-        return "/".join(inside)
-    return "/".join(parts)  # input/output: keep all parts
+    return "/".join(parts)
+
+
+def resolve_asset_path_context(file_path: str) -> AssetPathContext:
+    """Resolve a path against Core's asset roots and model-folder registration.
+
+    This is the source of truth for path-derived asset classification. For
+    model assets, ``model_folder`` is the exact registered folder name whose
+    base path contains the file, and ``relative_path`` is relative to that
+    matched base path. When multiple registered bases contain the file, the
+    deepest base wins.
+    """
+    fp_abs = os.path.abspath(file_path)
+
+    def _check_is_within(child: str, parent: str) -> bool:
+        return Path(child).is_relative_to(parent)
+
+    def _compute_relative(child: str, parent: str) -> str:
+        # Normalize relative path, stripping any leading ".." components
+        # by anchoring to root (os.sep) then computing relpath back from it.
+        return os.path.relpath(
+            os.path.join(os.sep, os.path.relpath(child, parent)), os.sep
+        )
+
+    best: tuple[int, str, str, str] | None = None
+    for model_folder, bases in get_comfy_models_folders():
+        for base in bases:
+            base_abs = os.path.abspath(base)
+            if not _check_is_within(fp_abs, base_abs):
+                continue
+            cand = (
+                len(base_abs),
+                model_folder,
+                base_abs,
+                _compute_relative(fp_abs, base_abs),
+            )
+            if best is None or cand[0] > best[0]:
+                best = cand
+
+    if best is not None:
+        _, model_folder, base_path, relative_path = best
+        return AssetPathContext(
+            asset_type="model",
+            model_folder=model_folder,
+            base_path=base_path,
+            relative_path=relative_path,
+        )
+
+    input_base = os.path.abspath(folder_paths.get_input_directory())
+    if _check_is_within(fp_abs, input_base):
+        return AssetPathContext(
+            asset_type="input",
+            model_folder=None,
+            base_path=input_base,
+            relative_path=_compute_relative(fp_abs, input_base),
+        )
+
+    output_base = os.path.abspath(folder_paths.get_output_directory())
+    if _check_is_within(fp_abs, output_base):
+        return AssetPathContext(
+            asset_type="output",
+            model_folder=None,
+            base_path=output_base,
+            relative_path=_compute_relative(fp_abs, output_base),
+        )
+
+    temp_base = os.path.abspath(folder_paths.get_temp_directory())
+    if _check_is_within(fp_abs, temp_base):
+        return AssetPathContext(
+            asset_type="temp",
+            model_folder=None,
+            base_path=temp_base,
+            relative_path=_compute_relative(fp_abs, temp_base),
+        )
+
+    raise ValueError(
+        f"Path is not within input, output, temp, or configured model bases: {file_path}"
+    )
 
 
 def get_asset_category_and_relative_path(
@@ -120,39 +224,161 @@ def get_asset_category_and_relative_path(
             os.path.join(os.sep, os.path.relpath(child, parent)), os.sep
         )
 
-    # 1) input
     input_base = os.path.abspath(folder_paths.get_input_directory())
     if _check_is_within(fp_abs, input_base):
         return "input", _compute_relative(fp_abs, input_base)
 
-    # 2) output
     output_base = os.path.abspath(folder_paths.get_output_directory())
     if _check_is_within(fp_abs, output_base):
         return "output", _compute_relative(fp_abs, output_base)
 
-    # 3) temp
     temp_base = os.path.abspath(folder_paths.get_temp_directory())
     if _check_is_within(fp_abs, temp_base):
         return "temp", _compute_relative(fp_abs, temp_base)
 
-    # 4) models (check deepest matching base to avoid ambiguity)
-    best: tuple[int, str, str] | None = None  # (base_len, bucket, rel_inside_bucket)
-    for bucket, bases in get_comfy_models_folders():
-        for b in bases:
-            base_abs = os.path.abspath(b)
+    best: tuple[int, str, str] | None = None
+    for model_folder, bases in get_comfy_models_folders():
+        for base in bases:
+            base_abs = os.path.abspath(base)
             if not _check_is_within(fp_abs, base_abs):
                 continue
-            cand = (len(base_abs), bucket, _compute_relative(fp_abs, base_abs))
+            relative_path = _compute_relative(fp_abs, base_abs)
+            combined = os.path.join(model_folder, relative_path)
+            cand = (len(base_abs), base_abs, combined)
             if best is None or cand[0] > best[0]:
                 best = cand
 
     if best is not None:
-        _, bucket, rel_inside = best
-        combined = os.path.join(bucket, rel_inside)
-        return "models", os.path.relpath(os.path.join(os.sep, combined), os.sep)
+        return "models", os.path.relpath(os.path.join(os.sep, best[2]), os.sep)
 
     raise ValueError(
         f"Path is not within input, output, temp, or configured model bases: {file_path}"
+    )
+
+
+def get_asset_path_info(file_path: str) -> AssetPathInfo:
+    """Return typed asset classification derived from the actual filesystem path.
+
+    This intentionally reads the ComfyUI model folder registration from
+    ``folder_paths.folder_names_and_paths`` instead of inferring it from tags.
+    For model files, ``model_folder`` is the registered folder name whose base
+    path contains ``file_path``.
+
+    Raises:
+        ValueError: path does not belong to any known root.
+    """
+    context = resolve_asset_path_context(file_path)
+    return AssetPathInfo(
+        asset_type=context.asset_type,
+        model_folder=context.model_folder,
+    )
+
+
+def get_asset_response_path_info(file_path: str) -> AssetResponsePathInfo:
+    """Return API-facing path fields derived from the actual filesystem path.
+
+    ``file_path`` is a logical namespace key: ``models/<model_folder>/<relative>``
+    for model assets and ``<asset_type>/<relative>`` for input/output/temp assets.
+    ``display_name`` is the path below the matched root or model folder.
+
+    Raises:
+        ValueError: path does not belong to any known root.
+    """
+    context = resolve_asset_path_context(file_path)
+    display_name = _normalize_relative_path(context.relative_path)
+
+    if context.asset_type == "model":
+        logical_file_path = (
+            f"models/{context.model_folder}/{display_name}"
+            if display_name
+            else f"models/{context.model_folder}"
+        )
+    else:
+        logical_file_path = (
+            f"{context.asset_type}/{display_name}"
+            if display_name
+            else context.asset_type
+        )
+
+    return AssetResponsePathInfo(
+        asset_type=context.asset_type,
+        model_folder=context.model_folder,
+        file_path=logical_file_path,
+        display_name=display_name,
+    )
+
+
+def get_stored_asset_response_path_info(
+    file_path: str,
+    asset_type: str | None,
+    model_folder: str | None,
+) -> AssetResponsePathInfo:
+    """Return API-facing path fields from persisted classification.
+
+    ``asset_type`` and ``model_folder`` are written at ingest time and are the
+    classification source of truth for API responses. The physical ``file_path``
+    is still used to compute the display path below the stored root.
+    """
+    if asset_type not in {"input", "output", "temp", "model"}:
+        raise ValueError(f"unknown persisted asset_type: {asset_type}")
+
+    fp_abs = os.path.abspath(file_path)
+
+    def _check_is_within(child: str, parent: str) -> bool:
+        return Path(child).is_relative_to(parent)
+
+    def _compute_relative(child: str, parent: str) -> str:
+        return os.path.relpath(
+            os.path.join(os.sep, os.path.relpath(child, parent)), os.sep
+        )
+
+    if asset_type == "model":
+        if not model_folder:
+            raise ValueError("model asset is missing persisted model_folder")
+        best: tuple[int, str] | None = None
+        for folder_name, bases in get_comfy_models_folders():
+            if folder_name != model_folder:
+                continue
+            for base in bases:
+                base_abs = os.path.abspath(base)
+                if not _check_is_within(fp_abs, base_abs):
+                    continue
+                relative_path = _compute_relative(fp_abs, base_abs)
+                cand = (len(base_abs), relative_path)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+        if best is None:
+            raise ValueError(
+                f"Path is not within persisted model folder roots: {file_path}"
+            )
+        display_name = _normalize_relative_path(best[1])
+        logical_file_path = (
+            f"models/{model_folder}/{display_name}"
+            if display_name
+            else f"models/{model_folder}"
+        )
+        return AssetResponsePathInfo(
+            asset_type="model",
+            model_folder=model_folder,
+            file_path=logical_file_path,
+            display_name=display_name,
+        )
+
+    root_by_type = {
+        "input": folder_paths.get_input_directory,
+        "output": folder_paths.get_output_directory,
+        "temp": folder_paths.get_temp_directory,
+    }
+    root = os.path.abspath(root_by_type[asset_type]())
+    if not _check_is_within(fp_abs, root):
+        raise ValueError(f"Path is not within persisted asset root: {file_path}")
+    display_name = _normalize_relative_path(_compute_relative(fp_abs, root))
+    logical_file_path = f"{asset_type}/{display_name}" if display_name else asset_type
+    return AssetResponsePathInfo(
+        asset_type=asset_type,
+        model_folder=None,
+        file_path=logical_file_path,
+        display_name=display_name,
     )
 
 

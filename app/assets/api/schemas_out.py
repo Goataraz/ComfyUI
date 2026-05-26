@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -10,9 +10,22 @@ class Asset(BaseModel):
 
     id: str
     name: str
+    file_path: str | None = Field(
+        default=None,
+        description="Logical asset namespace path. Model assets use `models/<model_folder>/<relative_path>`; other typed assets use `<asset_type>/<relative_path>`. This is not a unique identity; use `id` for stable asset-reference operations.",
+    )
+    display_name: str | None = Field(
+        default=None,
+        description="Human-facing path below the matched asset root or model folder.",
+    )
     asset_hash: str | None = None
     size: int | None = None
     mime_type: str | None = None
+    model_folder: str | None = Field(
+        default=None,
+        description="Exact, case-sensitive registered ComfyUI model folder name. Present only when asset_type is `model`.",
+    )
+    asset_type: Literal["model", "input", "output", "temp"] | None = None
     tags: list[str] = Field(default_factory=list)
     preview_url: str | None = None
     preview_id: str | None = None  # references an asset_reference id, not an asset id
