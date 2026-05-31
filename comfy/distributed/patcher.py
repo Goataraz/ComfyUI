@@ -79,6 +79,7 @@ def parallelize_model(model):
     mesh = get_mesh()
 
     count = 0
+    skipped_dims = 0
     for name, module in model.named_modules():
         if any(name.startswith(prefix) for prefix in targets):
             if isinstance(module, nn.Linear):
@@ -92,6 +93,12 @@ def parallelize_model(model):
                     mode = "rowwise"
                 elif any(k in name for k in COLWISE_KEYWORDS):
                     mode = "colwise"
+
+                # Skip layers where the shard dimension isn't evenly divisible
+                dim = module.out_features if mode == "colwise" else module.in_features
+                if dim % mesh.world_size != 0:
+                    skipped_dims += 1
+                    continue
 
                 new_layer = ParallelLinear(
                     in_features=module.in_features,
@@ -108,7 +115,8 @@ def parallelize_model(model):
                 setattr(parent, child_name, new_layer)
                 count += 1
 
-    logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups")
+    logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
+                 f" ({skipped_dims} skipped for non-divisible dimensions)")
     return True
 
 def load_tp_shards(model, sd, prefix=""):
