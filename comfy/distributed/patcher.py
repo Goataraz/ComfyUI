@@ -41,14 +41,17 @@ TP_TARGETS = {
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
 # Rowwise is checked first; if a layer name matches both, rowwise takes precedence.
-ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "to_out_t"]
+# - proj/to_out: attention output projections (reduce across shard, all-reduce)
+# - mlp.2: MLP second linear (down-projection, rowwise with all-reduce)
+# - down/w2: general down-projection patterns
+ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "mlp.2", "to_out_t"]
 COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t"]
 
-# Fused layer names that CANNOT be simply sharded with colwise/rowwise.
-# In Flux SingleStreamBlock, linear1 fuses QKV+MLP-in and linear2 fuses proj+MLP-out.
-# These fused layers use torch.split() with full (unsharded) dimensions internally,
-# so a simple colwise/rowwise split would cause dimension mismatches.
-FUSED_LAYER_EXCLUSIONS = ["linear1", "linear2"]
+# Layer names that must NOT be sharded because they produce full-dim modulation vectors
+# or use torch.split() with unsharded dimensions internally.
+# - modulation.lin, img_mod.lin, txt_mod.lin: AdaLN modulation producing shift/scale/gate
+# - linear1, linear2: Flux SingleStreamBlock fused QKV+MLP layers
+EXCLUDED_LAYER_NAMES = ["linear1", "linear2", "modulation.lin", "img_mod.lin", "txt_mod.lin"]
 
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
@@ -72,8 +75,8 @@ def parallelize_model(model):
     for name, module in model.named_modules():
         if any(name.startswith(prefix) for prefix in targets):
             if isinstance(module, nn.Linear):
-                # Skip fused layers that can't be simply sharded (e.g., Flux SingleStreamBlock linear1/linear2)
-                if any(name.endswith(excl) for excl in FUSED_LAYER_EXCLUSIONS):
+                # Skip layers that can't be simply sharded (fused layers, modulation layers)
+                if any(name.endswith(excl) for excl in EXCLUDED_LAYER_NAMES):
                     continue
 
                 # Determine mode
