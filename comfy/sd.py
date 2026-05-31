@@ -31,6 +31,7 @@ import os
 
 import comfy.utils
 
+
 from . import clip_vision
 from . import gligen
 from . import diffusers_convert
@@ -1928,6 +1929,42 @@ def load_checkpoint_guess_config_clip_only(ckpt_path, embedding_directory=None, 
             disable_dynamic=disable_dynamic)
     return clip.patcher
 
+
+def _apply_tensor_parallelism(model, sd, prefix=""):
+    """Apply Tensor Parallelism to a diffusion model.
+
+    Parallelizes the model's linear layers, loads weight shards onto
+    each rank's GPU, and moves non-TP params to CPU. Returns the
+    (load_device, offload_device) that the ModelPatcher should use.
+
+    Must be called after model construction. Returns (None, None) if
+    TP is not active.
+    """
+    from comfy.distributed.utils import is_tp_active
+    if not is_tp_active():
+        return None, None
+
+    from comfy.distributed.mesh import get_mesh
+    from comfy.distributed.patcher import parallelize_model, load_tp_shards
+    from comfy.distributed.utils import tp_aware_to
+
+    mesh = get_mesh()
+    load_device = torch.device(f"cuda:{mesh.current_device}")
+    offload_device = torch.device("cpu")
+
+    # The BaseModel wrapper stores the actual diffusion model at
+    # model.diffusion_model. parallelize_model() must operate on
+    # the inner model to find the correct module prefixes.
+    diffusion_model = getattr(model, 'diffusion_model', model)
+    parallelize_model(diffusion_model)
+    load_tp_shards(diffusion_model, sd, prefix=prefix)
+    # Move non-TP params (layer norms, embeddings) to CPU offload device.
+    # TP shards stay on their rank's GPU.
+    tp_aware_to(diffusion_model, offload_device)
+
+    return load_device, offload_device
+
+
 def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}, metadata=None, disable_dynamic=False):
     clip = None
     clipvision = None
@@ -1976,10 +2013,25 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
 
     if output_model:
         inital_load_device = model_management.unet_inital_load_device(parameters, unet_dtype)
+        from comfy.distributed.utils import is_tp_active
+        is_tp = is_tp_active()
+        # In TP mode, build the model on CPU so the constructor doesn't OOM by
+        # allocating tensors on a GPU that already holds CLIP/text encoders.
+        if is_tp:
+            inital_load_device = torch.device("cpu")
+            logging.info(f"[TP] Building diffusion model on {inital_load_device}")
         model = model_config.get_model(sd, diffusion_model_prefix, device=inital_load_device)
+        if is_tp:
+            tp_load_device, tp_offload_device = _apply_tensor_parallelism(model, sd, prefix=diffusion_model_prefix)
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
-        offload_device = model_options.get("offload_device", model_management.unet_offload_device())
+        if is_tp:
+            offload_device = tp_offload_device
+            load_device = tp_load_device
+        else:
+            offload_device = model_options.get("offload_device", model_management.unet_offload_device())
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
+        if not is_tp and not model_management.is_device_cpu(offload_device):
+            model.to(offload_device)
         model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.is_dynamic())
 
     if output_vae:
@@ -2117,10 +2169,21 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     if model_options.get("fp8_optimizations", False):
         model_config.optimizations["fp8"] = True
 
-    model = model_config.get_model(new_sd, "")
+    from comfy.distributed.utils import is_tp_active
+    is_tp = is_tp_active()
+    # In TP mode, build the model on CPU first so the constructor doesn't
+    # OOM by allocating tensors on a GPU that already holds CLIP/text encoders.
+    if is_tp:
+        model = model_config.get_model(new_sd, "", device=torch.device("cpu"))
+    else:
+        model = model_config.get_model(new_sd, "")
+    if is_tp:
+        tp_load_device, tp_offload_device = _apply_tensor_parallelism(model, new_sd)
     ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
+    offload_device = tp_offload_device if is_tp else model_management.unet_offload_device()
+    load_device = tp_load_device if is_tp else model_management.get_torch_device()
     model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-    if not model_management.is_device_cpu(offload_device):
+    if not is_tp and not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
     model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
     left_over = sd.keys()

@@ -351,6 +351,15 @@ class BaseModel(torch.nn.Module):
                 to_load[k[len(unet_prefix):]] = sd.pop(k)
 
         to_load = self.model_config.process_unet_state_dict(to_load)
+
+        # In TP mode, ParallelLinear layers have already been loaded by
+        # load_tp_shards(). Their weight shapes differ from the full model,
+        # so load_state_dict would fail. Remove them from to_load.
+        from comfy.distributed.utils import is_tp_active, get_tp_param_names
+        if is_tp_active():
+            tp_param_names = get_tp_param_names(self.diffusion_model)
+            to_load = {k: v for k, v in to_load.items() if k not in tp_param_names}
+
         m, u = self.diffusion_model.load_state_dict(to_load, strict=False, assign=assign)
         if len(m) > 0:
             logging.warning("unet missing: {}".format(m))
