@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import logging
 from comfy.distributed.mesh import get_mesh
 
 
@@ -62,11 +63,17 @@ class ParallelLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
+    _forward_debug = False  # Set to True to debug shape mismatches
+
     def forward(self, x):
         # Cast weight to match input dtype for manual-cast models (e.g., fp8 weights with fp16 compute)
         # This handles the case where ComfyUI's manual casting system sets the compute dtype
         # but TP weights retain their storage dtype (fp8_e4m3fn, etc.)
         w = self.weight.to(x.dtype)
+
+        if ParallelLinear._forward_debug:
+            logging.debug(f"[TP] {self.mode} forward: x.shape={x.shape}, w.shape={w.shape}, "
+                          f"local_in={self.local_in_features}, local_out={self.local_out_features}")
 
         if self.mode == "colwise":
             # Column Parallelism: Each GPU computes a shard of the output
