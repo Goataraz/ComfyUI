@@ -49,7 +49,10 @@ TP_TARGETS = {
     "GeneralDIT": ["blocks"],                          # Cosmos T2V/I2V
     "MiniTrainDIT": ["blocks"],                       # Cosmos Predict2 / Anima
     "HiDreamImageTransformer2DModel": ["double_stream_blocks", "single_stream_blocks"],
-    "HiDreamO1Transformer": ["language_model.layers"],
+    # HiDreamO1Transformer has an integrated Llama2 language model that cannot be
+    # naively sharded — its layers receive input from non-TP visual/x_embedder
+    # components. Full TP support requires sharding the vision encoder too.
+    # "HiDreamO1Transformer": ["language_model.layers"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
