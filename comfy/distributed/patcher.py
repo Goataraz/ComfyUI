@@ -47,11 +47,16 @@ TP_TARGETS = {
 ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "mlp.2", "to_out_t"]
 COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t"]
 
-# Layer names that must NOT be sharded because they produce full-dim modulation vectors
-# or use torch.split() with unsharded dimensions internally.
+# Layer names that must NOT be sharded because they produce full-dim modulation vectors,
+# are fused QKV projections, or use torch.split() with unsharded dimensions internally.
 # - modulation.lin, img_mod.lin, txt_mod.lin: AdaLN modulation producing shift/scale/gate
 # - linear1, linear2: Flux SingleStreamBlock fused QKV+MLP layers
-EXCLUDED_LAYER_NAMES = ["linear1", "linear2", "modulation.lin", "img_mod.lin", "txt_mod.lin"]
+# - qkv: Fused QKV attention projection (output dim = 3*hidden, reshaped with num_heads)
+EXCLUDED_LAYER_NAMES = [
+    "linear1", "linear2",
+    "modulation.lin", "img_mod.lin", "txt_mod.lin",
+    "img_attn.qkv", "txt_attn.qkv",
+]
 
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
