@@ -191,7 +191,9 @@ class TestGetTPTargets:
     def test_hidream_o1_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         HiDreamO1 = self._make_model_class("HiDreamO1Transformer")
-        assert get_tp_targets(HiDreamO1()) == ["language_model.layers"]
+        # HiDreamO1 is intentionally disabled in TP_TARGETS because its integrated
+        # Llama2 LLM can't be naively sharded (needs full-model TP strategy)
+        assert get_tp_targets(HiDreamO1()) == []
 
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
