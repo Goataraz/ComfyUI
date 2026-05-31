@@ -41,8 +41,14 @@ TP_TARGETS = {
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
 # Rowwise is checked first; if a layer name matches both, rowwise takes precedence.
-ROWWISE_KEYWORDS = ["to_out", "proj", "down", "linear2", "w2", "to_out_t"]
-COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "linear1", "w1", "w3", "to_q_t", "to_k_t", "to_v_t"]
+ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "to_out_t"]
+COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t"]
+
+# Fused layer names that CANNOT be simply sharded with colwise/rowwise.
+# In Flux SingleStreamBlock, linear1 fuses QKV+MLP-in and linear2 fuses proj+MLP-out.
+# These fused layers use torch.split() with full (unsharded) dimensions internally,
+# so a simple colwise/rowwise split would cause dimension mismatches.
+FUSED_LAYER_EXCLUSIONS = ["linear1", "linear2"]
 
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
@@ -66,6 +72,10 @@ def parallelize_model(model):
     for name, module in model.named_modules():
         if any(name.startswith(prefix) for prefix in targets):
             if isinstance(module, nn.Linear):
+                # Skip fused layers that can't be simply sharded (e.g., Flux SingleStreamBlock linear1/linear2)
+                if any(name.endswith(excl) for excl in FUSED_LAYER_EXCLUSIONS):
+                    continue
+
                 # Determine mode
                 mode = "colwise"
                 if any(k in name for k in ROWWISE_KEYWORDS):
