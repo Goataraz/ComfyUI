@@ -928,6 +928,7 @@ class ModelPatcher:
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
             self.unpatch_hooks()
+
             mem_counter = 0
             patch_counter = 0
             lowvram_counter = 0
@@ -967,14 +968,16 @@ class ModelPatcher:
 
                     if weight_key in self.patches:
                         if force_patch_weights:
-                            self.patch_weight_to_device(weight_key)
+                            if not getattr(m, "is_tp_parallelized", False):
+                                self.patch_weight_to_device(weight_key)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, weight_key)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     if bias_key in self.patches:
                         if force_patch_weights:
-                            self.patch_weight_to_device(bias_key)
+                            if not getattr(m, "is_tp_parallelized", False):
+                                self.patch_weight_to_device(bias_key)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, bias_key)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
@@ -1018,7 +1021,8 @@ class ModelPatcher:
                         comfy.ops.disable_weight_init._zero_init_parameter(m, param)
                     key = key_param_name_to_key(n, param)
                     self.unpin_weight(key)
-                    self.patch_weight_to_device(key, device_to=device_to)
+                    if not getattr(m, "is_tp_parallelized", False):
+                        self.patch_weight_to_device(key, device_to=device_to)
                 if comfy.model_management.is_device_cuda(device_to):
                     torch.cuda.synchronize()
 
@@ -1026,7 +1030,8 @@ class ModelPatcher:
                 m.comfy_patched_weights = True
 
             for x in load_completely:
-                x[2].to(device_to)
+                if not getattr(x[2], 'is_tp_parallelized', False):
+                    x[2].to(device_to)
 
             for x in offloaded:
                 n = x[1]
@@ -1042,7 +1047,12 @@ class ModelPatcher:
                 logging.info("loaded completely; {} {:.2f} MB loaded, full load: {}".format(usable_stat, mem_counter / (1024 * 1024), full_load))
                 self.model.model_lowvram = False
                 if full_load:
-                    self.model.to(device_to)
+                    from comfy.distributed.utils import is_tp_active
+                    if is_tp_active():
+                        from comfy.distributed.utils import tp_aware_to
+                        tp_aware_to(self.model, device_to)
+                    else:
+                        self.model.to(device_to)
                     mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
@@ -1099,7 +1109,12 @@ class ModelPatcher:
             self.backup.clear()
 
             if device_to is not None:
-                self.model.to(device_to)
+                from comfy.distributed.utils import is_tp_active
+                if is_tp_active():
+                    from comfy.distributed.utils import tp_aware_to
+                    tp_aware_to(self.model, device_to)
+                else:
+                    self.model.to(device_to)
                 self.model.device = device_to
             self.model.model_loaded_weight_memory = 0
             self.model.model_offload_buffer_memory = 0
@@ -1159,19 +1174,22 @@ class ModelPatcher:
                     bias_key = "{}.bias".format(n)
                     if move_weight:
                         cast_weight = self.force_cast_weights
-                        m.to(device_to)
+                        if not getattr(m, 'is_tp_parallelized', False):
+                            m.to(device_to)
                         module_mem += move_weight_functions(m, device_to)
                         if lowvram_possible:
                             if weight_key in self.patches:
                                 if force_patch_weights:
-                                    self.patch_weight_to_device(weight_key)
+                                    if not getattr(m, "is_tp_parallelized", False):
+                                        self.patch_weight_to_device(weight_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, weight_key)
                                     m.weight_function.append(LowVramPatch(weight_key, self.patches, convert_func, set_func))
                                     patch_counter += 1
                             if bias_key in self.patches:
                                 if force_patch_weights:
-                                    self.patch_weight_to_device(bias_key)
+                                    if not getattr(m, "is_tp_parallelized", False):
+                                        self.patch_weight_to_device(bias_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, bias_key)
                                     m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))
@@ -1892,13 +1910,18 @@ class ModelPatcherDynamic(ModelPatcher):
                             force_load_param(self, param, device_to)
 
                 else:
+                    is_tp_mod = getattr(m, 'is_tp_parallelized', False)
                     for param in params:
                         key = key_param_name_to_key(n, param)
                         weight, _, _ = get_key_weight(self.model, key)
                         if key not in self.backup:
                             self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight, False)
                         model_dtype = getattr(m, param + "_comfy_model_dtype", None)
-                        casted_weight = weight.to(dtype=model_dtype, device=device_to)
+                        if is_tp_mod:
+                            # TP shards stay on their assigned device; only cast dtype
+                            casted_weight = weight.to(dtype=model_dtype)
+                        else:
+                            casted_weight = weight.to(dtype=model_dtype, device=device_to)
                         comfy.utils.set_attr_param(self.model, key, casted_weight)
                         self.model.model_loaded_weight_memory += casted_weight.numel() * casted_weight.element_size()
 

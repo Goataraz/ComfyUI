@@ -1649,6 +1649,13 @@ class SaveImage:
     SEARCH_ALIASES = ["save", "save image", "export image", "output image", "write image", "download"]
 
     def save_images(self, images, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
+        # In TP mode, only rank 0 saves images to avoid duplicate file writes
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return {"ui": {"images": []}}
+        except ImportError:
+            pass
         filename_prefix += self.prefix_append
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         results = list()

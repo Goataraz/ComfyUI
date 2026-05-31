@@ -33,21 +33,10 @@ from comfy_api import feature_flags
 from app.database.db import init_db, dependencies_available
 
 if __name__ == "__main__":
-    #NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
+    # NOTE: These do not do anything on core ComfyUI, they are for custom nodes.
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
     os.environ['DO_NOT_TRACK'] = '1'
 
-faulthandler.enable(file=sys.stderr, all_threads=False)
-
-import comfy_aimdo.control
-
-if enables_dynamic_vram():
-    comfy_aimdo.control.init()
-
-if os.name == "nt":
-    os.environ['MIMALLOC_PURGE_DELAY'] = '0'
-
-if __name__ == "__main__":
     os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
     if args.default_device is not None:
         default_dev = args.default_device
@@ -72,9 +61,33 @@ if __name__ == "__main__":
         if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
             os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
 
+    # cuda_malloc MUST be imported before torch — it sets PYTORCH_CUDA_ALLOC_CONF
     import cuda_malloc
     if "rocm" in cuda_malloc.get_torch_version_noimport():
         os.environ['OCL_SET_SVM_SIZE'] = '262144'  # set at the request of AMD
+
+    # Distributed Initialization — must come after cuda_malloc so allocator config is set
+    import torch
+    import torch.distributed as dist
+    if args.tensor_parallel and 'RANK' in os.environ:
+        # Set CUDA device BEFORE init_process_group so NCCL binds to the correct GPU
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        torch.cuda.set_device(local_rank)
+        logging.info(f"Initializing Tensor Parallelism. Rank: {os.environ.get('RANK')}, World Size: {os.environ.get('WORLD_SIZE')}, Local Rank: {local_rank}")
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
+faulthandler.enable(file=sys.stderr, all_threads=False)
+
+import comfy_aimdo.control
+
+if enables_dynamic_vram():
+    comfy_aimdo.control.init()
+
+if os.name == "nt":
+    os.environ['MIMALLOC_PURGE_DELAY'] = '0'
 
 
 def handle_comfyui_manager_unavailable():
@@ -281,7 +294,20 @@ def _collect_output_absolute_paths(history_result: dict) -> list[str]:
     return paths
 
 
+from comfy.distributed.null_server import NullServer, NullQueue
+
+
 def prompt_worker(q, server_instance):
+    import torch.distributed as dist
+    import json
+    is_tp = dist.is_initialized()
+    rank = dist.get_rank() if is_tp else 0
+
+    # Set CUDA device for this thread so NCCL operations work correctly
+    if is_tp:
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        torch.cuda.set_device(local_rank)
+
     current_time: float = 0.0
     cache_ram = 0
     cache_ram_inactive = 0
@@ -311,7 +337,47 @@ def prompt_worker(q, server_instance):
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
 
-        queue_item = q.get(timeout=timeout)
+        queue_item = None
+        if is_tp:
+            if rank == 0:
+                try:
+                    queue_item = q.get(timeout=timeout)
+                except Exception:
+                    queue_item = None
+
+                if queue_item is not None:
+                    # Serialize and broadcast to worker ranks
+                    data = json.dumps(queue_item).encode('utf-8')
+                    size_tensor = torch.tensor([len(data)], dtype=torch.int32, device=f"cuda:{local_rank}")
+                    dist.broadcast(size_tensor, src=0)
+                    data_tensor = torch.frombuffer(data, dtype=torch.uint8).clone().to(device=f"cuda:{local_rank}")
+                    dist.broadcast(data_tensor, src=0)
+                else:
+                    # Signal no item to worker ranks
+                    size_tensor = torch.tensor([-1], dtype=torch.int32, device=f"cuda:{local_rank}")
+                    dist.broadcast(size_tensor, src=0)
+            else:
+                # Receive from rank 0
+                size_tensor = torch.tensor([0], dtype=torch.int32, device=f"cuda:{local_rank}")
+                dist.broadcast(size_tensor, src=0)
+                size = size_tensor.item()
+                if size > 0:
+                    data_tensor = torch.zeros(size, dtype=torch.uint8, device=f"cuda:{local_rank}")
+                    dist.broadcast(data_tensor, src=0)
+                    data = bytes(data_tensor.cpu().numpy())
+                    decoded = json.loads(data.decode('utf-8'))
+                    # JSON deserializes tuples as lists; restore the tuple structure
+                    # queue_item = (item, item_id) where item is a 6-tuple
+                    queue_item = (tuple(decoded[0]), decoded[1])
+                else:
+                    queue_item = None
+        else:
+            # Single GPU mode: just get from queue
+            try:
+                queue_item = q.get(timeout=timeout)
+            except Exception:
+                queue_item = None
+
         if queue_item is not None:
             item, item_id = queue_item
             execution_start_time = time.perf_counter()
@@ -324,38 +390,97 @@ def prompt_worker(q, server_instance):
                 extra_data[k] = sensitive[k]
 
             asset_seeder.pause()
-            e.execute(item[2], prompt_id, extra_data, item[4])
+            # All ranks execute the prompt — TP layers use all_reduce internally.
+            # If any rank errors, we must still synchronize so no rank hangs at a barrier.
+            exec_error = None
+            try:
+                e.execute(item[2], prompt_id, extra_data, item[4])
+            except Exception as exc:
+                exec_error = exc
+                logging.error(f"[TP] Rank {rank} execution error: {exc}")
+
+            if is_tp:
+                # Check if any rank errored so all ranks can proceed past the barrier
+                error_flag = torch.tensor([1 if exec_error is not None else 0],
+                                           dtype=torch.int32, device=f"cuda:{local_rank}")
+                dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
+                if error_flag.item() > 0 and exec_error is None:
+                    logging.error(f"[TP] Rank {rank}: another rank errored during execution, skipping result handling")
+                dist.barrier()
+                any_error = error_flag.item() > 0
+            else:
+                any_error = exec_error is not None
 
             need_gc = True
 
-            remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
-            q.task_done(item_id,
-                        e.history_result,
-                        status=execution.PromptQueue.ExecutionStatus(
-                            status_str='success' if e.success else 'error',
-                            completed=e.success,
-                            messages=e.status_messages), process_item=remove_sensitive)
-            if server_instance.client_id is not None:
-                server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+            # Only rank 0 handles queue completion and server notifications
+            if rank == 0 and exec_error is None:
+                remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
+                q.task_done(item_id,
+                            e.history_result,
+                            status=execution.PromptQueue.ExecutionStatus(
+                                status_str='success' if e.success else 'error',
+                                completed=e.success,
+                                messages=e.status_messages), process_item=remove_sensitive)
+                if server_instance.client_id is not None:
+                    server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
+            elif rank == 0 and exec_error is not None:
+                # Rank 0 errored — still report the failure to the queue
+                remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
+                q.task_done(item_id,
+                            e.history_result,
+                            status=execution.PromptQueue.ExecutionStatus(
+                                status_str='error',
+                                completed=False,
+                                messages=e.status_messages), process_item=remove_sensitive)
 
             current_time = time.perf_counter()
             execution_time = current_time - execution_start_time
 
-            # Log Time in a more readable way after 10 minutes
-            if execution_time > 600:
-                execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
-                logging.info(f"Prompt executed in {execution_time}", extra={'color': 'green'})
+            if exec_error is None:
+                # Log Time in a more readable way after 10 minutes
+                if execution_time > 600:
+                    execution_time = time.strftime("%H:%M:%S", time.gmtime(execution_time))
+                    logging.info(f"Prompt executed in {execution_time}", extra={'color': 'green'})
+                else:
+                    logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
             else:
-                logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
+                logging.error(f"Prompt execution failed on rank {rank} in {execution_time:.2f}s: {exec_error}")
 
-            if not asset_seeder.is_disabled():
+            if rank == 0 and not asset_seeder.is_disabled() and exec_error is None:
                 paths = _collect_output_absolute_paths(e.history_result)
                 register_output_files(paths, job_id=prompt_id)
 
-        flags = q.get_flags()
-        free_memory = flags.get("free_memory", False)
+        # Handle memory management flags
+        if rank == 0:
+            flags = q.get_flags()
+            free_memory = flags.get("free_memory", False)
+            unload_models = flags.get("unload_models", free_memory)
+        else:
+            free_memory = False
+            unload_models = False
 
-        if flags.get("unload_models", free_memory):
+        if is_tp:
+            # Broadcast memory management flags from rank 0 to all worker ranks
+            # Encode: 0=none, 1=free_memory(unload+reset), 2=unload_only
+            if rank == 0:
+                flag_val = 0
+                if free_memory:
+                    flag_val = 1
+                elif unload_models:
+                    flag_val = 2
+                flag_tensor = torch.tensor([flag_val], dtype=torch.int32, device=f"cuda:{local_rank}")
+            else:
+                flag_tensor = torch.tensor([0], dtype=torch.int32, device=f"cuda:{local_rank}")
+            dist.broadcast(flag_tensor, src=0)
+            flag_val = flag_tensor.item()
+            if flag_val == 1:
+                free_memory = True
+                unload_models = True
+            elif flag_val == 2:
+                unload_models = True
+
+        if unload_models:
             comfy.model_management.unload_all_models()
             need_gc = True
             last_gc_collect = 0
@@ -374,7 +499,7 @@ def prompt_worker(q, server_instance):
                 need_gc = False
                 hook_breaker_ac10a0.restore_functions()
 
-                if not asset_seeder.is_disabled():
+                if rank == 0 and not asset_seeder.is_disabled():
                     asset_seeder.enqueue_enrich(roots=("output",), compute_hashes=True)
                 asset_seeder.resume()
 
@@ -453,7 +578,7 @@ def setup_database():
         logging.error(f"Failed to initialize database. Please ensure you have installed the latest requirements. If the error persists, please report this as in future the database will be required: {e}")
 
 
-def start_comfyui(asyncio_loop=None):
+def start_comfyui(asyncio_loop=None, rank=0):
     """
     Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
     Returns the event loop, server instance, and a function to start the server asynchronously.
@@ -467,7 +592,18 @@ def start_comfyui(asyncio_loop=None):
     if not asyncio_loop:
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
-    prompt_server = server.PromptServer(asyncio_loop)
+
+    import torch.distributed as dist
+    is_tp = dist.is_initialized()
+
+    if is_tp and rank != 0:
+        # Worker rank: use NullServer instead of PromptServer
+        prompt_server = NullServer()
+        # Set PromptServer.instance so custom nodes that reference it don't crash
+        server.PromptServer.instance = prompt_server
+        logging.info(f"[TP] Rank {rank} using NullServer (worker mode)")
+    else:
+        prompt_server = server.PromptServer(asyncio_loop)
 
     if args.enable_manager and not args.disable_manager_ui:
         comfyui_manager.start()
@@ -480,12 +616,15 @@ def start_comfyui(asyncio_loop=None):
     hook_breaker_ac10a0.restore_functions()
 
     cuda_malloc_warning()
-    setup_database()
+    if rank == 0:
+        setup_database()
 
-    prompt_server.add_routes()
-    hijack_progress(prompt_server)
+    if rank == 0 or not is_tp:
+        prompt_server.add_routes()
+        hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server,)).start()
+    q = prompt_server.prompt_queue if rank == 0 else NullQueue()
+    threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server,)).start()
 
     if args.quick_test_for_ci:
         exit(0)
@@ -526,11 +665,17 @@ if __name__ == "__main__":
     if args.disable_dynamic_vram:
         logging.warning("Dynamic vram disabled with argument. If you have any issues with dynamic vram enabled please give us a detailed reports as this argument will be removed soon.")
 
-    event_loop, _, start_all_func = start_comfyui()
+    event_loop, _, start_all_func = start_comfyui(rank=rank)
     try:
-        x = start_all_func()
-        app.logger.print_startup_warnings()
-        event_loop.run_until_complete(x)
+        # Only Rank 0 starts the server and listens for requests
+        if rank == 0:
+            x = start_all_func()
+            app.logger.print_startup_warnings()
+            event_loop.run_until_complete(x)
+        else:
+            logging.info(f"[TP] Rank {rank} is now in worker mode. Waiting for execution...")
+            # Keep the event loop alive; actual work happens in prompt_worker daemon thread
+            event_loop.run_forever()
     except KeyboardInterrupt:
         logging.info("\nStopped server")
     finally:
