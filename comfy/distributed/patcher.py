@@ -47,15 +47,17 @@ TP_TARGETS = {
 ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "mlp.2", "to_out_t"]
 COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t"]
 
-# Layer names that must NOT be sharded because they produce full-dim modulation vectors,
-# are fused QKV projections, or use torch.split() with unsharded dimensions internally.
-# - modulation.lin, img_mod.lin, txt_mod.lin: AdaLN modulation producing shift/scale/gate
-# - linear1, linear2: Flux SingleStreamBlock fused QKV+MLP layers
-# - qkv: Fused QKV attention projection (output dim = 3*hidden, reshaped with num_heads)
+# Layer names that must NOT be sharded. These are excluded because:
+# - Modulation layers (chunk() with full dim): modulation.lin, img_mod.lin, txt_mod.lin
+# - Fused QKV+MLP layers (torch.split with full dim): linear1, linear2
+# - Fused QKV projections (reshape with 3*num_heads): img_attn.qkv, txt_attn.qkv
+# - Coupled attention output projections (receive full-dim input from excluded qkv):
+#   img_attn.proj, txt_attn.proj — must stay unsharded when qkv is excluded
 EXCLUDED_LAYER_NAMES = [
     "linear1", "linear2",
     "modulation.lin", "img_mod.lin", "txt_mod.lin",
     "img_attn.qkv", "txt_attn.qkv",
+    "img_attn.proj", "txt_attn.proj",
 ]
 
 def get_tp_targets(model):
