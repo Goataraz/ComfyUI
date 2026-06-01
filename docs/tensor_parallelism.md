@@ -20,7 +20,10 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | Cosmos T2V/I2V | `GeneralDIT` | `blocks` |
 | Cosmos Predict2 / Anima | `MiniTrainDIT` | `blocks` |
 | HiDream Image | `HiDreamImageTransformer2DModel` | `double_stream_blocks`, `single_stream_blocks` |
-| HiDream O1 | `HiDreamO1Transformer` | `language_model.layers` |
+| QwenImage | `QwenImageTransformer2DModel` | `transformer_blocks` |
+| Qwen25 7B text encoder | `Llama2` | `layers` |
+
+HiDream O1 is **not** supported in this PR — its integrated Llama2 LLM receives input from non-TP visual/x_embedder components and needs a full-model TP strategy that shards the vision encoder too. The `HiDreamO1Transformer` class is intentionally not in `TP_TARGETS` and `get_tp_targets` returns `[]` for it.
 
 Model matching uses Python's MRO (Method Resolution Order) walk, so subclasses of supported models (e.g., `Anima(MiniTrainDIT)`) automatically inherit TP support.
 
@@ -106,6 +109,8 @@ When any rank encounters an error during prompt execution:
 ## Limitations
 
 - **NCCL only**: Currently requires NVIDIA GPUs with NCCL backend
-- **LoRA**: Not yet tested with TP-parallelized layers
+- **LoRA**: Tested with Flux+LoRA; works when the LoRA targets non-TP layers or when the patcher rewires LoRA applications to honor `is_tp_parallelized`. Custom LoRA paths should be verified.
 - **Dynamic batching**: All ranks must process the same prompt; batch parallelism is not combined with TP
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
+- **HiDream O1**: Disabled — needs full-model TP including vision encoder
+- **Cosmos TP exclusions**: GeneralDIT `blocks` has modulation/norm layers that may need architecture-specific exclusion analysis similar to Flux (not yet audited)
