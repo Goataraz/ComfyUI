@@ -63,7 +63,7 @@ TP_TARGETS = {
 # - mlp.2: MLP second linear (down-projection, rowwise with all-reduce)
 # - down/down_proj: general down-projection patterns
 # - w2: Megatron-style MLP down-projection
-ROWWISE_KEYWORDS = ["to_out", "proj", "down", "w2", "mlp.2", "to_out_t", "o_proj", "down_proj"]
+ROWWISE_KEYWORDS = ["to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t", "o_proj", "down_proj"]
 COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
 
 # Layer names that must NOT be sharded. These are excluded because:
@@ -111,11 +111,24 @@ def parallelize_model(model):
                     continue
 
                 # Determine mode
+                # Check colwise first: more specific QKV/input projection
+                # keywords (to_q, q_proj, etc.) take precedence over the
+                # generic `proj` substring. Also detect the QwenImage
+                # GELU/MLP first-Linear pattern `*.net.0.proj` (up-projection
+                # with no colwise keyword) explicitly so it does not fall
+                # through to the generic `proj` rowwise rule.
                 mode = "colwise"
-                if any(k in name for k in ROWWISE_KEYWORDS):
-                    mode = "rowwise"
-                elif any(k in name for k in COLWISE_KEYWORDS):
+                if any(k in name for k in COLWISE_KEYWORDS):
                     mode = "colwise"
+                elif ".net.0.proj" in name:
+                    # GELU/MLP first-Linear in a ModuleList (QwenImage) —
+                    # structurally an up-projection, colwise with gather.
+                    mode = "colwise"
+                elif any(k in name for k in ROWWISE_KEYWORDS) or name.endswith(".net.2"):
+                    # `.net.2` covers QwenImage's MLP down-projection
+                    # (the GELU+Droput+Linear ModuleList's index-2 Linear),
+                    # matching Flux's `mlp.2` rowwise convention.
+                    mode = "rowwise"
 
                 # Skip layers where the shard dimension isn't evenly divisible
                 dim = module.out_features if mode == "colwise" else module.in_features
