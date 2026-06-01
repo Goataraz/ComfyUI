@@ -53,6 +53,8 @@ TP_TARGETS = {
     # naively sharded — its layers receive input from non-TP visual/x_embedder
     # components. Full TP support requires sharding the vision encoder too.
     # "HiDreamO1Transformer": ["language_model.layers"],
+    "QwenImageTransformer2DModel": ["transformer_blocks"],
+    "Llama2": ["layers"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -75,6 +77,10 @@ EXCLUDED_LAYER_NAMES = [
     "modulation.lin", "img_mod.lin", "txt_mod.lin",
     "img_attn.qkv", "txt_attn.qkv",
     "img_attn.proj", "txt_attn.proj",
+    # QwenImage uses nn.Sequential(SiLU, Linear) for modulation; the Linear is
+    # at index 1 (not a ".lin" suffix). Output is 6*dim, chunked 2-way for
+    # (shift, scale, gate).
+    "img_mod.1", "txt_mod.1",
 ]
 
 def get_tp_targets(model):

@@ -237,3 +237,33 @@ class TestIsTPActive:
         with patch.dict("sys.modules", {"torch.distributed": None}):
             # This would raise ImportError on import, which is caught
             assert is_tp_active() is False
+
+
+# ---------------------------------------------------------------------------
+# QwenImage + Llama2 TP allowlist tests
+# ---------------------------------------------------------------------------
+
+class TestQwenImageTP:
+    """Verify QwenImageTransformer2DModel and Llama2 are matched by the TP allowlist."""
+
+    def test_qwen_image_transformer_targets_identified(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Qwen = type("QwenImageTransformer2DModel", (), {})
+        assert get_tp_targets(Qwen()) == ["transformer_blocks"]
+
+    def test_qwen_image_modulation_layers_excluded(self):
+        """img_mod.1 / txt_mod.1 are inside nn.Sequential(SiLU, Linear) and must not
+        be replaced — the outer Sequential in QwenImageTransformerBlock feeds
+        6*dim through chunk(2, dim=-1) for (shift, scale, gate)."""
+        from comfy.distributed.patcher import EXCLUDED_LAYER_NAMES
+        assert "img_mod.1" in EXCLUDED_LAYER_NAMES
+        assert "txt_mod.1" in EXCLUDED_LAYER_NAMES
+
+
+class TestLlamaTP:
+    """Verify the Qwen25 7B text encoder (Llama2) is matched by the TP allowlist."""
+
+    def test_llama_layers_identified(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Llama2 = type("Llama2", (), {})
+        assert get_tp_targets(Llama2()) == ["layers"]
