@@ -430,3 +430,145 @@ class TestShardingMode:
             assert modes[layer_name] == expected_mode, (
                 f"{layer_name}: expected {expected_mode}, got {modes[layer_name]}"
             )
+
+
+class TestQwenImageHeadSplit:
+    """For QwenImage (and similar head-split models), the colwise shard of
+    to_q/to_k/to_v distributes a contiguous slice of heads across ranks,
+    so each rank holds `(heads/world_size) * dim_head` channels with full
+    per-head dim_head. The Attention module's `self.heads` is divided by
+    world_size; the per-head norm weights and rotary embeddings are NOT
+    sharded (they replicate on every rank).
+    """
+
+    def _build_synthetic_model(self, head_dim, n_heads, parent_class_name):
+        import torch.nn as nn
+
+        class _Attn(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.heads = n_heads
+                self.dim_head = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(head_dim, eps=1e-6)
+                self.norm_k = nn.RMSNorm(head_dim, eps=1e-6)
+                self.norm_added_q = nn.RMSNorm(head_dim, eps=1e-6)
+                self.norm_added_k = nn.RMSNorm(head_dim, eps=1e-6)
+
+        class _Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                dim = n_heads * head_dim
+                self.attn = _Attn(dim)
+
+        class _TransformerBlocks(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([_Block()])
+
+        if parent_class_name == "QwenImageTransformer2DModel":
+            class Model(_TransformerBlocks):
+                pass
+            Model.__name__ = "QwenImageTransformer2DModel"
+            return Model()
+        raise ValueError(f"Unknown parent class name: {parent_class_name}")
+
+    def test_heads_overridden_to_world_size_divisor(self, monkeypatch):
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        model = self._build_synthetic_model(
+            head_dim=128, n_heads=24, parent_class_name="QwenImageTransformer2DModel"
+        )
+        attn_before = model.transformer_blocks[0].attn
+        assert attn_before.heads == 24
+        assert attn_before.dim_head == 128
+
+        patcher.parallelize_model(model)
+
+        attn_after = model.transformer_blocks[0].attn
+        assert attn_after.heads == 12, (
+            f"expected heads=12 after TP (world_size=2), got {attn_after.heads}"
+        )
+        assert attn_after.dim_head == 128, (
+            f"expected dim_head=128 (unchanged), got {attn_after.dim_head}"
+        )
+
+    def test_per_head_norms_not_flagged_or_sliced(self, monkeypatch):
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        model = self._build_synthetic_model(
+            head_dim=128, n_heads=24, parent_class_name="QwenImageTransformer2DModel"
+        )
+        patcher.parallelize_model(model)
+
+        flagged = {n for n, m in model.named_modules() if getattr(m, "_tp_norm_shard", None) is not None}
+        assert flagged == set(), (
+            f"Expected no _tp_norm_shard flags under head-split, got: {flagged}"
+        )
+
+        attn = model.transformer_blocks[0].attn
+        for n in ("norm_q", "norm_k", "norm_added_q", "norm_added_k"):
+            norm = getattr(attn, n)
+            assert tuple(norm.weight.shape) == (128,), (
+                f"{n}: weight shape should be (128,), got {tuple(norm.weight.shape)}"
+            )
+            assert tuple(norm.normalized_shape) == (128,), (
+                f"{n}: normalized_shape should stay (128,), got {tuple(norm.normalized_shape)}"
+            )
+
+    def test_non_qwenimage_attn_not_heads_overridden(self, monkeypatch):
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        import torch.nn as nn
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class _Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = 20
+                self.dim_head = 64
+                self.to_q = nn.Linear(1280, 1280, bias=False)
+
+        class _Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = _Attn()
+
+        class _Outer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.double_stream_blocks = nn.ModuleList([_Block()])
+
+        class Model(_Outer):
+            pass
+        Model.__name__ = "HiDreamImageTransformer2DModel"
+        model = Model()
+
+        patcher.parallelize_model(model)
+
+        attn = model.double_stream_blocks[0].attn
+        assert attn.heads == 20, (
+            f"HiDream heads should NOT be overridden, got {attn.heads}"
+        )
