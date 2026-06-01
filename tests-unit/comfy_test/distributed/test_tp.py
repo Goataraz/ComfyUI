@@ -267,3 +267,166 @@ class TestLlamaTP:
         from comfy.distributed.patcher import get_tp_targets
         Llama2 = type("Llama2", (), {})
         assert get_tp_targets(Llama2()) == ["layers"]
+
+
+class TestShardingMode:
+    """Verify the colwise/rowwise classification for QwenImage and Llama2 layer
+    names. Builds a synthetic model whose layer names mirror the real
+    architectures, then runs parallelize_model and inspects the
+    ParallelLinear.mode that was assigned to each replacement."""
+
+    def _collect_modes(self, model):
+        from comfy.distributed.parallel_linear import ParallelLinear
+        return {name: module.mode for name, module in model.named_modules()
+                if isinstance(module, ParallelLinear)}
+
+    def test_qwen_image_sharding_modes(self, monkeypatch):
+        """QwenImageTransformerBlock has the following Linear layers under
+        `transformer_blocks.*`:
+
+          attn.to_q / attn.to_k / attn.to_v       → colwise
+          attn.add_q_proj / attn.add_k_proj / attn.add_v_proj → colwise
+          attn.to_out.0                            → rowwise
+          attn.to_add_out                          → rowwise
+          img_mlp.net.0.proj (GELU inner Linear)   → colwise (up-projection)
+          img_mlp.net.2 (MLP down-projection)     → rowwise
+
+        Modulation layers (img_mod.1, txt_mod.1) must be excluded.
+        """
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        def L(in_f, out_f):
+            return nn.Linear(in_f, out_f, bias=True)
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        # Patch both modules — patcher and ParallelLinear both call get_mesh()
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class QwenBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Modulation: nn.Sequential(SiLU, Linear) — the Linear is at .1
+                self.img_mod = nn.Sequential(nn.SiLU(), L(64, 384))
+                self.txt_mod = nn.Sequential(nn.SiLU(), L(64, 384))
+                # Attention projections
+                self.attn = nn.Module()
+                self.attn.to_q = L(64, 64)
+                self.attn.to_k = L(64, 64)
+                self.attn.to_v = L(64, 64)
+                self.attn.add_q_proj = L(64, 64)
+                self.attn.add_k_proj = L(64, 64)
+                self.attn.add_v_proj = L(64, 64)
+                self.attn.to_out = nn.ModuleList([L(64, 64), nn.Identity()])
+                self.attn.to_add_out = L(64, 64)
+                # MLP: ModuleList of [GELU-with-proj, Dropout, Linear]
+                self.img_mlp = nn.Module()
+                self.img_mlp.net = nn.ModuleList()
+                gelu = nn.Sequential()
+                gelu.proj = L(64, 256)  # up-projection
+                self.img_mlp.net.append(gelu)
+                self.img_mlp.net.append(nn.Dropout(0.0))
+                self.img_mlp.net.append(L(256, 64))  # down-projection
+
+        class QwenModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([QwenBlock()])
+
+        # Tag the model class so the MRO match works
+        class QwenImageTransformer2DModel(QwenModel):
+            pass
+
+        model = QwenImageTransformer2DModel()
+        patched = patcher.parallelize_model(model)
+        assert patched is True
+
+        modes = self._collect_modes(model)
+        expected = {
+            "transformer_blocks.0.attn.to_q": "colwise",
+            "transformer_blocks.0.attn.to_k": "colwise",
+            "transformer_blocks.0.attn.to_v": "colwise",
+            "transformer_blocks.0.attn.add_q_proj": "colwise",
+            "transformer_blocks.0.attn.add_k_proj": "colwise",
+            "transformer_blocks.0.attn.add_v_proj": "colwise",
+            "transformer_blocks.0.attn.to_out.0": "rowwise",
+            "transformer_blocks.0.attn.to_add_out": "rowwise",
+            "transformer_blocks.0.img_mlp.net.0.proj": "colwise",
+            "transformer_blocks.0.img_mlp.net.2": "rowwise",
+        }
+        for layer_name, expected_mode in expected.items():
+            assert layer_name in modes, f"Layer {layer_name} was not sharded"
+            assert modes[layer_name] == expected_mode, (
+                f"{layer_name}: expected {expected_mode}, got {modes[layer_name]}"
+            )
+
+        # Modulation layers must be excluded
+        for excluded in ("transformer_blocks.0.img_mod.1",
+                         "transformer_blocks.0.txt_mod.1"):
+            assert excluded not in modes, f"{excluded} should be excluded"
+
+    def test_llama2_sharding_modes(self, monkeypatch):
+        """Llama2 (Qwen25 7B text encoder) layer names under `layers.*`:
+
+          self_attn.q_proj / k_proj / v_proj  → colwise
+          self_attn.o_proj                     → rowwise
+          mlp.gate_proj / mlp.up_proj          → colwise
+          mlp.down_proj                        → rowwise
+        """
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        def L(in_f, out_f):
+            return nn.Linear(in_f, out_f, bias=True)
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class LlamaBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Module()
+                self.self_attn.q_proj = L(64, 64)
+                self.self_attn.k_proj = L(64, 64)
+                self.self_attn.v_proj = L(64, 64)
+                self.self_attn.o_proj = L(64, 64)
+                self.mlp = nn.Module()
+                self.mlp.gate_proj = L(64, 256)
+                self.mlp.up_proj = L(64, 256)
+                self.mlp.down_proj = L(256, 64)
+
+        class Llama2Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([LlamaBlock()])
+
+        class Llama2(Llama2Model):
+            pass
+
+        model = Llama2()
+        patcher.parallelize_model(model)
+        modes = self._collect_modes(model)
+        expected = {
+            "layers.0.self_attn.q_proj": "colwise",
+            "layers.0.self_attn.k_proj": "colwise",
+            "layers.0.self_attn.v_proj": "colwise",
+            "layers.0.self_attn.o_proj": "rowwise",
+            "layers.0.mlp.gate_proj": "colwise",
+            "layers.0.mlp.up_proj": "colwise",
+            "layers.0.mlp.down_proj": "rowwise",
+        }
+        for layer_name, expected_mode in expected.items():
+            assert layer_name in modes, f"Layer {layer_name} was not sharded"
+            assert modes[layer_name] == expected_mode, (
+                f"{layer_name}: expected {expected_mode}, got {modes[layer_name]}"
+            )
