@@ -83,6 +83,15 @@ EXCLUDED_LAYER_NAMES = [
     "img_mod.1", "txt_mod.1",
 ]
 
+# Models where TP sharding splits HEADS (not head_dim). For these models
+# each rank holds a contiguous slice of the colwise projection's output
+# channels — i.e., a subset of heads with full per-head dim. The Attention
+# module's `self.heads` must be divided by world_size so that the model's
+# `.view(B, S, heads, dim_head)` reshape produces the correct
+# (B, S, heads//ws, dim_head) layout. The per-head RMSNorm weights and
+# rotary embeddings stay at full dim_head (replicated across ranks).
+TP_HEAD_SPLIT_MODELS = {"QwenImageTransformer2DModel"}
+
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
     for cls in type(model).__mro__:
@@ -97,6 +106,18 @@ def parallelize_model(model):
     targets = get_tp_targets(model)
     if not targets:
         return False
+
+    # For head-split models (QwenImage) the colwise shard distributes a
+    # contiguous slice of heads across ranks. We need to override
+    # `self.heads` on each Attention module so the model's
+    # `.view(B, S, heads, dim_head)` reshape produces the right per-rank
+    # layout. Detect this once up front.
+    model_class_name = None
+    for cls in type(model).__mro__:
+        if cls.__name__ in TP_HEAD_SPLIT_MODELS:
+            model_class_name = cls.__name__
+            break
+    head_split_active = model_class_name is not None
 
     logging.info(f"Applying Tensor Parallelism to {model.__class__.__name__} with targets: {targets}")
     mesh = get_mesh()
@@ -153,6 +174,39 @@ def parallelize_model(model):
 
     logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
                  f" ({skipped_dims} skipped for non-divisible dimensions)")
+
+    # Head-split override: for QwenImage-style models, the colwise shard
+    # distributes a contiguous slice of heads across ranks. Each rank's
+    # output of to_q/to_k/to_v is `(heads/world_size) * dim_head` channels,
+    # so the Attention module's `self.heads` must be divided by world_size
+    # to make the model's `.view(B, S, heads, dim_head)` reshape produce
+    # the right per-rank layout. Per-head norms and the rotary embedding
+    # stay at full dim_head on every rank (no slicing needed).
+    if head_split_active:
+        head_overrides = 0
+        for module in model.modules():
+            # Duck-typed Attention detection: has heads, dim_head, to_q
+            # already wrapped as ParallelLinear, and a per-head norm.
+            to_q = getattr(module, "to_q", None)
+            if not isinstance(to_q, ParallelLinear):
+                continue
+            heads = getattr(module, "heads", None)
+            dim_head = getattr(module, "dim_head", None)
+            if not isinstance(heads, int) or not isinstance(dim_head, int):
+                continue
+            if heads % mesh.world_size != 0:
+                raise RuntimeError(
+                    f"[TP] {model_class_name} attention heads={heads} not divisible by "
+                    f"world_size={mesh.world_size}"
+                )
+            local_heads = heads // mesh.world_size
+            module.heads = local_heads
+            head_overrides += 1
+        if head_overrides:
+            logging.info(
+                f"[TP] Head-split override: set heads={local_heads} (from "
+                f"{heads}) on {head_overrides} Attention modules"
+            )
     return True
 
 def load_tp_shards(model, sd, prefix=""):
