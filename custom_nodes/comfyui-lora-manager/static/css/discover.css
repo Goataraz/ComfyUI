@@ -1,0 +1,160 @@
+.discover-container {
+    padding: 16px;
+    max-width: 1600px;
+    margin: 0 auto;
+}
+
+.discover-filters {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.discover-search-input {
+    flex: 1 1 220px;
+    min-width: 180px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color, #ccc);
+    background: var(--input-bg, #fff);
+    color: var(--text-color, #222);
+    font-size: 14px;
+}
+
+.discover-select {
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color, #ccc);
+    background: var(--input-bg, #fff);
+    color: var(--text-color, #222);
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.discover-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 14px;
+}
+
+.discover-card {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--card-bg, #f5f5f5);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+}
+
+.discover-card-img {
+    width: 100%;
+    aspect-ratio: 2/3;
+    object-fit: cover;
+    display: block;
+    background: var(--placeholder-bg, #ddd);
+}
+
+.discover-card-info {
+    padding: 8px;
+}
+
+.discover-card-name {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 2px;
+}
+
+.discover-card-creator {
+    font-size: 11px;
+    color: var(--text-muted, #888);
+    margin-bottom: 4px;
+}
+
+.discover-card-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.discover-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--badge-bg, #e0e0e0);
+    color: var(--badge-color, #555);
+}
+
+.discover-badge-type {
+    background: #3b5bdb22;
+    color: #3b5bdb;
+}
+
+.discover-badge-base {
+    background: #2f9e4422;
+    color: #2f9e44;
+}
+
+.discover-installed-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: #2f9e44;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 4px;
+    pointer-events: none;
+}
+
+.discover-install-btn {
+    position: absolute;
+    bottom: 52px;
+    right: 8px;
+    background: #3b5bdb;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.discover-card:hover .discover-install-btn {
+    opacity: 1;
+}
+
+.discover-error,
+.discover-empty {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 48px 0;
+    color: var(--text-muted, #888);
+}
+
+.discover-error p {
+    margin-bottom: 12px;
+    font-size: 15px;
+}
+
+.discover-error button,
+.discover-load-more-btn {
+    padding: 7px 18px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color, #ccc);
+    background: var(--btn-bg, #fff);
+    cursor: pointer;
+    font-size: 14px;
+}
+
+.discover-load-more {
+    display: flex;
+    justify-content: center;
+    margin-top: 24px;
+}

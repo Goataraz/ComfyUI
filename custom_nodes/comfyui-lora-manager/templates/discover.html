@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Discover — {{ t('header.appTitle') }}{% endblock %}
+{% block page_id %}discover{% endblock %}
+
+{% block page_css %}
+<link rel="stylesheet" href="/loras_static/css/discover.css">
+{% endblock %}
+
+{% block content %}
+<div class="discover-container" id="discoverContainer">
+    <div class="discover-filters" id="discoverFilters">
+        <input type="text" id="discoverSearch" class="discover-search-input"
+               placeholder="Search CivitAI models..." autocomplete="off">
+        <select id="discoverTypeFilter" class="discover-select">
+            <option value="">All Types</option>
+        </select>
+        <select id="discoverBaseModelFilter" class="discover-select">
+            <option value="">All Base Models</option>
+        </select>
+    </div>
+    <div class="discover-grid" id="discoverGrid"></div>
+    <div class="discover-load-more" id="discoverLoadMore" style="display:none">
+        <button id="loadMoreBtn" class="discover-load-more-btn">Load More</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block main_script %}
+<script type="module" src="/loras_static/js/discover.js"></script>
+{% endblock %}
