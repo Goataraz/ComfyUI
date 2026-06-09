@@ -45,13 +45,12 @@ class TestFreeMemoryHandler:
     @pytest.mark.asyncio
     async def test_calls_unload_and_cache_clear(self, monkeypatch):
         mod, _ = load_beast_utils(monkeypatch)
-        with patch("comfy.model_management.unload_all_models") as mock_unload, \
-             patch("comfy.model_management.soft_empty_cache") as mock_cache, \
-             patch("gc.collect") as mock_gc:
+        mm_mock = sys.modules["comfy.model_management"]
+        with patch("gc.collect") as mock_gc:
             request = make_mocked_request("POST", "/beast/free-memory")
             await mod.free_memory(request)
-        mock_unload.assert_called_once()
-        mock_cache.assert_called_once()
+        mm_mock.unload_all_models.assert_called_once()
+        mm_mock.soft_empty_cache.assert_called_once()
         mock_gc.assert_called_once()
 
 
@@ -76,6 +75,20 @@ class TestRestartHandler:
             await mod.restart(request)
         mock_thread_cls.assert_called_once()
         mock_thread.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kills_parent_with_sigterm(self, monkeypatch):
+        import signal as signal_mod
+        import time as real_time
+        mod, _ = load_beast_utils(monkeypatch)
+        kill_calls = []
+        monkeypatch.setattr(mod.time, "sleep", lambda _: None)
+        monkeypatch.setattr(mod.os, "kill", lambda pid, sig: kill_calls.append((pid, sig)))
+        monkeypatch.setattr(mod.os, "getppid", lambda: 12345)
+        request = make_mocked_request("POST", "/beast/restart")
+        await mod.restart(request)
+        real_time.sleep(0.05)
+        assert kill_calls == [(12345, signal_mod.SIGTERM)]
 
 
 class TestRankGuard:
