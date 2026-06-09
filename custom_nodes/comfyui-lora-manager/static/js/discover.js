@@ -1,3 +1,4 @@
+import { appCore } from './core.js';
 import { downloadManager } from './managers/DownloadManager.js';
 import { showModelModalForCivitaiId } from './components/shared/ModelModal.js';
 
@@ -255,5 +256,8 @@ function init() {
 
 // Guard: only auto-run when the Discover page DOM is present
 if (document.getElementById('discoverGrid')) {
-    init();
+    document.addEventListener('DOMContentLoaded', async () => {
+        await appCore.initialize();
+        init();
+    });
 }

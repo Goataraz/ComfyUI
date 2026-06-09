@@ -8,6 +8,10 @@ vi.mock('../../../static/js/components/shared/ModelModal.js', () => ({
     showModelModalForCivitaiId: vi.fn(),
 }));
 
+vi.mock('../../../static/js/core.js', () => ({
+    appCore: { initialize: vi.fn().mockResolvedValue(undefined) },
+}));
+
 let buildCard, installModel;
 
 beforeEach(async () => {
@@ -134,6 +138,8 @@ describe('card click behavior', () => {
     it('card body click calls showModelModalForCivitaiId with correct args', async () => {
         const { showModelModalForCivitaiId } = await import('../../../static/js/components/shared/ModelModal.js');
         const { buildCard } = await import('../../../static/js/discover.js');
+        document.dispatchEvent(new Event('DOMContentLoaded'));
+        await new Promise(resolve => setTimeout(resolve, 0));
 
         const model = {
             id: 555,
@@ -157,6 +163,8 @@ describe('card click behavior', () => {
     it('install button click does NOT call showModelModalForCivitaiId', async () => {
         const { showModelModalForCivitaiId } = await import('../../../static/js/components/shared/ModelModal.js');
         const { buildCard } = await import('../../../static/js/discover.js');
+        document.dispatchEvent(new Event('DOMContentLoaded'));
+        await new Promise(resolve => setTimeout(resolve, 0));
 
         const model = {
             id: 777,
