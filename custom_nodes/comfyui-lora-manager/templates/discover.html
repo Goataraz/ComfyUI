@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 
-{% block title %}Discover — {{ t('header.appTitle') }}{% endblock %}
+{% block title %}{{ t('header.navigation.discover') }} - {{ t('header.appTitle') }}{% endblock %}
 {% block page_id %}discover{% endblock %}
 
 {% block page_css %}
-<link rel="stylesheet" href="/loras_static/css/discover.css">
+<link rel="stylesheet" href="/loras_static/css/discover.css?v={{ version }}">
 {% endblock %}
 
 {% block content %}
@@ -27,5 +27,5 @@
 {% endblock %}
 
 {% block main_script %}
-<script type="module" src="/loras_static/js/discover.js"></script>
+<script type="module" src="/loras_static/js/discover.js?v={{ version }}"></script>
 {% endblock %}
