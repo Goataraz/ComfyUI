@@ -191,3 +191,66 @@ async def test_browse_returns_401_on_auth_failure(monkeypatch):
     request = make_mocked_request("GET", "/api/lm/discover/browse")
     response = await routes.browse_models(request)
     assert response.status == 401
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_returns_payload(monkeypatch):
+    payload = {"id": 123, "name": "Test Model", "modelVersions": []}
+    mock_client = AsyncMock()
+    mock_client.get_model_detail = AsyncMock(return_value=payload)
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request(
+        "GET", "/api/lm/discover/model/123", match_info={"model_id": "123"}
+    )
+    response = await routes.get_model_detail(request)
+    assert response.status == 200
+    assert json.loads(response.body)["id"] == 123
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_returns_404_for_not_found(monkeypatch):
+    mock_client = AsyncMock()
+    mock_client.get_model_detail = AsyncMock(return_value={"error": "404 Not Found"})
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request(
+        "GET", "/api/lm/discover/model/999", match_info={"model_id": "999"}
+    )
+    response = await routes.get_model_detail(request)
+    assert response.status == 404
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_returns_429_on_rate_limit(monkeypatch):
+    from py.services.errors import RateLimitError
+    mock_client = AsyncMock()
+    mock_client.get_model_detail = AsyncMock(side_effect=RateLimitError("rate limited"))
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request(
+        "GET", "/api/lm/discover/model/123", match_info={"model_id": "123"}
+    )
+    response = await routes.get_model_detail(request)
+    assert response.status == 429
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_returns_503_on_generic_error(monkeypatch):
+    mock_client = AsyncMock()
+    mock_client.get_model_detail = AsyncMock(return_value={"error": "connection refused"})
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request(
+        "GET", "/api/lm/discover/model/123", match_info={"model_id": "123"}
+    )
+    response = await routes.get_model_detail(request)
+    assert response.status == 503

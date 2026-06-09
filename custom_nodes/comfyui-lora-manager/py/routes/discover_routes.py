@@ -27,6 +27,7 @@ class DiscoverRoutes:
         app.router.add_get("/discover", self.handle_discover_page)
         app.router.add_get("/api/lm/discover/browse", self.browse_models)
         app.router.add_get("/api/lm/discover/installed-ids", self.get_installed_ids)
+        app.router.add_get("/api/lm/discover/model/{model_id}", self.get_model_detail)
 
     async def handle_discover_page(self, request: web.Request) -> web.Response:
         try:
@@ -113,3 +114,20 @@ class DiscoverRoutes:
             except Exception as exc:
                 logger.warning("Could not collect installed IDs from scanner: %s", exc)
         return web.json_response({"ids": list(ids)})
+
+    async def get_model_detail(self, request: web.Request) -> web.Response:
+        model_id = request.match_info["model_id"]
+        try:
+            client = await CivitaiClient.get_instance()
+            result = await client.get_model_detail(model_id)
+        except RateLimitError:
+            return web.json_response({"error": "Rate limited by CivitAI"}, status=429)
+
+        if "error" in result:
+            error_str = str(result["error"])
+            if "401" in error_str:
+                return web.json_response({"error": "Authentication required"}, status=401)
+            if "404" in error_str:
+                return web.json_response({"error": "Model not found"}, status=404)
+            return web.json_response({"error": error_str}, status=503)
+        return web.json_response(result)
