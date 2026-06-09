@@ -158,3 +158,18 @@
     justify-content: center;
     margin-top: 24px;
 }
+
+/* Card loading spinner while fetching model detail */
+.discover-card-spinner {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in oklch, var(--lora-bg, #1a1a2e) 70%, transparent);
+    border-radius: inherit;
+    font-size: 1.5rem;
+    color: var(--lora-accent);
+    z-index: 2;
+    pointer-events: none;
+}
