@@ -118,12 +118,6 @@ describe('installModel', () => {
 describe('card click behavior', () => {
     beforeEach(async () => {
         vi.resetModules();
-        vi.mock('../../../static/js/managers/DownloadManager.js', () => ({
-            downloadManager: { openForModelVersion: vi.fn() },
-        }));
-        vi.mock('../../../static/js/components/shared/ModelModal.js', () => ({
-            showModelModalForCivitaiId: vi.fn(),
-        }));
         global.fetch = vi.fn().mockResolvedValue({
             ok: true,
             json: async () => ({ ids: [], items: [], metadata: { currentPage: 1, totalPages: 1 } }),
