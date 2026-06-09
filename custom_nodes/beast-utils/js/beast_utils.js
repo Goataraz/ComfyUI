@@ -90,6 +90,7 @@ async function onFreeMemory() {
     if (!confirm("Unload all models and free VRAM/RAM?\n\nThis clears everything currently in memory.")) return;
     try {
         const res = await fetch("/beast/free-memory", { method: "POST" });
+        if (!res.ok) { alert("Free memory failed: server returned " + res.status); return; }
         const data = await res.json();
         if (data.success) {
             showToast("Memory freed");
