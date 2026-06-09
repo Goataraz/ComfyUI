@@ -1143,6 +1143,71 @@ async function handleSendToWorkflow(target, modelType) {
     }
 }
 
+function normalizeCivitaiModelDetail(civitaiModel) {
+    const firstVersion = (civitaiModel.modelVersions || [])[0] || {};
+    const tags = (civitaiModel.tags || [])
+        .map(t => (typeof t === 'string' ? t : t?.name || ''))
+        .filter(Boolean);
+    return {
+        model_name: civitaiModel.name || '',
+        file_path: null,
+        from_civitai: true,
+        base_model: firstVersion.baseModel || '',
+        sha256: null,
+        tags,
+        update_available: false,
+        civitai: {
+            modelId: civitaiModel.id,
+            id: firstVersion.id,
+            creator: civitaiModel.creator,
+            trainedWords: firstVersion.trainedWords || [],
+            images: firstVersion.images || [],
+            description: firstVersion.description || civitaiModel.description || '',
+            model: {
+                allowCommercialUse: civitaiModel.allowCommercialUse,
+                allowDerivatives: civitaiModel.allowDerivatives,
+                allowNoCredit: civitaiModel.allowNoCredit,
+                allowDifferentLicense: civitaiModel.allowDifferentLicense,
+            },
+        },
+    };
+}
+
+export async function showModelModalForCivitaiId(civitaiId, modelType, { onInstall = null } = {}) {
+    const card = document.querySelector(`.discover-card[data-civitai-id="${civitaiId}"]`);
+    let spinner = null;
+    if (card) {
+        spinner = document.createElement('div');
+        spinner.className = 'discover-card-spinner';
+        const icon = document.createElement('i');
+        icon.className = 'fas fa-spinner fa-spin';
+        spinner.appendChild(icon);
+        card.appendChild(spinner);
+    }
+
+    try {
+        const res = await fetch(`/api/lm/discover/model/${civitaiId}`);
+        const data = await res.json();
+
+        if (!res.ok) {
+            const errorMap = {
+                404: ['discover.errors.notFound', 'Model not found on CivitAI'],
+                429: ['discover.errors.rateLimit', 'CivitAI is rate limiting requests, try again in a moment'],
+            };
+            const [key, fallback] = errorMap[res.status] || ['discover.errors.network', 'Could not reach CivitAI — check your connection'];
+            showToast(key, {}, 'error', fallback);
+            return;
+        }
+
+        const model = normalizeCivitaiModelDetail(data);
+        await showModelModal(model, modelType, { isDiscoverModel: true, onInstall });
+    } catch (_) {
+        showToast('discover.errors.network', {}, 'error', 'Could not reach CivitAI — check your connection');
+    } finally {
+        if (spinner) spinner.remove();
+    }
+}
+
 // Export the model modal API
 const modelModal = {
     show: showModelModal,
