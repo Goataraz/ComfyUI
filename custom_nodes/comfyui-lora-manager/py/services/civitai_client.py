@@ -857,6 +857,8 @@ class CivitaiClient:
                 use_auth=True,
             )
             if not success:
+                if is_expected_offline_error(result):
+                    logger.info("get_model_detail offline: %s", OFFLINE_FRIENDLY_MESSAGE)
                 return {"error": str(result)}
             return result if isinstance(result, dict) else {"error": "Invalid response"}
         except RateLimitError:
