@@ -815,7 +815,7 @@ class CivitaiClient:
         *,
         model_type: str | None = None,
         base_model: str | None = None,
-        sort: str = "Trending",
+        sort: str = "Most Downloaded",
         period: str = "Week",
         query: str | None = None,
         page: int = 1,

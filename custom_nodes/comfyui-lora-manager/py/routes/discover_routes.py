@@ -57,7 +57,7 @@ class DiscoverRoutes:
         q = request.rel_url.query
         model_type = q.get("type") or None
         base_model = q.get("baseModel") or None
-        sort = q.get("sort", "Trending")
+        sort = q.get("sort", "Most Downloaded")
         period = q.get("period", "Week")
         query = q.get("query") or None
         try:

@@ -90,7 +90,7 @@ async def test_browse_forwards_params_to_client(monkeypatch):
     mock_client.browse_models.assert_called_once_with(
         model_type="LORA",
         base_model="Flux.1 D",
-        sort="Trending",
+        sort="Most Downloaded",
         period="Week",
         query="cat",
         page=2,

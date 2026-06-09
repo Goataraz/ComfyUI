@@ -30,7 +30,7 @@ async def test_browse_models_default_params(downloader):
     client = await CivitaiClient.get_instance()
     result = await client.browse_models()
     params = downloader.make_request.call_args.kwargs["params"]
-    assert params["sort"] == "Trending"
+    assert params["sort"] == "Most Downloaded"
     assert params["period"] == "Week"
     assert params["page"] == 1
     assert params["limit"] == 20
