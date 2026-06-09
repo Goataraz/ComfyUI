@@ -1,4 +1,5 @@
 import { downloadManager } from './managers/DownloadManager.js';
+import { showModelModalForCivitaiId } from './components/shared/ModelModal.js';
 
 const MODEL_TYPE_MAP = {
     LORA: 'loras',
@@ -35,6 +36,8 @@ export function buildCard(model, installedIds) {
     const card = document.createElement('div');
     card.className = 'discover-card';
     card.dataset.modelId = model.id;
+    card.dataset.civitaiId = model.id;
+    card.dataset.modelType = model.type;
 
     const version = (model.modelVersions || [])[0] || {};
     const image = (version.images || []).find(img => img.url && !img.url.endsWith('.mp4'));
@@ -234,6 +237,18 @@ function init() {
     });
     document.getElementById('loadMoreBtn').addEventListener('click', () => {
         loadPage(currentPage + 1, true);
+    });
+    document.getElementById('discoverGrid').addEventListener('click', (e) => {
+        if (e.target.closest('.discover-install-btn')) return;
+        const card = e.target.closest('.discover-card');
+        if (!card || !card.dataset.civitaiId) return;
+        const modelType = MODEL_TYPE_MAP[card.dataset.modelType] || 'loras';
+        showModelModalForCivitaiId(card.dataset.civitaiId, modelType, {
+            onInstall: () => installModel({
+                id: Number(card.dataset.civitaiId),
+                type: card.dataset.modelType,
+            }),
+        });
     });
     fetchInstalledIds().then(() => loadPage(1, false));
 }

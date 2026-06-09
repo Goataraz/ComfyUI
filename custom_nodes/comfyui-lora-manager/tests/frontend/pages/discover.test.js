@@ -4,6 +4,10 @@ vi.mock('../../../static/js/managers/DownloadManager.js', () => ({
     downloadManager: { openForModelVersion: vi.fn() },
 }));
 
+vi.mock('../../../static/js/components/shared/ModelModal.js', () => ({
+    showModelModalForCivitaiId: vi.fn(),
+}));
+
 let buildCard, installModel;
 
 beforeEach(async () => {
@@ -108,5 +112,70 @@ describe('installModel', () => {
         const { downloadManager } = await import('../../../static/js/managers/DownloadManager.js');
         installModel({ id: 77, type: 'Poses' });
         expect(downloadManager.openForModelVersion).toHaveBeenCalledWith('loras', 77);
+    });
+});
+
+describe('card click behavior', () => {
+    beforeEach(async () => {
+        vi.resetModules();
+        vi.mock('../../../static/js/managers/DownloadManager.js', () => ({
+            downloadManager: { openForModelVersion: vi.fn() },
+        }));
+        vi.mock('../../../static/js/components/shared/ModelModal.js', () => ({
+            showModelModalForCivitaiId: vi.fn(),
+        }));
+        global.fetch = vi.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({ ids: [], items: [], metadata: { currentPage: 1, totalPages: 1 } }),
+        });
+        document.body.innerHTML = `
+            <div id="discoverGrid"></div>
+            <select id="discoverTypeFilter"></select>
+            <select id="discoverBaseModelFilter"></select>
+            <input id="discoverSearch">
+            <div id="discoverLoadMore" style="display:none"><button id="loadMoreBtn"></button></div>
+        `;
+    });
+
+    it('card body click calls showModelModalForCivitaiId with correct args', async () => {
+        const { showModelModalForCivitaiId } = await import('../../../static/js/components/shared/ModelModal.js');
+        const { buildCard } = await import('../../../static/js/discover.js');
+
+        const model = {
+            id: 555,
+            name: 'ClickMe',
+            type: 'LORA',
+            creator: { username: 'u' },
+            modelVersions: [],
+        };
+        const card = buildCard(model, new Set());
+        document.getElementById('discoverGrid').appendChild(card);
+
+        card.querySelector('.discover-card-info').click();
+
+        expect(showModelModalForCivitaiId).toHaveBeenCalledWith(
+            '555',
+            'loras',
+            expect.objectContaining({ onInstall: expect.any(Function) })
+        );
+    });
+
+    it('install button click does NOT call showModelModalForCivitaiId', async () => {
+        const { showModelModalForCivitaiId } = await import('../../../static/js/components/shared/ModelModal.js');
+        const { buildCard } = await import('../../../static/js/discover.js');
+
+        const model = {
+            id: 777,
+            name: 'NewModel',
+            type: 'LORA',
+            creator: { username: 'u' },
+            modelVersions: [],
+        };
+        const card = buildCard(model, new Set());
+        document.getElementById('discoverGrid').appendChild(card);
+
+        card.querySelector('.discover-install-btn').click();
+
+        expect(showModelModalForCivitaiId).not.toHaveBeenCalled();
     });
 });
