@@ -126,3 +126,53 @@ async def test_browse_returns_503_on_error(monkeypatch):
     request = make_mocked_request("GET", "/api/lm/discover/browse")
     response = await routes.browse_models(request)
     assert response.status == 503
+
+
+@pytest.mark.asyncio
+async def test_browse_returns_429_on_rate_limit(monkeypatch):
+    from py.services.errors import RateLimitError
+    mock_client = AsyncMock()
+    mock_client.browse_models = AsyncMock(side_effect=RateLimitError("rate limited"))
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request("GET", "/api/lm/discover/browse")
+    response = await routes.browse_models(request)
+    assert response.status == 429
+
+
+@pytest.mark.asyncio
+async def test_installed_ids_handles_scanner_failure_gracefully(monkeypatch):
+    """If one scanner raises, the others still contribute."""
+    good_data = [{"civitai": {"modelId": 999}}]
+
+    async def fake_lora_fail(cls):
+        raise RuntimeError("scanner unavailable")
+
+    async def fake_checkpoint(cls):
+        return FakeScanner(good_data)
+
+    async def fake_embedding(cls):
+        return FakeScanner([])
+
+    monkeypatch.setattr(
+        discover_module.ServiceRegistry, "get_lora_scanner", classmethod(fake_lora_fail)
+    )
+    monkeypatch.setattr(
+        discover_module.ServiceRegistry,
+        "get_checkpoint_scanner",
+        classmethod(fake_checkpoint),
+    )
+    monkeypatch.setattr(
+        discover_module.ServiceRegistry,
+        "get_embedding_scanner",
+        classmethod(fake_embedding),
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request("GET", "/api/lm/discover/installed-ids")
+    response = await routes.get_installed_ids(request)
+    import json
+    data = json.loads(response.body)
+    assert data["ids"] == [999]
+    assert response.status == 200

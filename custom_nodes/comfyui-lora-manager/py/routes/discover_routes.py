@@ -78,7 +78,14 @@ class DiscoverRoutes:
             return web.json_response({"error": "Rate limited by CivitAI"}, status=429)
 
         if "error" in result:
-            return web.json_response({"error": result["error"]}, status=503)
+            error_str = str(result["error"])
+            # CivitAI auth failures surface as error strings containing "401";
+            # there is no dedicated AuthenticationError in the client — failures
+            # come back as (False, error_string) from _make_request and are
+            # wrapped into the error dict by browse_models().
+            if "401" in error_str:
+                return web.json_response({"error": "Authentication required"}, status=401)
+            return web.json_response({"error": error_str}, status=503)
         return web.json_response(result)
 
     async def get_installed_ids(self, request: web.Request) -> web.Response:
