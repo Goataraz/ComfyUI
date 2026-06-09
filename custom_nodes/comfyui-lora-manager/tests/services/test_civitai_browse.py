@@ -70,6 +70,15 @@ async def test_browse_models_returns_error_dict_on_failure(downloader):
     downloader.make_request = AsyncMock(return_value=(False, "server error"))
     client = await CivitaiClient.get_instance()
     result = await client.browse_models()
-    assert "error" in result
+    assert result["error"] == "server error"
     assert result["items"] == []
     assert result["metadata"] == {}
+
+
+@pytest.mark.asyncio
+async def test_browse_models_reraises_rate_limit_error(downloader):
+    from py.services.errors import RateLimitError
+    downloader.make_request = AsyncMock(side_effect=RateLimitError("rate limited"))
+    client = await CivitaiClient.get_instance()
+    with pytest.raises(RateLimitError):
+        await client.browse_models()

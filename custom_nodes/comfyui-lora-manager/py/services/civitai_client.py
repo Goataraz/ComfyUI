@@ -839,11 +839,11 @@ class CivitaiClient:
             )
             if not success:
                 if is_expected_offline_error(result):
-                    logger.info("browse_models skipped: %s", OFFLINE_FRIENDLY_MESSAGE)
+                    logger.info("browse_models offline: %s", OFFLINE_FRIENDLY_MESSAGE)
                 return {"error": str(result), "items": [], "metadata": {}}
             return result if isinstance(result, dict) else {"items": [], "metadata": {}}
         except RateLimitError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - defensive logging
             logger.error("Error in browse_models: %s", exc)
             return {"error": str(exc), "items": [], "metadata": {}}
