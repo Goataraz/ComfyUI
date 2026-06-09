@@ -31,9 +31,11 @@ class DiscoverRoutes:
     async def handle_discover_page(self, request: web.Request) -> web.Response:
         try:
             user_language = "en"
+            settings_manager = None
             try:
                 from ..services.settings_manager import get_settings_manager
-                user_language = get_settings_manager().get("language", "en")
+                settings_manager = get_settings_manager()
+                user_language = settings_manager.get("language", "en")
             except Exception:
                 pass
             server_i18n.set_locale(user_language)
@@ -42,6 +44,7 @@ class DiscoverRoutes:
                 self._template_env._i18n_filter_added = True
             rendered = self._template_env.get_template("discover.html").render(
                 is_initializing=False,
+                settings=settings_manager,
                 request=request,
                 t=server_i18n.get_translation,
             )
