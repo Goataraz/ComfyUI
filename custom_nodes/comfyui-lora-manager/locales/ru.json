@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "Посмотреть профиль создателя",
                 "openFileLocation": "Открыть расположение файла",
                 "sendToWorkflow": "Отправить в ComfyUI",
-                "sendToWorkflowText": "Отправить в ComfyUI"
+                "sendToWorkflowText": "Отправить в ComfyUI",
+                "install": "[TODO: Translate] Install model",
+                "installText": "[TODO: Translate] Install"
             },
             "openFileLocation": {
                 "success": "Расположение файла успешно открыто",
@@ -2008,6 +2010,13 @@
             "rebuilding": "Перестроение кэша...",
             "rebuildFailed": "Не удалось перестроить кэш: {error}",
             "retry": "Повторить"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "[TODO: Translate] Model not found on CivitAI",
+            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
+            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

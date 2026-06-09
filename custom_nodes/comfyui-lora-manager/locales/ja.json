@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "作成者プロフィールを表示",
                 "openFileLocation": "ファイルの場所を開く",
                 "sendToWorkflow": "ComfyUI に送信",
-                "sendToWorkflowText": "ComfyUI に送信"
+                "sendToWorkflowText": "ComfyUI に送信",
+                "install": "[TODO: Translate] Install model",
+                "installText": "[TODO: Translate] Install"
             },
             "openFileLocation": {
                 "success": "ファイルの場所を正常に開きました",
@@ -2008,6 +2010,13 @@
             "rebuilding": "キャッシュを再構築中...",
             "rebuildFailed": "キャッシュの再構築に失敗しました: {error}",
             "retry": "再試行"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "[TODO: Translate] Model not found on CivitAI",
+            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
+            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

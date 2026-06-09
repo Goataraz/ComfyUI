@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "查看创作者主页",
                 "openFileLocation": "打开文件位置",
                 "sendToWorkflow": "发送到 ComfyUI",
-                "sendToWorkflowText": "发送到 ComfyUI"
+                "sendToWorkflowText": "发送到 ComfyUI",
+                "install": "[TODO: Translate] Install model",
+                "installText": "[TODO: Translate] Install"
             },
             "openFileLocation": {
                 "success": "文件位置已成功打开",
@@ -2008,6 +2010,13 @@
             "rebuilding": "正在重建缓存...",
             "rebuildFailed": "重建缓存失败：{error}",
             "retry": "重试"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "[TODO: Translate] Model not found on CivitAI",
+            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
+            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

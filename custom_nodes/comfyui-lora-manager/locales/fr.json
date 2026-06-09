@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "Voir le profil du créateur",
                 "openFileLocation": "Ouvrir l'emplacement du fichier",
                 "sendToWorkflow": "Envoyer vers ComfyUI",
-                "sendToWorkflowText": "Envoyer vers ComfyUI"
+                "sendToWorkflowText": "Envoyer vers ComfyUI",
+                "install": "[TODO: Translate] Install model",
+                "installText": "[TODO: Translate] Install"
             },
             "openFileLocation": {
                 "success": "Emplacement du fichier ouvert avec succès",
@@ -2008,6 +2010,13 @@
             "rebuilding": "Reconstruction du cache...",
             "rebuildFailed": "Échec de la reconstruction du cache : {error}",
             "retry": "Réessayer"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "[TODO: Translate] Model not found on CivitAI",
+            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
+            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

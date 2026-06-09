@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "View Creator Profile",
                 "openFileLocation": "Open File Location",
                 "sendToWorkflow": "Send to ComfyUI",
-                "sendToWorkflowText": "Send to ComfyUI"
+                "sendToWorkflowText": "Send to ComfyUI",
+                "install": "Install model",
+                "installText": "Install"
             },
             "openFileLocation": {
                 "success": "File location opened successfully",
@@ -2008,6 +2010,13 @@
             "rebuilding": "Rebuilding cache...",
             "rebuildFailed": "Failed to rebuild cache: {error}",
             "retry": "Retry"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "Model not found on CivitAI",
+            "rateLimit": "CivitAI is rate limiting requests, try again in a moment",
+            "network": "Could not reach CivitAI — check your connection"
         }
     }
 }

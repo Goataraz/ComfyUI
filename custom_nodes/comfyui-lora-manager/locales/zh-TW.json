@@ -1188,7 +1188,9 @@
                 "viewCreatorProfile": "查看創作者個人檔案",
                 "openFileLocation": "開啟檔案位置",
                 "sendToWorkflow": "傳送到 ComfyUI",
-                "sendToWorkflowText": "傳送到 ComfyUI"
+                "sendToWorkflowText": "傳送到 ComfyUI",
+                "install": "[TODO: Translate] Install model",
+                "installText": "[TODO: Translate] Install"
             },
             "openFileLocation": {
                 "success": "檔案位置已成功開啟",
@@ -2008,6 +2010,13 @@
             "rebuilding": "重建快取中...",
             "rebuildFailed": "重建快取失敗：{error}",
             "retry": "重試"
+        }
+    },
+    "discover": {
+        "errors": {
+            "notFound": "[TODO: Translate] Model not found on CivitAI",
+            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
+            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }
