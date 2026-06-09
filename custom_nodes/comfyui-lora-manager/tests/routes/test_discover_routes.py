@@ -176,3 +176,18 @@ async def test_installed_ids_handles_scanner_failure_gracefully(monkeypatch):
     data = json.loads(response.body)
     assert data["ids"] == [999]
     assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_browse_returns_401_on_auth_failure(monkeypatch):
+    mock_client = AsyncMock()
+    mock_client.browse_models = AsyncMock(
+        return_value={"error": "401 Unauthorized: Invalid API key", "items": [], "metadata": {}}
+    )
+    monkeypatch.setattr(
+        discover_module.CivitaiClient, "get_instance", AsyncMock(return_value=mock_client)
+    )
+    routes = DiscoverRoutes()
+    request = make_mocked_request("GET", "/api/lm/discover/browse")
+    response = await routes.browse_models(request)
+    assert response.status == 401
