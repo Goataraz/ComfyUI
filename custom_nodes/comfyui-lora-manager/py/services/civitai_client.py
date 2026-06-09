@@ -847,3 +847,20 @@ class CivitaiClient:
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.error("Error in browse_models: %s", exc)
             return {"error": str(exc), "items": [], "metadata": {}}
+
+    async def get_model_detail(self, model_id: str) -> dict:
+        """Fetch detailed information about a specific CivitAI model."""
+        try:
+            success, result = await self._make_request(
+                "GET",
+                f"{self.base_url}/models/{model_id}",
+                use_auth=True,
+            )
+            if not success:
+                return {"error": str(result)}
+            return result if isinstance(result, dict) else {"error": "Invalid response"}
+        except RateLimitError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("Error in get_model_detail: %s", exc)
+            return {"error": str(exc)}

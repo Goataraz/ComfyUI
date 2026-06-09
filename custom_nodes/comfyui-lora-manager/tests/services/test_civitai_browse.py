@@ -82,3 +82,32 @@ async def test_browse_models_reraises_rate_limit_error(downloader):
     client = await CivitaiClient.get_instance()
     with pytest.raises(RateLimitError):
         await client.browse_models()
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_success(downloader):
+    downloader.make_request = AsyncMock(
+        return_value=(True, {"id": 123, "name": "Test Model", "modelVersions": []})
+    )
+    client = await CivitaiClient.get_instance()
+    result = await client.get_model_detail("123")
+    assert result["id"] == 123
+    assert result["name"] == "Test Model"
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_returns_error_dict_on_failure(downloader):
+    downloader.make_request = AsyncMock(return_value=(False, "404 Not Found"))
+    client = await CivitaiClient.get_instance()
+    result = await client.get_model_detail("999")
+    assert "error" in result
+    assert "404" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_get_model_detail_reraises_rate_limit_error(downloader):
+    from py.services.errors import RateLimitError
+    downloader.make_request = AsyncMock(side_effect=RateLimitError("rate limited"))
+    client = await CivitaiClient.get_instance()
+    with pytest.raises(RateLimitError):
+        await client.get_model_detail("123")
