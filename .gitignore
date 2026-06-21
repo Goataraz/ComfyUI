@@ -25,3 +25,12 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+
+# ponytail: throwaway scratch — not fork value
+audit_models.py
+detailed_audit.py
+parse_metadata.py
+comfy-normal.sh
+chroma_*.json
+test_misfit_*.json
+modelimages/
