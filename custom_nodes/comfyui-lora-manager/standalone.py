@@ -326,7 +326,6 @@ class StandaloneLoraManager(LoraManager):
         from py.routes.example_images_routes import ExampleImagesRoutes
         from py.routes.preview_routes import PreviewRoutes
         from py.routes.stats_routes import StatsRoutes
-        from py.routes.discover_routes import DiscoverRoutes
         from py.services.websocket_manager import ws_manager
 
         register_default_model_types()
@@ -341,8 +340,6 @@ class StandaloneLoraManager(LoraManager):
         RecipeRoutes.setup_routes(app)
         UpdateRoutes.setup_routes(app)
         MiscRoutes.setup_routes(app)
-        discover_routes = DiscoverRoutes()
-        discover_routes.setup_routes(app)
         ExampleImagesRoutes.setup_routes(app, ws_manager=ws_manager)
         PreviewRoutes.setup_routes(app)
 

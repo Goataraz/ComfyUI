@@ -188,8 +188,7 @@
             "recipes": "Rezepte",
             "checkpoints": "Checkpoints",
             "embeddings": "Embeddings",
-            "statistics": "Statistiken",
-            "discover": "Discover"
+            "statistics": "Statistiken"
         },
         "search": {
             "placeholder": "Suchen...",
@@ -646,7 +645,9 @@
                 "sizeAsc": "Kleinste",
                 "usage": "Anzahl Nutzung",
                 "usageDesc": "Meiste",
-                "usageAsc": "Wenigste"
+                "usageAsc": "Wenigste",
+                "recentDesc": "[TODO: Translate] Recently used (newest)",
+                "recentAsc": "[TODO: Translate] Recently used (oldest)"
             },
             "refresh": {
                 "title": "Modelliste aktualisieren",
@@ -694,6 +695,7 @@
             "checkUpdates": "Auswahl auf Updates prüfen",
             "moveAll": "Alle in Ordner verschieben",
             "autoOrganize": "Automatisch organisieren",
+            "saveSelectionAsRecipe": "[TODO: Translate] Save Selection as Recipe",
             "skipMetadataRefresh": "Metadaten-Aktualisierung für ausgewählte Modelle überspringen",
             "resumeMetadataRefresh": "Metadaten-Aktualisierung für ausgewählte Modelle fortsetzen",
             "setFavorite": "Als Favorit setzen",
@@ -964,6 +966,13 @@
         "empty": {
             "noFolders": "Keine Ordner gefunden",
             "dragHint": "Elemente hierher ziehen, um Ordner zu erstellen"
+        },
+        "folderUpdateCheck": {
+            "label": "Auf Updates in diesem Ordner prüfen",
+            "loading": "Prüfe {type}-Updates in diesem Ordner...",
+            "success": "{count} Update(s) für {type}s in diesem Ordner gefunden",
+            "none": "Alle {type}s in diesem Ordner sind aktuell",
+            "error": "Fehler beim Prüfen des Ordners auf {type}-Updates: {message}"
         }
     },
     "statistics": {
@@ -1032,6 +1041,11 @@
             "downloadedTooltip": "Zuvor heruntergeladen, aber derzeit nicht in Ihrer Bibliothek.",
             "alreadyInLibrary": "Bereits in Bibliothek",
             "autoOrganizedPath": "[Automatisch organisiert durch Pfadvorlage]",
+            "fileSelection": {
+                "title": "Dateiformat auswählen",
+                "files": "Dateien",
+                "select": "Datei auswählen"
+            },
             "errors": {
                 "invalidUrl": "Ungültiges Civitai URL-Format",
                 "noVersions": "Keine Versionen für dieses Modell verfügbar"
@@ -1188,9 +1202,7 @@
                 "viewCreatorProfile": "Ersteller-Profil anzeigen",
                 "openFileLocation": "Dateispeicherort öffnen",
                 "sendToWorkflow": "An ComfyUI senden",
-                "sendToWorkflowText": "An ComfyUI senden",
-                "install": "[TODO: Translate] Install model",
-                "installText": "[TODO: Translate] Install"
+                "sendToWorkflowText": "An ComfyUI senden"
             },
             "openFileLocation": {
                 "success": "Dateispeicherort erfolgreich geöffnet",
@@ -1488,6 +1500,9 @@
             "selectTargetNode": "Zielknoten auswählen",
             "sendToAll": "An alle senden"
         },
+        "recipeSaveSelection": {
+            "promptTitle": "[TODO: Translate] Save selection as recipe"
+        },
         "exampleImages": {
             "opened": "Beispielbilder-Ordner geöffnet",
             "openingFolder": "Beispielbilder-Ordner wird geöffnet",
@@ -1624,6 +1639,8 @@
             "noLorasSelected": "Keine LoRAs ausgewählt",
             "missingDataForLoras": "Fehlende Daten für {count} LoRAs",
             "noValidLorasToCopy": "Keine gültigen LoRAs zum Kopieren",
+            "saveRecipeOnlyForLoras": "[TODO: Translate] Save selection as recipe is only available for LoRAs",
+            "noValidLorasToSave": "[TODO: Translate] No valid LoRAs in selection to save",
             "sendOnlyForLoras": "An Workflow senden ist nur für LoRAs verfügbar",
             "noValidLorasToSend": "Keine gültigen LoRAs zum Senden",
             "downloadSuccessful": "LoRAs erfolgreich heruntergeladen",
@@ -1633,6 +1650,7 @@
             "pleaseSelectVersion": "Bitte wählen Sie eine Version aus",
             "versionExists": "Diese Version existiert bereits in Ihrer Bibliothek",
             "downloadCompleted": "Download erfolgreich abgeschlossen",
+            "downloadRenamed": "[TODO: Translate] Renamed to {to} (was {from})",
             "downloadSkippedByBaseModel": "Download übersprungen, weil das Basismodell {baseModel} ausgeschlossen ist",
             "autoOrganizeSuccess": "Automatische Organisation für {count} {type} erfolgreich abgeschlossen",
             "autoOrganizePartialSuccess": "Automatische Organisation abgeschlossen: {success} verschoben, {failures} fehlgeschlagen von insgesamt {total} Modellen",
@@ -1650,6 +1668,8 @@
             "updateFailed": "Fehler beim Aktualisieren des Rezepts: {error}",
             "updateError": "Fehler beim Aktualisieren des Rezepts: {message}",
             "nameSaved": "Rezept \"{name}\" erfolgreich gespeichert",
+            "recipeSaved": "Recipe saved successfully",
+            "recipeSaveFailed": "Fehler beim Speichern des Rezepts: {error}",
             "nameUpdated": "Rezeptname erfolgreich aktualisiert",
             "tagsUpdated": "Rezept-Tags erfolgreich aktualisiert",
             "sourceUrlUpdated": "Quell-URL erfolgreich aktualisiert",
@@ -1659,6 +1679,10 @@
             "noRecipeId": "Keine Rezept-ID verfügbar",
             "sendToWorkflowFailed": "Fehler beim Senden des Rezepts an den Workflow: {message}",
             "copyFailed": "Fehler beim Kopieren der Rezept-Syntax: {message}",
+            "createError": "Fehler beim Erstellen des Rezepts：{message}",
+            "createFailed": "Fehler beim Erstellen des Rezepts：{error}",
+            "createMissingData": "Erforderliche Daten zum Erstellen des Rezepts fehlen",
+            "created": "Rezept erfolgreich erstellt",
             "noMissingLoras": "Keine fehlenden LoRAs zum Herunterladen",
             "missingLorasInfoFailed": "Fehler beim Abrufen der Informationen für fehlende LoRAs",
             "preparingForDownloadFailed": "Fehler beim Vorbereiten der LoRAs für den Download",
@@ -1684,8 +1708,6 @@
             "enterRecipeName": "Bitte geben Sie einen Rezeptnamen ein",
             "processingError": "Verarbeitungsfehler: {message}",
             "folderBrowserError": "Fehler beim Laden des Ordner-Browsers: {message}",
-            "recipeSaveFailed": "Fehler beim Speichern des Rezepts: {error}",
-            "recipeSaved": "Recipe saved successfully",
             "importFailed": "Import fehlgeschlagen: {message}",
             "folderTreeFailed": "Fehler beim Laden des Ordnerbaums",
             "folderTreeError": "Fehler beim Laden des Ordnerbaums",
@@ -1704,6 +1726,7 @@
             "noLoraRootConfigured": "Kein LoRA-Stammverzeichnis konfiguriert. Bitte legen Sie ein Standard-LoRA-Stammverzeichnis in den Einstellungen fest."
         },
         "models": {
+            "updatesAvailable": "[TODO: Translate] {count} {type}(s) have updates available",
             "noModelsSelected": "Keine Modelle ausgewählt",
             "deletedSuccessfully": "{count} {type}(s) erfolgreich gelöscht",
             "deleteFailed": "Fehler: {error}",
@@ -2010,13 +2033,6 @@
             "rebuilding": "Cache wird neu aufgebaut...",
             "rebuildFailed": "Fehler beim Neuaufbau des Caches: {error}",
             "retry": "Wiederholen"
-        }
-    },
-    "discover": {
-        "errors": {
-            "notFound": "[TODO: Translate] Model not found on CivitAI",
-            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
-            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

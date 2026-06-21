@@ -78,7 +78,7 @@ class DownloadCoordinator:
                 "Missing required parameter: Please provide either 'model_id' or 'model_version_id'"
             )
 
-        async def _run_and_notify() -> None:
+        async def _run_download() -> None:
             try:
                 result = await download_manager.download_from_civitai(
                     model_id=model_id,
@@ -91,22 +91,37 @@ class DownloadCoordinator:
                     source=payload.get("source"),
                     file_params=payload.get("file_params"),
                 )
+                if result.get("success") or result.get("skipped"):
+                    ws_payload: Dict[str, Any] = {
+                        "status": "completed",
+                        "download_id": download_id,
+                        "progress": 100,
+                    }
+                    if result.get("skipped"):
+                        ws_payload["skipped"] = True
+                        if result.get("base_model"):
+                            ws_payload["base_model"] = result["base_model"]
+                else:
+                    ws_payload = {
+                        "status": "error",
+                        "download_id": download_id,
+                        "progress": 0,
+                        "error": result.get("error", "Download failed"),
+                    }
+                await self._ws_manager.broadcast_download_progress(download_id, ws_payload)
             except Exception as exc:
-                result = {"success": False, "error": str(exc)}
-            if result.get("skipped"):
-                terminal_status = "skipped"
-            elif result.get("success"):
-                terminal_status = "completed"
-            else:
-                terminal_status = "failed"
-            broadcast: Dict[str, Any] = {"status": terminal_status, "download_id": download_id}
-            if result.get("error"):
-                broadcast["error"] = result["error"]
-            if result.get("base_model"):
-                broadcast["base_model"] = result["base_model"]
-            await self._ws_manager.broadcast_download_progress(download_id, broadcast)
+                logger.error("Background download task failed: %s", exc, exc_info=True)
+                await self._ws_manager.broadcast_download_progress(
+                    download_id,
+                    {
+                        "status": "error",
+                        "download_id": download_id,
+                        "progress": 0,
+                        "error": str(exc),
+                    },
+                )
 
-        asyncio.create_task(_run_and_notify())
+        asyncio.create_task(_run_download())
         return {"success": True, "download_id": download_id}
 
     async def cancel_download(self, download_id: str) -> Dict[str, Any]:
@@ -122,6 +137,23 @@ class DownloadCoordinator:
                 "progress": 0,
                 "download_id": download_id,
                 "message": "Download cancelled by user",
+            },
+        )
+
+        return result
+
+    async def skip_download(self, download_id: str) -> Dict[str, Any]:
+        """Skip a download while preserving all partial files on disk."""
+        download_manager = await self._download_manager_factory()
+        result = await download_manager.skip_download(download_id)
+
+        await self._ws_manager.broadcast_download_progress(
+            download_id,
+            {
+                "status": "skipped",
+                "progress": 0,
+                "download_id": download_id,
+                "message": "Download skipped by user (partial files preserved)",
             },
         )
 

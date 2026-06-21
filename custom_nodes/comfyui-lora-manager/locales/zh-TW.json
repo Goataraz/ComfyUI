@@ -188,8 +188,7 @@
             "recipes": "配方",
             "checkpoints": "Checkpoint",
             "embeddings": "Embedding",
-            "statistics": "統計",
-            "discover": "Discover"
+            "statistics": "統計"
         },
         "search": {
             "placeholder": "搜尋...",
@@ -646,7 +645,9 @@
                 "sizeAsc": "最小",
                 "usage": "使用次數",
                 "usageDesc": "最多",
-                "usageAsc": "最少"
+                "usageAsc": "最少",
+                "recentDesc": "[TODO: Translate] Recently used (newest)",
+                "recentAsc": "[TODO: Translate] Recently used (oldest)"
             },
             "refresh": {
                 "title": "重新整理模型列表",
@@ -694,6 +695,7 @@
             "checkUpdates": "檢查所選更新",
             "moveAll": "全部移動到資料夾",
             "autoOrganize": "自動整理所選模型",
+            "saveSelectionAsRecipe": "[TODO: Translate] Save Selection as Recipe",
             "skipMetadataRefresh": "跳過所選模型的元數據更新",
             "resumeMetadataRefresh": "恢復所選模型的元數據更新",
             "setFavorite": "設為收藏",
@@ -964,6 +966,13 @@
         "empty": {
             "noFolders": "未找到資料夾",
             "dragHint": "將項目拖到此處以建立資料夾"
+        },
+        "folderUpdateCheck": {
+            "label": "檢查此資料夾的更新",
+            "loading": "正在檢查此資料夾中的{type}更新...",
+            "success": "在此資料夾中找到 {count} 個{type}更新",
+            "none": "此資料夾中的所有{type}都是最新版本",
+            "error": "檢查資料夾{type}更新失敗: {message}"
         }
     },
     "statistics": {
@@ -1032,6 +1041,11 @@
             "downloadedTooltip": "先前已下載，但目前不在你的庫中。",
             "alreadyInLibrary": "已在庫存",
             "autoOrganizedPath": "[依路徑範本自動整理]",
+            "fileSelection": {
+                "title": "選擇檔案格式",
+                "files": "個檔案",
+                "select": "選擇檔案"
+            },
             "errors": {
                 "invalidUrl": "Civitai 網址格式無效",
                 "noVersions": "此模型無可用版本"
@@ -1188,9 +1202,7 @@
                 "viewCreatorProfile": "查看創作者個人檔案",
                 "openFileLocation": "開啟檔案位置",
                 "sendToWorkflow": "傳送到 ComfyUI",
-                "sendToWorkflowText": "傳送到 ComfyUI",
-                "install": "[TODO: Translate] Install model",
-                "installText": "[TODO: Translate] Install"
+                "sendToWorkflowText": "傳送到 ComfyUI"
             },
             "openFileLocation": {
                 "success": "檔案位置已成功開啟",
@@ -1488,6 +1500,9 @@
             "selectTargetNode": "選擇目標節點",
             "sendToAll": "全部傳送"
         },
+        "recipeSaveSelection": {
+            "promptTitle": "[TODO: Translate] Save selection as recipe"
+        },
         "exampleImages": {
             "opened": "範例圖片資料夾已開啟",
             "openingFolder": "正在開啟範例圖片資料夾",
@@ -1624,6 +1639,8 @@
             "noLorasSelected": "未選擇任何 LoRA",
             "missingDataForLoras": "缺少 {count} 個 LoRA 的數據",
             "noValidLorasToCopy": "沒有有效的 LoRA 可供複製",
+            "saveRecipeOnlyForLoras": "[TODO: Translate] Save selection as recipe is only available for LoRAs",
+            "noValidLorasToSave": "[TODO: Translate] No valid LoRAs in selection to save",
             "sendOnlyForLoras": "僅對 LoRA 可用的發送到工作流程",
             "noValidLorasToSend": "沒有有效的 LoRA 可供發送",
             "downloadSuccessful": "LoRA 下載成功",
@@ -1633,6 +1650,7 @@
             "pleaseSelectVersion": "請選擇一個版本",
             "versionExists": "此版本已存在於您的庫中",
             "downloadCompleted": "下載成功完成",
+            "downloadRenamed": "[TODO: Translate] Renamed to {to} (was {from})",
             "downloadSkippedByBaseModel": "由於基礎模型 {baseModel} 已被排除，已跳過下載",
             "autoOrganizeSuccess": "自動整理已成功完成，共 {count} 個 {type} 已整理",
             "autoOrganizePartialSuccess": "自動整理完成：已移動 {success} 個，{failures} 個失敗，共 {total} 個模型",
@@ -1650,6 +1668,8 @@
             "updateFailed": "更新配方失敗：{error}",
             "updateError": "更新配方錯誤：{message}",
             "nameSaved": "配方「{name}」已成功儲存",
+            "recipeSaved": "配方儲存成功",
+            "recipeSaveFailed": "儲存配方失敗：{error}",
             "nameUpdated": "配方名稱已更新",
             "tagsUpdated": "配方標籤已更新",
             "sourceUrlUpdated": "來源網址已更新",
@@ -1659,6 +1679,10 @@
             "noRecipeId": "無配方 ID",
             "sendToWorkflowFailed": "傳送配方到工作流失敗：{message}",
             "copyFailed": "複製配方語法錯誤：{message}",
+            "createError": "建立配方時發生錯誤：{message}",
+            "createFailed": "建立配方失敗：{error}",
+            "createMissingData": "缺少建立配方所需的資料",
+            "created": "配方建立成功",
             "noMissingLoras": "無缺少的 LoRA 可下載",
             "missingLorasInfoFailed": "取得缺少 LoRA 資訊失敗",
             "preparingForDownloadFailed": "準備下載 LoRA 時發生錯誤",
@@ -1684,8 +1708,6 @@
             "enterRecipeName": "請輸入配方名稱",
             "processingError": "處理錯誤：{message}",
             "folderBrowserError": "載入資料夾瀏覽器錯誤：{message}",
-            "recipeSaveFailed": "儲存配方失敗：{error}",
-            "recipeSaved": "配方儲存成功",
             "importFailed": "匯入失敗：{message}",
             "folderTreeFailed": "載入資料夾樹狀結構失敗",
             "folderTreeError": "載入資料夾樹狀結構錯誤",
@@ -1704,6 +1726,7 @@
             "noLoraRootConfigured": "未配置 LoRA 根目錄。請在設定中設定預設的 LoRA 根目錄。"
         },
         "models": {
+            "updatesAvailable": "[TODO: Translate] {count} {type}(s) have updates available",
             "noModelsSelected": "未選擇模型",
             "deletedSuccessfully": "成功刪除 {count} 個 {type}",
             "deleteFailed": "錯誤：{error}",
@@ -2010,13 +2033,6 @@
             "rebuilding": "重建快取中...",
             "rebuildFailed": "重建快取失敗：{error}",
             "retry": "重試"
-        }
-    },
-    "discover": {
-        "errors": {
-            "notFound": "[TODO: Translate] Model not found on CivitAI",
-            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
-            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

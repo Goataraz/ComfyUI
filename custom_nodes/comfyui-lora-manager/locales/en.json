@@ -188,8 +188,7 @@
             "recipes": "Recipes",
             "checkpoints": "Checkpoints",
             "embeddings": "Embeddings",
-            "statistics": "Stats",
-            "discover": "Discover"
+            "statistics": "Stats"
         },
         "search": {
             "placeholder": "Search...",
@@ -646,7 +645,9 @@
                 "sizeAsc": "Smallest",
                 "usage": "Use Count",
                 "usageDesc": "Most",
-                "usageAsc": "Least"
+                "usageAsc": "Least",
+                "recentDesc": "Recently used (newest)",
+                "recentAsc": "Recently used (oldest)"
             },
             "refresh": {
                 "title": "Refresh model list",
@@ -694,6 +695,7 @@
             "checkUpdates": "Check Updates for Selected",
             "moveAll": "Move Selected to Folder",
             "autoOrganize": "Auto-Organize Selected",
+            "saveSelectionAsRecipe": "Save Selection as Recipe",
             "skipMetadataRefresh": "Skip Metadata Refresh for Selected",
             "resumeMetadataRefresh": "Resume Metadata Refresh for Selected",
             "setFavorite": "Set as Favorite",
@@ -964,6 +966,13 @@
         "empty": {
             "noFolders": "No folders found",
             "dragHint": "Drag items here to create folders"
+        },
+        "folderUpdateCheck": {
+            "label": "Check for updates in this folder",
+            "loading": "Checking {type} updates for this folder...",
+            "success": "Found {count} update(s) for {type}s in this folder",
+            "none": "All {type}s in this folder are up to date",
+            "error": "Failed to check folder for {type} updates: {message}"
         }
     },
     "statistics": {
@@ -1032,6 +1041,11 @@
             "downloadedTooltip": "Previously downloaded, but it is not currently in your library.",
             "alreadyInLibrary": "Already in Library",
             "autoOrganizedPath": "[Auto-organized by path template]",
+            "fileSelection": {
+                "title": "Select File Format",
+                "files": "files",
+                "select": "Select File"
+            },
             "errors": {
                 "invalidUrl": "Invalid Civitai URL format",
                 "noVersions": "No versions available for this model"
@@ -1188,9 +1202,7 @@
                 "viewCreatorProfile": "View Creator Profile",
                 "openFileLocation": "Open File Location",
                 "sendToWorkflow": "Send to ComfyUI",
-                "sendToWorkflowText": "Send to ComfyUI",
-                "install": "Install model",
-                "installText": "Install"
+                "sendToWorkflowText": "Send to ComfyUI"
             },
             "openFileLocation": {
                 "success": "File location opened successfully",
@@ -1488,6 +1500,9 @@
             "selectTargetNode": "Select target node",
             "sendToAll": "Send to All"
         },
+        "recipeSaveSelection": {
+            "promptTitle": "Save selection as recipe"
+        },
         "exampleImages": {
             "opened": "Example images folder opened",
             "openingFolder": "Opening example images folder",
@@ -1624,6 +1639,8 @@
             "noLorasSelected": "No LoRAs selected",
             "missingDataForLoras": "Missing data for {count} LoRAs",
             "noValidLorasToCopy": "No valid LoRAs to copy",
+            "saveRecipeOnlyForLoras": "Save selection as recipe is only available for LoRAs",
+            "noValidLorasToSave": "No valid LoRAs in selection to save",
             "sendOnlyForLoras": "Send to workflow is only available for LoRAs",
             "noValidLorasToSend": "No valid LoRAs to send",
             "downloadSuccessful": "LoRAs downloaded successfully",
@@ -1633,6 +1650,7 @@
             "pleaseSelectVersion": "Please select a version",
             "versionExists": "This version already exists in your library",
             "downloadCompleted": "Download completed successfully",
+            "downloadRenamed": "Renamed to {to} (was {from})",
             "downloadSkippedByBaseModel": "Skipped download because base model {baseModel} is excluded",
             "autoOrganizeSuccess": "Auto-organize completed successfully for {count} {type}",
             "autoOrganizePartialSuccess": "Auto-organize completed with {success} moved, {failures} failed out of {total} models",
@@ -1650,6 +1668,8 @@
             "updateFailed": "Failed to update recipe: {error}",
             "updateError": "Error updating recipe: {message}",
             "nameSaved": "Recipe \"{name}\" saved successfully",
+            "recipeSaved": "Recipe \"{name}\" saved from selection",
+            "recipeSaveFailed": "Failed to save recipe: {error}",
             "nameUpdated": "Recipe name updated successfully",
             "tagsUpdated": "Recipe tags updated successfully",
             "sourceUrlUpdated": "Source URL updated successfully",
@@ -1659,6 +1679,10 @@
             "noRecipeId": "No recipe ID available",
             "sendToWorkflowFailed": "Failed to send recipe to workflow: {message}",
             "copyFailed": "Error copying recipe syntax: {message}",
+            "createError": "Error creating recipe: {message}",
+            "createFailed": "Failed to create recipe: {error}",
+            "createMissingData": "Missing required data to create recipe",
+            "created": "Recipe created successfully",
             "noMissingLoras": "No missing LoRAs to download",
             "missingLorasInfoFailed": "Failed to get information for missing LoRAs",
             "preparingForDownloadFailed": "Error preparing LoRAs for download",
@@ -1704,6 +1728,7 @@
             "noLoraRootConfigured": "No LoRA root directory configured. Please set a default LoRA root in settings."
         },
         "models": {
+            "updatesAvailable": "{count} {type}(s) have updates available",
             "noModelsSelected": "No models selected",
             "deletedSuccessfully": "Successfully deleted {count} {type}(s)",
             "deleteFailed": "Error: {error}",
@@ -2010,13 +2035,6 @@
             "rebuilding": "Rebuilding cache...",
             "rebuildFailed": "Failed to rebuild cache: {error}",
             "retry": "Retry"
-        }
-    },
-    "discover": {
-        "errors": {
-            "notFound": "Model not found on CivitAI",
-            "rateLimit": "CivitAI is rate limiting requests, try again in a moment",
-            "network": "Could not reach CivitAI — check your connection"
         }
     }
 }

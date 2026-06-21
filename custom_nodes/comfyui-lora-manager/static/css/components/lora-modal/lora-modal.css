@@ -961,28 +961,3 @@
 .modal-send-btn span {
     white-space: nowrap;
 }
-
-/* Install button in Discover modal — replaces Send-to-ComfyUI */
-.modal-install-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 14px;
-    background: var(--lora-accent);
-    border: 1px solid var(--lora-accent);
-    border-radius: var(--border-radius-sm);
-    color: #fff;
-    cursor: pointer;
-    font-weight: 600;
-    font-size: 0.9em;
-    transition: all 0.2s;
-}
-
-.modal-install-btn:hover {
-    opacity: 0.88;
-    transform: translateY(-1px);
-}
-
-.modal-install-btn:active {
-    transform: translateY(0);
-}

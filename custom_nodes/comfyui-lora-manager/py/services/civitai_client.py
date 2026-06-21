@@ -15,38 +15,9 @@ from .model_metadata_provider import (
 )
 from .downloader import get_downloader
 from .errors import RateLimitError, ResourceNotFoundError
-from .settings_manager import get_settings_manager
 from ..utils.civitai_utils import resolve_license_payload
 
 logger = logging.getLogger(__name__)
-
-
-_ALLOWED_CIVITAI_HOSTS = frozenset({"civitai.com", "civitai.red"})
-_DEFAULT_CIVITAI_HOST = "civitai.com"
-
-
-def _resolve_civitai_base_url() -> str:
-    """Build the Civitai API base URL from the civitai_host setting.
-
-    Falls back to civitai.com when the configured host is missing or not in the
-    allowlist, logging a warning so misconfigurations are visible in logs.
-    """
-    try:
-        host = (get_settings_manager().get("civitai_host") or "").strip().lower()
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Failed to read civitai_host setting: %s", exc)
-        host = ""
-
-    if host not in _ALLOWED_CIVITAI_HOSTS:
-        if host:
-            logger.warning(
-                "Unrecognized civitai_host '%s'; falling back to %s",
-                host,
-                _DEFAULT_CIVITAI_HOST,
-            )
-        host = _DEFAULT_CIVITAI_HOST
-
-    return f"https://{host}/api/v1"
 
 
 class CivitaiClient:
@@ -74,7 +45,7 @@ class CivitaiClient:
             return
         self._initialized = True
 
-        self.base_url = _resolve_civitai_base_url()
+        self.base_url = "https://civitai.red/api/v1"
         # In-memory cache to avoid redundant get_model_version_info calls
         # within the same import/scan flow. Only successful results are cached.
         # Uses OrderedDict with LRU eviction at MAX_CACHE_ENTRIES to prevent

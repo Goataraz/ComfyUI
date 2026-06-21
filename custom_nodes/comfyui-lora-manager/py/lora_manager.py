@@ -72,6 +72,13 @@ settings = _SettingsProxy()
 class LoraManager:
     """Main entry point for LoRA Manager plugin"""
 
+    _periodic_update_task = None
+    _UPDATE_CHECK_MODEL_TYPES = (
+        ("lora", ServiceRegistry.get_lora_scanner),
+        ("checkpoint", ServiceRegistry.get_checkpoint_scanner),
+        ("embedding", ServiceRegistry.get_embedding_scanner),
+    )
+
     @classmethod
     def add_routes(cls):
         """Initialize and register all routes using the new refactored architecture"""
@@ -165,10 +172,9 @@ class LoraManager:
         RecipeRoutes.setup_routes(app)
         UpdateRoutes.setup_routes(app)
         MiscRoutes.setup_routes(app)
-        discover_routes = DiscoverRoutes()
-        discover_routes.setup_routes(app)
         ExampleImagesRoutes.setup_routes(app, ws_manager=ws_manager)
         PreviewRoutes.setup_routes(app)
+        DiscoverRoutes().setup_routes(app)
 
         # Setup WebSocket routes that are shared across all model types
         app.router.add_get("/ws/fetch-progress", ws_manager.handle_connection)
@@ -284,10 +290,52 @@ class LoraManager:
 
             logger.debug("LoRA Manager: All post-initialization tasks completed")
 
+            # Start the periodic update checker (long-running, not part of post_tasks
+            # since it never returns).
+            cls._periodic_update_task = asyncio.create_task(
+                cls._run_periodic_update_check(), name="periodic_update_check"
+            )
+
         except Exception as e:
             logger.error(
                 f"LoRA Manager: Error in post-initialization tasks: {e}", exc_info=True
             )
+
+    @classmethod
+    async def _check_for_model_updates(cls):
+        """Run a single update-check pass across all model types."""
+        from .services.metadata_service import get_metadata_provider
+
+        provider = await get_metadata_provider("civitai_api")
+        update_service = await ServiceRegistry.get_model_update_service()
+
+        for model_type, get_scanner in cls._UPDATE_CHECK_MODEL_TYPES:
+            scanner = await get_scanner()
+            records = await update_service.refresh_for_model_type(
+                model_type, scanner, provider, force_refresh=False
+            )
+            updated_count = sum(1 for record in records.values() if record.has_update())
+            await ws_manager.broadcast_update_available(model_type, updated_count)
+
+    @classmethod
+    async def _run_periodic_update_check(cls):
+        """Periodically check Civitai for newer versions of installed models.
+
+        Interval is controlled by the `update_check_interval_hours` setting
+        (0 disables it); re-checked every cycle so it can be toggled without a restart.
+        """
+        while True:
+            interval_hours = settings.get("update_check_interval_hours", 24)
+            if not interval_hours or interval_hours <= 0:
+                await asyncio.sleep(3600)
+                continue
+
+            try:
+                await cls._check_for_model_updates()
+            except Exception as e:
+                logger.error(f"Periodic update check failed: {e}", exc_info=True)
+
+            await asyncio.sleep(interval_hours * 3600)
 
     @classmethod
     async def _cleanup_backup_files(cls):
@@ -428,6 +476,9 @@ class LoraManager:
         """Cleanup resources using ServiceRegistry"""
         try:
             logger.info("LoRA Manager: Cleaning up services")
+
+            if cls._periodic_update_task is not None:
+                cls._periodic_update_task.cancel()
 
         except Exception as e:
             logger.error(f"Error during cleanup: {e}", exc_info=True)

@@ -17,8 +17,6 @@
       {% set current_page = 'embeddings' %}
       {% elif current_path.startswith('/statistics') %}
       {% set current_page = 'statistics' %}
-      {% elif current_path.startswith('/discover') %}
-      {% set current_page = 'discover' %}
       {% else %}
       {% set current_page = 'loras' %}
       {% endif %}
@@ -42,15 +40,11 @@
           id="statisticsNavItem">
           <i class="fas fa-chart-bar"></i> <span>{{ t('header.navigation.statistics') }}</span>
         </a>
-        <a href="/discover" class="nav-item{% if current_path.startswith('/discover') %} active{% endif %}"
-          id="discoverNavItem">
-          <i class="fas fa-compass"></i> <span>{{ t('header.navigation.discover') }}</span>
-        </a>
       </nav>
     </div>
 
     <!-- Center section: Search -->
-    {% set search_disabled = current_page == 'statistics' or current_page == 'discover' %}
+    {% set search_disabled = current_page == 'statistics' %}
     {% set search_placeholder_key = 'header.search.notAvailable' if search_disabled else 'header.search.placeholders.' ~
     current_page %}
     {% set header_search_class = 'header-search disabled' if search_disabled else 'header-search' %}

@@ -239,7 +239,7 @@ function renderLicenseIcons(modelData) {
  * @param {Object} model - Model data object
  * @param {string} modelType - Type of model ('lora' or 'checkpoint')
  */
-export async function showModelModal(model, modelType, { isDiscoverModel = false, onInstall = null } = {}) {
+export async function showModelModal(model, modelType) {
     const modalId = 'modelModal';
     const modalTitle = model.model_name;
     cleanupNavigationShortcuts();
@@ -297,25 +297,15 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
         : '';
     const headerActionItems = [];
     
-    if (!isDiscoverModel) {
-        const sendToWorkflowTitle = translate('modals.model.actions.sendToWorkflow', {}, 'Send to ComfyUI');
-        const sendToWorkflowButton = `
-            <button class="modal-send-btn" data-action="send-to-workflow" data-model-type="${modelType}" title="${sendToWorkflowTitle}">
-                <i class="fas fa-paper-plane"></i>
-                <span>${translate('modals.model.actions.sendToWorkflowText', {}, 'Send to ComfyUI')}</span>
-            </button>
-        `.trim();
-        headerActionItems.push(indentMarkup(sendToWorkflowButton, 20));
-    } else {
-        const installTitle = translate('modals.model.actions.install', {}, 'Install model');
-        const installButton = `
-            <button class="modal-install-btn" data-action="install-discover-model" title="${installTitle}">
-                <i class="fas fa-download"></i>
-                <span>${translate('modals.model.actions.installText', {}, 'Install')}</span>
-            </button>
-        `.trim();
-        headerActionItems.push(indentMarkup(installButton, 20));
-    }
+    // Add send to ComfyUI button for all model types
+    const sendToWorkflowTitle = translate('modals.model.actions.sendToWorkflow', {}, 'Send to ComfyUI');
+    const sendToWorkflowButton = `
+        <button class="modal-send-btn" data-action="send-to-workflow" data-model-type="${modelType}" title="${sendToWorkflowTitle}">
+            <i class="fas fa-paper-plane"></i>
+            <span>${translate('modals.model.actions.sendToWorkflowText', {}, 'Send to ComfyUI')}</span>
+        </button>
+    `.trim();
+    headerActionItems.push(indentMarkup(sendToWorkflowButton, 20));
     
     if (creatorActionsMarkup) {
         headerActionItems.push(creatorActionsMarkup);
@@ -366,7 +356,7 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
                 ${versionsTabBadge}
             </button>`.trim();
 
-    const supportsRecipesTab = !isDiscoverModel && (modelType === 'loras' || modelType === 'checkpoints');
+    const supportsRecipesTab = modelType === 'loras' || modelType === 'checkpoints';
 
     const tabsContent = supportsRecipesTab ?
         `<button class="tab-btn active" data-tab="showcase">${examplesText}</button>
@@ -459,12 +449,12 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
                 <div class="modal-header-row">
                     <div class="model-name-header">
                         <h2 class="model-name-content">${modalTitle}</h2>
-                        ${!isDiscoverModel ? `<button class="edit-model-name-btn" title="${translate('modals.model.actions.editModelName', {}, 'Edit model name')}">
+                        <button class="edit-model-name-btn" title="${translate('modals.model.actions.editModelName', {}, 'Edit model name')}">
                             <i class="fas fa-pencil-alt"></i>
-                        </button>` : ''}
+                        </button>
                     </div>
 
-                    ${isDiscoverModel ? '' : navigationControls}
+                    ${navigationControls}
                 </div>
 
                 ${headerActionsMarkup}
@@ -532,7 +522,7 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
                     </div>
                 </div>
 
-                <div class="showcase-section" data-model-hash="${modelWithFullData.sha256 || ''}" data-filepath="${escapedFilePathAttr}">
+                <div class="showcase-section" data-model-hash="${modelWithFullData.sha256 || ''}" data-model-name="${escapeAttribute(modelWithFullData.file_name || modelWithFullData.model_name || '')}" data-model-type="${modelType}" data-filepath="${escapedFilePathAttr}">
                     <div class="showcase-tabs">
                         ${tabsContent}
                     </div>
@@ -663,6 +653,7 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
         currentBaseModel: modelWithFullData.base_model,
         onUpdateStatusChange: handleUpdateStatusChange,
     });
+    setupEditableFields(modelWithFullData.file_path, modelType);
     showcaseCleanup = setupShowcaseScroll(modalId);
     setupTabSwitching({
         onTabChange: async (tab) => {
@@ -673,32 +664,32 @@ export async function showModelModal(model, modelType, { isDiscoverModel = false
     });
     versionsTabController.load({ eager: true });
     setupTagTooltip();
-    setupEventHandlers(modelWithFullData.file_path, modelType, { onInstall });
-    if (!isDiscoverModel) {
-        setupEditableFields(modelWithFullData.file_path, modelType);
-        setupTagEditMode(modelType);
-        setupModelNameEditing(modelWithFullData.file_path);
-        setupVersionNameEditing(modelWithFullData.file_path);
-        setupBaseModelEditing(modelWithFullData.file_path);
-        setupFileNameEditing(modelWithFullData.file_path);
-        setupNavigationShortcuts(modelType);
-        updateNavigationControls();
-        if (modelType === 'loras' || modelType === 'embeddings') {
-            setupTriggerWordsEditMode();
-        }
-        if (modelType === 'loras') {
-            loadRecipesForModel({
-                modelKind: 'lora',
-                displayName: modelWithFullData.model_name,
-                sha256: modelWithFullData.sha256,
-            });
-        } else if (modelType === 'checkpoints') {
-            loadRecipesForModel({
-                modelKind: 'checkpoint',
-                displayName: modelWithFullData.model_name,
-                sha256: modelWithFullData.sha256,
-            });
-        }
+    setupTagEditMode(modelType);
+    setupModelNameEditing(modelWithFullData.file_path);
+    setupVersionNameEditing(modelWithFullData.file_path);
+    setupBaseModelEditing(modelWithFullData.file_path);
+    setupFileNameEditing(modelWithFullData.file_path);
+    setupEventHandlers(modelWithFullData.file_path, modelType);
+    setupNavigationShortcuts(modelType);
+    updateNavigationControls();
+
+    // Model-specific setup
+    if (modelType === 'loras' || modelType === 'embeddings') {
+        setupTriggerWordsEditMode();
+    }
+
+    if (modelType === 'loras') {
+        loadRecipesForModel({
+            modelKind: 'lora',
+            displayName: modelWithFullData.model_name,
+            sha256: modelWithFullData.sha256,
+        });
+    } else if (modelType === 'checkpoints') {
+        loadRecipesForModel({
+            modelKind: 'checkpoint',
+            displayName: modelWithFullData.model_name,
+            sha256: modelWithFullData.sha256,
+        });
     }
 
     // Load example images asynchronously - merge regular and custom images
@@ -753,7 +744,7 @@ function detachModalHandlers(modalId) {
  * @param {string} filePath - Path to the model file
  * @param {string} modelType - Current model type
  */
-function setupEventHandlers(filePath, modelType, { onInstall = null } = {}) {
+function setupEventHandlers(filePath, modelType) {
     const modalElement = document.getElementById('modelModal');
 
     // Remove existing event listeners first
@@ -796,9 +787,6 @@ function setupEventHandlers(filePath, modelType, { onInstall = null } = {}) {
                 break;
             case 'send-to-workflow':
                 handleSendToWorkflow(target, modelType);
-                break;
-            case 'install-discover-model':
-                if (onInstall) onInstall();
                 break;
         }
     }
@@ -1140,71 +1128,6 @@ async function handleSendToWorkflow(target, modelType) {
         // For Embedding: Send as LoRA syntax (embedding name only)
         const embeddingSyntax = `<embed:${currentFileName}:1>`;
         await sendLoraToWorkflow(embeddingSyntax, false, 'embedding');
-    }
-}
-
-function normalizeCivitaiModelDetail(civitaiModel) {
-    const firstVersion = (civitaiModel.modelVersions || [])[0] || {};
-    const tags = (civitaiModel.tags || [])
-        .map(t => (typeof t === 'string' ? t : t?.name || ''))
-        .filter(Boolean);
-    return {
-        model_name: civitaiModel.name || '',
-        file_path: null,
-        from_civitai: true,
-        base_model: firstVersion.baseModel || '',
-        sha256: null,
-        tags,
-        update_available: false,
-        civitai: {
-            modelId: civitaiModel.id,
-            id: firstVersion.id,
-            creator: civitaiModel.creator,
-            trainedWords: firstVersion.trainedWords || [],
-            images: firstVersion.images || [],
-            description: firstVersion.description || civitaiModel.description || '',
-            model: {
-                allowCommercialUse: civitaiModel.allowCommercialUse,
-                allowDerivatives: civitaiModel.allowDerivatives,
-                allowNoCredit: civitaiModel.allowNoCredit,
-                allowDifferentLicense: civitaiModel.allowDifferentLicense,
-            },
-        },
-    };
-}
-
-export async function showModelModalForCivitaiId(civitaiId, modelType, { onInstall = null } = {}) {
-    const card = document.querySelector(`.discover-card[data-civitai-id="${civitaiId}"]`);
-    let spinner = null;
-    if (card) {
-        spinner = document.createElement('div');
-        spinner.className = 'discover-card-spinner';
-        const icon = document.createElement('i');
-        icon.className = 'fas fa-spinner fa-spin';
-        spinner.appendChild(icon);
-        card.appendChild(spinner);
-    }
-
-    try {
-        const res = await fetch(`/api/lm/discover/model/${civitaiId}`);
-        const data = await res.json();
-
-        if (!res.ok) {
-            const errorMap = {
-                404: ['discover.errors.notFound', 'Model not found on CivitAI'],
-                429: ['discover.errors.rateLimit', 'CivitAI is rate limiting requests, try again in a moment'],
-            };
-            const [key, fallback] = errorMap[res.status] || ['discover.errors.network', 'Could not reach CivitAI — check your connection'];
-            showToast(key, {}, 'error', fallback);
-            return;
-        }
-
-        const model = normalizeCivitaiModelDetail(data);
-        await showModelModal(model, modelType, { isDiscoverModel: true, onInstall });
-    } catch (_) {
-        showToast('discover.errors.network', {}, 'error', 'Could not reach CivitAI — check your connection');
-    } finally {
-        if (spinner) spinner.remove();
     }
 }
 

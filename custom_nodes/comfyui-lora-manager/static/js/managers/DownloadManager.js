@@ -33,6 +33,8 @@ export class DownloadManager {
         this.handleStartDownload = this.startDownload.bind(this);
         this.handleBackToUrl = this.backToUrl.bind(this);
         this.handleBackToVersions = this.backToVersions.bind(this);
+        this.handleBackToVersionFromFiles = this.backToVersionFromFiles.bind(this);
+        this.handleConfirmFileSelection = this.confirmFileSelection.bind(this);
         this.handleCloseModal = this.closeModal.bind(this);
         this.handleToggleDefaultPath = this.toggleDefaultPath.bind(this);
     }
@@ -79,6 +81,10 @@ export class DownloadManager {
         document.getElementById('backToUrlBtn').addEventListener('click', this.handleBackToUrl);
         document.getElementById('backToVersionsBtn').addEventListener('click', this.handleBackToVersions);
         document.getElementById('closeDownloadModal').addEventListener('click', this.handleCloseModal);
+
+        // File selection step buttons
+        document.getElementById('backToVersionFromFilesBtn').addEventListener('click', this.handleBackToVersionFromFiles);
+        document.getElementById('confirmFileSelection').addEventListener('click', this.handleConfirmFileSelection);
 
         // Default path toggle handler
         document.getElementById('useDefaultPath').addEventListener('change', this.handleToggleDefaultPath);
@@ -129,6 +135,7 @@ export class DownloadManager {
         this.modelId = null;
         this.modelVersionId = null;
         this.source = null;
+        this.selectedFile = null;
 
         this.selectedFolder = '';
 
@@ -247,9 +254,12 @@ export class DownloadManager {
             const firstImage = version.images?.find(img => !img.url.endsWith('.mp4'));
             const thumbnailUrl = firstImage ? firstImage.url : '/loras_static/images/no-preview.png';
 
+            // Count model-type files per version
+            const modelFiles = (version.files || []).filter(f => f.type === 'Model');
+            const primaryFile = modelFiles.find(f => f.primary) || modelFiles[0] || {};
             const fileSize = version.modelSizeKB ?
                 (version.modelSizeKB / 1024).toFixed(2) :
-                (version.files[0]?.sizeKB / 1024).toFixed(2);
+                ((primaryFile.sizeKB || 0) / 1024).toFixed(2);
 
             const existsLocally = version.existsLocally;
             const hasBeenDownloaded = version.hasBeenDownloaded && !existsLocally;
@@ -282,6 +292,12 @@ export class DownloadManager {
                  </div>`;
             }
 
+            const fileBadge = modelFiles.length > 1 && !existsLocally
+                ? `<span class="file-select-badge" data-version-id="${version.id}">
+                     <i class="fas fa-th-list"></i> ${modelFiles.length} ${translate('modals.download.fileSelection.files')} <i class="fas fa-chevron-right badge-arrow"></i>
+                   </span>`
+                : '';
+
             return `
                 <div class="version-item ${this.currentVersion?.id === version.id ? 'selected' : ''} 
                      ${existsLocally ? 'exists-locally' : ''} 
@@ -302,14 +318,23 @@ export class DownloadManager {
                         <div class="version-meta">
                             <span><i class="fas fa-calendar"></i> ${new Date(version.createdAt).toLocaleDateString()}</span>
                             <span><i class="fas fa-file-archive"></i> ${fileSize} MB</span>
+                            ${fileBadge}
                         </div>
                     </div>
                 </div>
             `;
         }).join('');
 
-        // Add click handlers for version selection
+        // Add click handlers for version selection and file badge
         versionList.addEventListener('click', (event) => {
+            const badge = event.target.closest('.file-select-badge');
+            if (badge) {
+                event.stopPropagation();
+                const versionId = badge.dataset.versionId;
+                this.selectVersion(versionId);
+                this.showFileSelectionStep(versionId);
+                return;
+            }
             const versionItem = event.target.closest('.version-item');
             if (versionItem) {
                 this.selectVersion(versionItem.dataset.versionId);
@@ -352,6 +377,80 @@ export class DownloadManager {
         }
     }
 
+    showFileSelectionStep(versionId) {
+        const version = this.versions.find(v => v.id.toString() === versionId.toString());
+        if (!version) return;
+
+        this.currentVersion = version;
+        const modelFiles = (version.files || []).filter(f => f.type === 'Model');
+
+        document.getElementById('versionStep').style.display = 'none';
+        document.getElementById('fileSelectionStep').style.display = 'block';
+
+        const nameEl = document.getElementById('fileSelectionVersionName');
+        if (nameEl) {
+            nameEl.textContent = `${version.name} · ${version.baseModel || ''}`;
+        }
+
+        const container = document.getElementById('fileSelectionList');
+        container.innerHTML = modelFiles.map(file => {
+            const meta = file.metadata || {};
+            const sizeGB = file.sizeKB ? (file.sizeKB / (1024 * 1024)).toFixed(2) : '--';
+            const isSelected = this.selectedFile?.id === file.id;
+
+            const tags = [];
+            if (meta.size) tags.push(`<span class="file-tag size">${meta.size}</span>`);
+            if (meta.format) tags.push(`<span class="file-tag format">${meta.format}</span>`);
+            if (meta.fp) tags.push(`<span class="file-tag fp">${meta.fp}</span>`);
+
+            const fileName = file.name || '';
+
+            return `
+                <div class="file-option ${isSelected ? 'selected' : ''}" data-file-id="${file.id}">
+                    <div class="file-option-radio">
+                        <input type="radio" name="fileSelection" value="${file.id}" ${isSelected ? 'checked' : ''}>
+                    </div>
+                    <div class="file-option-info">
+                        <div class="file-option-tags">
+                            ${tags.join(' ')}
+                        </div>
+                        <div class="file-option-name">${fileName}</div>
+                    </div>
+                    <div class="file-option-size">${sizeGB} GB</div>
+                </div>
+            `;
+        }).join('');
+
+        container.querySelectorAll('.file-option').forEach(el => {
+            el.addEventListener('click', () => {
+                container.querySelectorAll('.file-option').forEach(o => o.classList.remove('selected'));
+                el.classList.add('selected');
+                const radio = el.querySelector('input[type="radio"]');
+                if (radio) radio.checked = true;
+            });
+        });
+    }
+
+    confirmFileSelection() {
+        const selectedRadio = document.querySelector('#fileSelectionList input[type="radio"]:checked');
+        if (!selectedRadio) return;
+
+        const version = this.currentVersion;
+        if (!version) return;
+
+        const modelFiles = (version.files || []).filter(f => f.type === 'Model');
+        this.selectedFile = modelFiles.find(f => f.id.toString() === selectedRadio.value);
+
+        document.getElementById('fileSelectionStep').style.display = 'none';
+        document.getElementById('locationStep').style.display = 'block';
+        this.proceedToLocationContent();
+    }
+
+    backToVersionFromFiles() {
+        document.getElementById('fileSelectionStep').style.display = 'none';
+        document.getElementById('versionStep').style.display = 'block';
+    }
+
     async proceedToLocation() {
         if (!this.currentVersion) {
             showToast('toast.loras.pleaseSelectVersion', {}, 'error');
@@ -366,6 +465,10 @@ export class DownloadManager {
 
         document.getElementById('versionStep').style.display = 'none';
         document.getElementById('locationStep').style.display = 'block';
+        await this.proceedToLocationContent();
+    }
+
+    async proceedToLocationContent() {
 
         try {
             // Fetch model roots
@@ -450,6 +553,7 @@ export class DownloadManager {
         targetFolder = '',
         useDefaultPaths = false,
         source = null,
+        fileParams = null,
         closeModal = false,
     }) {
         const config = this.apiClient?.apiConfig?.config;
@@ -469,86 +573,74 @@ export class DownloadManager {
 
             const downloadId = Date.now().toString();
             const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-            ws = new WebSocket(`${wsProtocol}${window.location.host}/ws/download-progress?id=${downloadId}`);
 
-            let downloadSettled = false;
-            let resolveDownload, rejectDownload;
+            // Promise that resolves/rejects when the backend signals completion via WebSocket
             const downloadComplete = new Promise((resolve, reject) => {
-                resolveDownload = resolve;
-                rejectDownload = reject;
+                ws = new WebSocket(`${wsProtocol}${window.location.host}/ws/download-progress?id=${downloadId}`);
+
+                ws.onmessage = event => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === 'download_id') {
+                        console.log(`Connected to download progress with ID: ${data.download_id}`);
+                        return;
+                    }
+
+                    if (data.download_id !== downloadId) return;
+
+                    if (data.status === 'progress') {
+                        const metrics = {
+                            bytesDownloaded: data.bytes_downloaded,
+                            totalBytes: data.total_bytes,
+                            bytesPerSecond: data.bytes_per_second,
+                        };
+
+                        updateProgress(data.progress, 0, displayName, metrics);
+
+                        if (data.progress < 3) {
+                            this.loadingManager.setStatus(translate('modals.download.status.preparing'));
+                        } else if (data.progress === 3) {
+                            this.loadingManager.setStatus(translate('modals.download.status.downloadedPreview'));
+                        } else if (data.progress > 3 && data.progress < 100) {
+                            this.loadingManager.setStatus(
+                                translate('modals.download.status.downloadingFile', { type: config.singularName })
+                            );
+                        } else {
+                            this.loadingManager.setStatus(translate('modals.download.status.finalizing'));
+                        }
+                    } else if (data.status === 'completed') {
+                        resolve({ skipped: data.skipped, base_model: data.base_model });
+                    } else if (data.status === 'error') {
+                        reject(new Error(data.error || 'Download failed'));
+                    }
+                };
+
+                ws.onerror = error => {
+                    console.error('WebSocket error:', error);
+                    reject(error);
+                };
             });
 
-            ws.onmessage = event => {
-                const data = JSON.parse(event.data);
-
-                if (data.type === 'download_id') {
-                    console.log(`Connected to download progress with ID: ${data.download_id}`);
-                    return;
-                }
-
-                if (data.status === 'progress' && data.download_id === downloadId) {
-                    const metrics = {
-                        bytesDownloaded: data.bytes_downloaded,
-                        totalBytes: data.total_bytes,
-                        bytesPerSecond: data.bytes_per_second,
-                    };
-
-                    updateProgress(data.progress, 0, displayName, metrics);
-
-                    if (data.progress < 3) {
-                        this.loadingManager.setStatus(translate('modals.download.status.preparing'));
-                    } else if (data.progress === 3) {
-                        this.loadingManager.setStatus(translate('modals.download.status.downloadedPreview'));
-                    } else if (data.progress > 3 && data.progress < 100) {
-                        this.loadingManager.setStatus(
-                            translate('modals.download.status.downloadingFile', { type: config.singularName })
-                        );
-                    } else {
-                        this.loadingManager.setStatus(translate('modals.download.status.finalizing'));
-                    }
-                }
-
-                if (data.download_id === downloadId && !downloadSettled) {
-                    if (data.status === 'completed') {
-                        downloadSettled = true;
-                        resolveDownload({ completed: true });
-                    } else if (data.status === 'skipped') {
-                        downloadSettled = true;
-                        resolveDownload({ skipped: true, base_model: data.base_model });
-                    } else if (data.status === 'failed') {
-                        downloadSettled = true;
-                        rejectDownload(new Error(data.error || 'Download failed'));
-                    }
-                }
-            };
-
-            ws.onerror = error => {
-                console.error('WebSocket error:', error);
-            };
-
-            ws.onclose = () => {
-                if (!downloadSettled) {
-                    rejectDownload(new Error('Connection closed before download completed'));
-                }
-            };
-
-            const response = await this.apiClient.downloadModel(
+            // Start download — now returns immediately with {success, download_id}
+            const startResponse = await this.apiClient.downloadModel(
                 modelId,
                 versionId,
                 modelRoot,
                 targetFolder,
                 useDefaultPaths,
                 downloadId,
-                source
+                source,
+                fileParams
             );
 
-            if (!response?.success) {
-                throw new Error(response?.error || 'Failed to start download');
+            if (!startResponse?.success) {
+                throw new Error(startResponse?.error || 'Failed to start download');
             }
 
+            // Wait for backend to signal completion via WebSocket
             const result = await downloadComplete;
 
-            if (result.skipped) {
+            if (result?.skipped) {
                 this.loadingManager.setStatus(translate('modals.download.status.finalizing'));
                 updateProgress(100, 0, displayName);
                 showToast('toast.loras.downloadSkippedByBaseModel', { baseModel: result.base_model || 'Unknown' }, 'warning');
@@ -559,6 +651,15 @@ export class DownloadManager {
             }
 
             showToast('toast.loras.downloadCompleted', {}, 'success');
+
+            if (result?.renamed_from) {
+                const newName = result.file_path ? result.file_path.split(/[\\/]/).pop() : null;
+                showToast(
+                    'toast.loras.downloadRenamed',
+                    { from: result.renamed_from, to: newName || '' },
+                    'info'
+                );
+            }
 
             if (closeModal) {
                 modalManager.closeModal('downloadModal');
@@ -664,6 +765,13 @@ export class DownloadManager {
         } else {
             targetFolder = this.folderTreeManager.getSelectedPath();
         }
+        const fileParams = this.selectedFile ? {
+            type: 'Model',
+            format: this.selectedFile.metadata?.format || 'SafeTensor',
+            size: this.selectedFile.metadata?.size || 'full',
+            fp: this.selectedFile.metadata?.fp,
+        } : null;
+
         return this.executeDownloadWithProgress({
             modelId: this.modelId,
             versionId: this.currentVersion.id,
@@ -672,6 +780,7 @@ export class DownloadManager {
             targetFolder,
             useDefaultPaths,
             source: this.source,
+            fileParams,
             closeModal: true,
         });
     }

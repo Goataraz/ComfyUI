@@ -174,6 +174,34 @@ def download_manager_stub():
             ServiceRegistry._services.pop("download_manager", None)
 
 
+def capture_tasks(monkeypatch):
+    """Patch asyncio.create_task so background download tasks can be awaited explicitly."""
+    tasks = []
+    original_create_task = asyncio.create_task
+
+    def fake_create_task(coro):
+        task = original_create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+    return tasks
+
+
+def capture_download_broadcasts(monkeypatch):
+    """Record every broadcast_download_progress call, since downloads now complete
+    in a background task and the synchronous HTTP response no longer carries the result."""
+    calls = []
+    original_broadcast = ws_manager.broadcast_download_progress
+
+    async def fake_broadcast(download_id, data):
+        calls.append(dict(data))
+        await original_broadcast(download_id, data)
+
+    monkeypatch.setattr(ws_manager, "broadcast_download_progress", fake_broadcast)
+    return calls
+
+
 def test_list_models_returns_formatted_items(mock_service, mock_scanner):
     mock_service.paginated_items = [
         {"file_path": "/tmp/demo.safetensors", "name": "Demo"}
@@ -509,7 +537,14 @@ def test_download_model_invokes_download_manager(
     mock_service,
     download_manager_stub,
     tmp_path: Path,
+    monkeypatch,
 ):
+    # Download now runs in a background task (fire-and-forget, to avoid Cloudflare
+    # timeouts), so the HTTP response only carries the scheduled download_id and the
+    # actual progress/completion is observed via the WebSocket broadcasts.
+    tasks = capture_tasks(monkeypatch)
+    broadcasts = capture_download_broadcasts(monkeypatch)
+
     async def scenario():
         client = await create_test_client(mock_service)
         try:
@@ -522,26 +557,42 @@ def test_download_model_invokes_download_manager(
             assert response.status == 200
             assert payload["success"] is True
 
-            # Download runs in background; yield to event loop to let it complete.
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
 
             assert download_manager_stub.calls
-
             call_args = download_manager_stub.calls[0]
             assert call_args["model_id"] == 1
             assert call_args["download_id"] == payload["download_id"]
 
-            # Completion broadcast overwrites intermediate progress; check final status.
-            progress = ws_manager.get_download_progress(payload["download_id"])
-            assert progress is not None
-            assert progress["status"] == "completed"
-            assert "timestamp" in progress
+            progress_broadcast = next(b for b in broadcasts if b.get("status") == "progress")
+            expected_progress = round(
+                download_manager_stub.last_progress_snapshot.percent_complete
+            )
+            assert progress_broadcast["progress"] == expected_progress
+            assert (
+                progress_broadcast["bytes_downloaded"]
+                == download_manager_stub.last_progress_snapshot.bytes_downloaded
+            )
+            assert (
+                progress_broadcast["total_bytes"]
+                == download_manager_stub.last_progress_snapshot.total_bytes
+            )
+            assert (
+                progress_broadcast["bytes_per_second"]
+                == download_manager_stub.last_progress_snapshot.bytes_per_second
+            )
+
+            completed_broadcast = next(b for b in broadcasts if b.get("status") == "completed")
+            assert completed_broadcast["progress"] == 100
 
             progress_response = await client.get(
                 f"/api/lm/download-progress/{payload['download_id']}"
             )
+            progress_payload = await progress_response.json()
+
             assert progress_response.status == 200
+            assert progress_payload["success"] is True
+            assert progress_payload["progress"] == 100
             ws_manager.cleanup_download_progress(payload["download_id"])
         finally:
             await client.close()
@@ -568,8 +619,13 @@ def test_download_model_requires_identifier(mock_service, download_manager_stub)
     asyncio.run(scenario())
 
 
-def test_download_model_maps_validation_errors(mock_service, download_manager_stub):
+def test_download_model_maps_validation_errors(mock_service, download_manager_stub, monkeypatch):
+    # The download itself now happens in a background task, so errors raised by the
+    # download manager surface as a WebSocket "error" broadcast rather than a
+    # synchronous HTTP error response (which is reserved for pre-scheduling validation).
     download_manager_stub.error = ValueError("Invalid relative path")
+    tasks = capture_tasks(monkeypatch)
+    broadcasts = capture_download_broadcasts(monkeypatch)
 
     async def scenario():
         client = await create_test_client(mock_service)
@@ -580,25 +636,23 @@ def test_download_model_maps_validation_errors(mock_service, download_manager_st
             )
             payload = await response.json()
 
-            # Download is now fire-and-forget; HTTP always returns 200 on schedule success.
-            # The error is broadcast via WebSocket by the background task.
             assert response.status == 200
             assert payload["success"] is True
 
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
 
-            progress = ws_manager.get_download_progress(payload["download_id"])
-            assert progress is not None
-            assert progress["status"] == "failed"
+            error_broadcast = next(b for b in broadcasts if b.get("status") == "error")
+            assert error_broadcast["error"] == "Invalid relative path"
         finally:
             await client.close()
 
     asyncio.run(scenario())
 
 
-def test_download_model_maps_early_access_errors(mock_service, download_manager_stub):
+def test_download_model_maps_early_access_errors(mock_service, download_manager_stub, monkeypatch):
     download_manager_stub.error = RuntimeError("401 early access")
+    tasks = capture_tasks(monkeypatch)
+    broadcasts = capture_download_broadcasts(monkeypatch)
 
     async def scenario():
         client = await create_test_client(mock_service)
@@ -609,16 +663,13 @@ def test_download_model_maps_early_access_errors(mock_service, download_manager_
             )
             payload = await response.json()
 
-            # Early access errors surface via WebSocket now, not HTTP status.
             assert response.status == 200
             assert payload["success"] is True
 
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
 
-            progress = ws_manager.get_download_progress(payload["download_id"])
-            assert progress is not None
-            assert progress["status"] == "failed"
+            error_broadcast = next(b for b in broadcasts if b.get("status") == "error")
+            assert error_broadcast["error"] == "401 early access"
         finally:
             await client.close()
 
@@ -699,18 +750,15 @@ def test_auto_organize_conflict_when_running(mock_service):
     async def scenario():
         client = await create_test_client(mock_service)
         try:
-            await ws_manager.broadcast_auto_organize_progress(
-                {"type": "auto_organize_progress", "status": "started"}
-            )
+            async with ws_manager.get_auto_organize_guard().acquire():
+                response = await client.post("/api/lm/test-models/auto-organize")
+                payload = await response.json()
 
-            response = await client.post("/api/lm/test-models/auto-organize")
-            payload = await response.json()
-
-            assert response.status == 409
-            assert payload == {
-                "success": False,
-                "error": "Auto-organize is already running. Please wait for it to complete.",
-            }
+                assert response.status == 409
+                assert payload == {
+                    "success": False,
+                    "error": "Auto-organize is already running. Please wait for it to complete.",
+                }
         finally:
             await client.close()
 
@@ -718,7 +766,10 @@ def test_auto_organize_conflict_when_running(mock_service):
 
 
 
-def test_download_model_returns_skipped_success(mock_service, download_manager_stub):
+def test_download_model_returns_skipped_success(mock_service, download_manager_stub, monkeypatch):
+    tasks = capture_tasks(monkeypatch)
+    broadcasts = capture_download_broadcasts(monkeypatch)
+
     async def scenario():
         download_manager_stub.last_progress_snapshot = None
 
@@ -744,16 +795,14 @@ def test_download_model_returns_skipped_success(mock_service, download_manager_s
             )
             payload = await response.json()
 
-            # HTTP returns immediately; skipped status is broadcast via WebSocket.
             assert response.status == 200
             assert payload["success"] is True
 
-            for _ in range(5):
-                await asyncio.sleep(0)
+            await asyncio.gather(*tasks)
 
-            progress = ws_manager.get_download_progress(payload["download_id"])
-            assert progress is not None
-            assert progress["status"] == "skipped"
+            completed_broadcast = next(b for b in broadcasts if b.get("status") == "completed")
+            assert completed_broadcast["skipped"] is True
+            assert completed_broadcast["base_model"] == "SDXL 1.0"
         finally:
             await client.close()
 

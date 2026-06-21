@@ -188,8 +188,7 @@
             "recipes": "Рецепты",
             "checkpoints": "Checkpoints",
             "embeddings": "Embeddings",
-            "statistics": "Статистика",
-            "discover": "Discover"
+            "statistics": "Статистика"
         },
         "search": {
             "placeholder": "Поиск...",
@@ -646,7 +645,9 @@
                 "sizeAsc": "Наименьшим",
                 "usage": "Число использований",
                 "usageDesc": "Больше",
-                "usageAsc": "Меньше"
+                "usageAsc": "Меньше",
+                "recentDesc": "[TODO: Translate] Recently used (newest)",
+                "recentAsc": "[TODO: Translate] Recently used (oldest)"
             },
             "refresh": {
                 "title": "Обновить список моделей",
@@ -694,6 +695,7 @@
             "checkUpdates": "Проверить обновления для выбранных",
             "moveAll": "Переместить все в папку",
             "autoOrganize": "Автоматически организовать выбранные",
+            "saveSelectionAsRecipe": "[TODO: Translate] Save Selection as Recipe",
             "skipMetadataRefresh": "Пропустить обновление метаданных для выбранных",
             "resumeMetadataRefresh": "Возобновить обновление метаданных для выбранных",
             "setFavorite": "Добавить в избранное",
@@ -964,6 +966,13 @@
         "empty": {
             "noFolders": "Папки не найдены",
             "dragHint": "Перетащите элементы сюда, чтобы создать папки"
+        },
+        "folderUpdateCheck": {
+            "label": "Проверить обновления в этой папке",
+            "loading": "Проверка обновлений {type} в этой папке...",
+            "success": "Найдено {count} обновление(й) для {type}s в этой папке",
+            "none": "Все {type}s в этой папке актуальны",
+            "error": "Не удалось проверить папку на наличие обновлений {type}: {message}"
         }
     },
     "statistics": {
@@ -1032,6 +1041,11 @@
             "downloadedTooltip": "Ранее загружено, но сейчас этого нет в вашей библиотеке.",
             "alreadyInLibrary": "Уже в библиотеке",
             "autoOrganizedPath": "[Автоматически организовано по шаблону пути]",
+            "fileSelection": {
+                "title": "Выбрать формат файла",
+                "files": "файлов",
+                "select": "Выбрать файл"
+            },
             "errors": {
                 "invalidUrl": "Неверный формат URL Civitai",
                 "noVersions": "Нет доступных версий для этой модели"
@@ -1188,9 +1202,7 @@
                 "viewCreatorProfile": "Посмотреть профиль создателя",
                 "openFileLocation": "Открыть расположение файла",
                 "sendToWorkflow": "Отправить в ComfyUI",
-                "sendToWorkflowText": "Отправить в ComfyUI",
-                "install": "[TODO: Translate] Install model",
-                "installText": "[TODO: Translate] Install"
+                "sendToWorkflowText": "Отправить в ComfyUI"
             },
             "openFileLocation": {
                 "success": "Расположение файла успешно открыто",
@@ -1488,6 +1500,9 @@
             "selectTargetNode": "Выберите целевой узел",
             "sendToAll": "Отправить во все"
         },
+        "recipeSaveSelection": {
+            "promptTitle": "[TODO: Translate] Save selection as recipe"
+        },
         "exampleImages": {
             "opened": "Папка с примерами изображений открыта",
             "openingFolder": "Открытие папки с примерами изображений",
@@ -1624,6 +1639,8 @@
             "noLorasSelected": "LoRAs не выбраны",
             "missingDataForLoras": "Отсутствуют данные для {count} LoRAs",
             "noValidLorasToCopy": "Нет валидных LoRAs для копирования",
+            "saveRecipeOnlyForLoras": "[TODO: Translate] Save selection as recipe is only available for LoRAs",
+            "noValidLorasToSave": "[TODO: Translate] No valid LoRAs in selection to save",
             "sendOnlyForLoras": "Отправка в workflow доступна только для LoRAs",
             "noValidLorasToSend": "Нет валидных LoRAs для отправки",
             "downloadSuccessful": "LoRAs успешно загружены",
@@ -1633,6 +1650,7 @@
             "pleaseSelectVersion": "Пожалуйста, выберите версию",
             "versionExists": "Эта версия уже существует в вашей библиотеке",
             "downloadCompleted": "Загрузка успешно завершена",
+            "downloadRenamed": "[TODO: Translate] Renamed to {to} (was {from})",
             "downloadSkippedByBaseModel": "Загрузка пропущена, потому что базовая модель {baseModel} исключена",
             "autoOrganizeSuccess": "Автоматическая организация успешно завершена для {count} {type}",
             "autoOrganizePartialSuccess": "Автоматическая организация завершена: перемещено {success}, не удалось {failures} из {total} моделей",
@@ -1650,6 +1668,8 @@
             "updateFailed": "Не удалось обновить рецепт: {error}",
             "updateError": "Ошибка обновления рецепта: {message}",
             "nameSaved": "Рецепт \"{name}\" успешно сохранен",
+            "recipeSaved": "Recipe saved successfully",
+            "recipeSaveFailed": "Не удалось сохранить рецепт: {error}",
             "nameUpdated": "Название рецепта успешно обновлено",
             "tagsUpdated": "Теги рецепта успешно обновлены",
             "sourceUrlUpdated": "Исходный URL успешно обновлен",
@@ -1659,6 +1679,10 @@
             "noRecipeId": "ID рецепта недоступен",
             "sendToWorkflowFailed": "Не удалось отправить рецепт в рабочий процесс: {message}",
             "copyFailed": "Ошибка копирования синтаксиса рецепта: {message}",
+            "createError": "Ошибка при создании рецепта：{message}",
+            "createFailed": "Не удалось создать рецепт：{error}",
+            "createMissingData": "Отсутствуют необходимые данные для создания рецепта",
+            "created": "Рецепт успешно создан",
             "noMissingLoras": "Нет отсутствующих LoRAs для загрузки",
             "missingLorasInfoFailed": "Не удалось получить информацию для отсутствующих LoRAs",
             "preparingForDownloadFailed": "Ошибка подготовки LoRAs для загрузки",
@@ -1684,8 +1708,6 @@
             "enterRecipeName": "Пожалуйста, введите название рецепта",
             "processingError": "Ошибка обработки: {message}",
             "folderBrowserError": "Ошибка загрузки браузера папок: {message}",
-            "recipeSaveFailed": "Не удалось сохранить рецепт: {error}",
-            "recipeSaved": "Recipe saved successfully",
             "importFailed": "Импорт не удался: {message}",
             "folderTreeFailed": "Не удалось загрузить дерево папок",
             "folderTreeError": "Ошибка загрузки дерева папок",
@@ -1704,6 +1726,7 @@
             "noLoraRootConfigured": "Корневой каталог LoRA не настроен. Пожалуйста, установите корневой каталог LoRA по умолчанию в настройках."
         },
         "models": {
+            "updatesAvailable": "[TODO: Translate] {count} {type}(s) have updates available",
             "noModelsSelected": "Модели не выбраны",
             "deletedSuccessfully": "Успешно удалено {count} {type}(ей)",
             "deleteFailed": "Ошибка: {error}",
@@ -2010,13 +2033,6 @@
             "rebuilding": "Перестроение кэша...",
             "rebuildFailed": "Не удалось перестроить кэш: {error}",
             "retry": "Повторить"
-        }
-    },
-    "discover": {
-        "errors": {
-            "notFound": "[TODO: Translate] Model not found on CivitAI",
-            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
-            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }

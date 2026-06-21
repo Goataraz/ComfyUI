@@ -188,8 +188,7 @@
             "recipes": "レシピ",
             "checkpoints": "Checkpoint",
             "embeddings": "Embedding",
-            "statistics": "統計",
-            "discover": "Discover"
+            "statistics": "統計"
         },
         "search": {
             "placeholder": "検索...",
@@ -646,7 +645,9 @@
                 "sizeAsc": "小さい順",
                 "usage": "使用回数",
                 "usageDesc": "多い",
-                "usageAsc": "少ない"
+                "usageAsc": "少ない",
+                "recentDesc": "[TODO: Translate] Recently used (newest)",
+                "recentAsc": "[TODO: Translate] Recently used (oldest)"
             },
             "refresh": {
                 "title": "モデルリストを更新",
@@ -694,6 +695,7 @@
             "checkUpdates": "選択項目の更新を確認",
             "moveAll": "すべてをフォルダに移動",
             "autoOrganize": "自動整理を実行",
+            "saveSelectionAsRecipe": "[TODO: Translate] Save Selection as Recipe",
             "skipMetadataRefresh": "選択したモデルのメタデータ更新をスキップ",
             "resumeMetadataRefresh": "選択したモデルのメタデータ更新を再開",
             "setFavorite": "お気に入りに設定",
@@ -964,6 +966,13 @@
         "empty": {
             "noFolders": "フォルダが見つかりません",
             "dragHint": "ここへアイテムをドラッグしてフォルダを作成します"
+        },
+        "folderUpdateCheck": {
+            "label": "このフォルダのアップデートを確認",
+            "loading": "このフォルダの{type}アップデートを確認中...",
+            "success": "このフォルダの{type}sに{count}件のアップデートが見つかりました",
+            "none": "このフォルダのすべての{type}sは最新です",
+            "error": "フォルダの{type}アップデート確認に失敗しました: {message}"
         }
     },
     "statistics": {
@@ -1032,6 +1041,11 @@
             "downloadedTooltip": "以前にダウンロード済みですが、現在はライブラリにありません。",
             "alreadyInLibrary": "既にライブラリ内",
             "autoOrganizedPath": "[パステンプレートによる自動整理]",
+            "fileSelection": {
+                "title": "ファイル形式を選択",
+                "files": "ファイル",
+                "select": "ファイルを選択"
+            },
             "errors": {
                 "invalidUrl": "無効なCivitai URL形式",
                 "noVersions": "このモデルの利用可能なバージョンがありません"
@@ -1188,9 +1202,7 @@
                 "viewCreatorProfile": "作成者プロフィールを表示",
                 "openFileLocation": "ファイルの場所を開く",
                 "sendToWorkflow": "ComfyUI に送信",
-                "sendToWorkflowText": "ComfyUI に送信",
-                "install": "[TODO: Translate] Install model",
-                "installText": "[TODO: Translate] Install"
+                "sendToWorkflowText": "ComfyUI に送信"
             },
             "openFileLocation": {
                 "success": "ファイルの場所を正常に開きました",
@@ -1488,6 +1500,9 @@
             "selectTargetNode": "ターゲットノードを選択",
             "sendToAll": "すべてに送信"
         },
+        "recipeSaveSelection": {
+            "promptTitle": "[TODO: Translate] Save selection as recipe"
+        },
         "exampleImages": {
             "opened": "例画像フォルダが開かれました",
             "openingFolder": "例画像フォルダを開いています",
@@ -1624,6 +1639,8 @@
             "noLorasSelected": "LoRAが選択されていません",
             "missingDataForLoras": "{count} LoRAのデータが不足しています",
             "noValidLorasToCopy": "コピーする有効なLoRAがありません",
+            "saveRecipeOnlyForLoras": "[TODO: Translate] Save selection as recipe is only available for LoRAs",
+            "noValidLorasToSave": "[TODO: Translate] No valid LoRAs in selection to save",
             "sendOnlyForLoras": "ワークフローへの送信はLoRAのみ利用可能です",
             "noValidLorasToSend": "送信する有効なLoRAがありません",
             "downloadSuccessful": "LoRAが正常にダウンロードされました",
@@ -1633,6 +1650,7 @@
             "pleaseSelectVersion": "バージョンを選択してください",
             "versionExists": "このバージョンは既にライブラリに存在します",
             "downloadCompleted": "ダウンロードが正常に完了しました",
+            "downloadRenamed": "[TODO: Translate] Renamed to {to} (was {from})",
             "downloadSkippedByBaseModel": "ベースモデル {baseModel} が除外されているため、ダウンロードをスキップしました",
             "autoOrganizeSuccess": "{count} {type} の自動整理が正常に完了しました",
             "autoOrganizePartialSuccess": "自動整理が完了しました：{total} モデル中 {success} 移動、{failures} 失敗",
@@ -1650,6 +1668,8 @@
             "updateFailed": "レシピの更新に失敗しました：{error}",
             "updateError": "レシピ更新エラー：{message}",
             "nameSaved": "レシピ\"{name}\"が正常に保存されました",
+            "recipeSaved": "Recipe saved successfully",
+            "recipeSaveFailed": "レシピの保存に失敗しました：{error}",
             "nameUpdated": "レシピ名が正常に更新されました",
             "tagsUpdated": "レシピタグが正常に更新されました",
             "sourceUrlUpdated": "ソースURLが正常に更新されました",
@@ -1659,6 +1679,10 @@
             "noRecipeId": "レシピIDが利用できません",
             "sendToWorkflowFailed": "ワークフローへのレシピ送信に失敗しました：{message}",
             "copyFailed": "レシピ構文のコピーエラー：{message}",
+            "createError": "レシピ作成中にエラーが発生しました：{message}",
+            "createFailed": "レシピの作成に失敗しました：{error}",
+            "createMissingData": "レシピ作成に必要なデータが不足しています",
+            "created": "レシピを作成しました",
             "noMissingLoras": "ダウンロードする不足LoRAがありません",
             "missingLorasInfoFailed": "不足LoRAの情報取得に失敗しました",
             "preparingForDownloadFailed": "ダウンロード用LoRAの準備中にエラーが発生しました",
@@ -1684,8 +1708,6 @@
             "enterRecipeName": "レシピ名を入力してください",
             "processingError": "処理エラー：{message}",
             "folderBrowserError": "フォルダブラウザの読み込みエラー：{message}",
-            "recipeSaveFailed": "レシピの保存に失敗しました：{error}",
-            "recipeSaved": "Recipe saved successfully",
             "importFailed": "インポートに失敗しました：{message}",
             "folderTreeFailed": "フォルダツリーの読み込みに失敗しました",
             "folderTreeError": "フォルダツリー読み込みエラー",
@@ -1704,6 +1726,7 @@
             "noLoraRootConfigured": "LoRA ルートディレクトリが設定されていません。設定でデフォルトの LoRA ルートを設定してください。"
         },
         "models": {
+            "updatesAvailable": "[TODO: Translate] {count} {type}(s) have updates available",
             "noModelsSelected": "モデルが選択されていません",
             "deletedSuccessfully": "{count} {type}が正常に削除されました",
             "deleteFailed": "エラー：{error}",
@@ -2010,13 +2033,6 @@
             "rebuilding": "キャッシュを再構築中...",
             "rebuildFailed": "キャッシュの再構築に失敗しました: {error}",
             "retry": "再試行"
-        }
-    },
-    "discover": {
-        "errors": {
-            "notFound": "[TODO: Translate] Model not found on CivitAI",
-            "rateLimit": "[TODO: Translate] CivitAI is rate limiting requests, try again in a moment",
-            "network": "[TODO: Translate] Could not reach CivitAI — check your connection"
         }
     }
 }
