@@ -390,6 +390,10 @@ def prompt_worker(q, server_instance):
 
                 if queue_item is not None:
                     # Serialize and broadcast to worker ranks
+                    # cuda.synchronize prevents rank 0 from enqueuing the broadcast
+                    # before its prior work lands — otherwise NCCL watchdog can fire
+                    # when rank 1 is still finishing a heavy TP all-reduce.
+                    torch.cuda.synchronize(device=f"cuda:{local_rank}")
                     data = json.dumps(queue_item).encode('utf-8')
                     size_tensor = torch.tensor([len(data)], dtype=torch.int32, device=f"cuda:{local_rank}")
                     dist.broadcast(size_tensor, src=0)
@@ -397,10 +401,14 @@ def prompt_worker(q, server_instance):
                     dist.broadcast(data_tensor, src=0)
                 else:
                     # Signal no item to worker ranks
+                    torch.cuda.synchronize(device=f"cuda:{local_rank}")
                     size_tensor = torch.tensor([-1], dtype=torch.int32, device=f"cuda:{local_rank}")
                     dist.broadcast(size_tensor, src=0)
             else:
                 # Receive from rank 0
+                # cuda.synchronize mirrors the rank-0 send side so both ranks
+                # hit the collective at the same point in their CUDA work.
+                torch.cuda.synchronize(device=f"cuda:{local_rank}")
                 size_tensor = torch.tensor([0], dtype=torch.int32, device=f"cuda:{local_rank}")
                 dist.broadcast(size_tensor, src=0)
                 size = size_tensor.item()
@@ -506,7 +514,12 @@ def prompt_worker(q, server_instance):
         if is_tp:
             # Broadcast memory management flags from rank 0 to all worker ranks
             # Encode: 0=none, 1=free_memory(unload+reset), 2=unload_only
+            # cuda.synchronize ensures rank 0 has finished its prior CUDA work
+            # (model offload, free_memory calls) before the broadcast — otherwise
+            # rank 1 can be stuck in a TP all-reduce from the previous prompt
+            # and the watchdog aborts the whole process group.
             if rank == 0:
+                torch.cuda.synchronize(device=f"cuda:{local_rank}")
                 flag_val = 0
                 if free_memory:
                     flag_val = 1
@@ -514,6 +527,7 @@ def prompt_worker(q, server_instance):
                     flag_val = 2
                 flag_tensor = torch.tensor([flag_val], dtype=torch.int32, device=f"cuda:{local_rank}")
             else:
+                torch.cuda.synchronize(device=f"cuda:{local_rank}")
                 flag_tensor = torch.tensor([0], dtype=torch.int32, device=f"cuda:{local_rank}")
             dist.broadcast(flag_tensor, src=0)
             flag_val = flag_tensor.item()

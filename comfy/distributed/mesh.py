@@ -50,13 +50,18 @@ class DeviceMesh:
 
 # Global mesh instance
 _mesh: DeviceMesh | None = None
+_mesh_lock = None  # Initialized lazily to avoid import-time threading issues
 
 
 def get_mesh() -> DeviceMesh:
-    global _mesh
-    if _mesh is None:
-        _mesh = DeviceMesh()
-    return _mesh
+    global _mesh, _mesh_lock
+    import threading
+    if _mesh_lock is None:
+        _mesh_lock = threading.Lock()
+    with _mesh_lock:
+        if _mesh is None:
+            _mesh = DeviceMesh()
+        return _mesh
 
 
 def init_mesh(devices: list[int] | None = None) -> DeviceMesh:

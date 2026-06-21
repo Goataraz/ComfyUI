@@ -49,6 +49,15 @@ class NullProxy:
     def __setattr__(self, name, value):
         pass
 
+    def __iter__(self):
+        return iter([])
+
+    def __contains__(self, item):
+        return False
+
+    def __len__(self):
+        return 0
+
 
 class NullQueue:
     """No-op queue stand-in for TP worker ranks."""
@@ -117,7 +126,7 @@ class NullServer:
         self.loop = NullProxy()
         self.client_session = None
         self.messages = NullProxy()
-        self.node_replace_manager = None
+        self.node_replace_manager = NullProxy()
         self.supports = set()
         self.instance = self
 

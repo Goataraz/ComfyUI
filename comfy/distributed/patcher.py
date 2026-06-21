@@ -63,7 +63,7 @@ TP_TARGETS = {
 # - mlp.2: MLP second linear (down-projection, rowwise with all-reduce)
 # - down/down_proj: general down-projection patterns
 # - w2: Megatron-style MLP down-projection
-ROWWISE_KEYWORDS = ["to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t", "o_proj", "down_proj"]
+ROWWISE_KEYWORDS = ["to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t", "o_proj", "down_proj", "mlp.layer2"]
 COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
 
 # Layer names that must NOT be sharded. These are excluded because:
@@ -81,6 +81,15 @@ EXCLUDED_LAYER_NAMES = [
     # at index 1 (not a ".lin" suffix). Output is 6*dim, chunked 2-way for
     # (shift, scale, gate).
     "img_mod.1", "txt_mod.1",
+    # Cosmos Predict2 / Anima: adaln modulation Sequentials
+    # When use_adaln_lora=True the Sequential is (SiLU, Linear_down, Linear_up)
+    # — two linears at indices .1 and .2 that form a bottleneck and must stay
+    # together as un-sharded layers. When use_adaln_lora=False the Sequential
+    # is (SiLU, Linear) — only .1 exists. Excluding both covers both cases.
+    "adaln_modulation.1", "adaln_modulation.2",
+    "adaln_modulation_self_attn.1", "adaln_modulation_self_attn.2",
+    "adaln_modulation_cross_attn.1", "adaln_modulation_cross_attn.2",
+    "adaln_modulation_mlp.1", "adaln_modulation_mlp.2",
 ]
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -90,7 +99,7 @@ EXCLUDED_LAYER_NAMES = [
 # `.view(B, S, heads, dim_head)` reshape produces the correct
 # (B, S, heads//ws, dim_head) layout. The per-head RMSNorm weights and
 # rotary embeddings stay at full dim_head (replicated across ranks).
-TP_HEAD_SPLIT_MODELS = {"QwenImageTransformer2DModel"}
+TP_HEAD_SPLIT_MODELS = {"QwenImageTransformer2DModel", "MiniTrainDIT"}
 
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
@@ -172,6 +181,11 @@ def parallelize_model(model):
                 setattr(parent, child_name, new_layer)
                 count += 1
 
+    if count == 0:
+        logging.warning(f"[TP] parallelize_model: 0 layers parallelized for {model.__class__.__name__}"
+                        f" ({skipped_dims} skipped for non-divisible dimensions) — TP had no effect")
+        return False
+
     logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
                  f" ({skipped_dims} skipped for non-divisible dimensions)")
 
@@ -185,13 +199,15 @@ def parallelize_model(model):
     if head_split_active:
         head_overrides = 0
         for module in model.modules():
-            # Duck-typed Attention detection: has heads, dim_head, to_q
-            # already wrapped as ParallelLinear, and a per-head norm.
-            to_q = getattr(module, "to_q", None)
-            if not isinstance(to_q, ParallelLinear):
+            # Duck-typed Attention detection. Two naming conventions:
+            #   QwenImage: to_q (ParallelLinear), heads, dim_head
+            #   Cosmos/Anima: q_proj (ParallelLinear), n_heads, head_dim
+            q_proj = getattr(module, "to_q", None) or getattr(module, "q_proj", None)
+            if not isinstance(q_proj, ParallelLinear):
                 continue
-            heads = getattr(module, "heads", None)
-            dim_head = getattr(module, "dim_head", None)
+            # Resolve whichever naming convention this module uses.
+            heads = getattr(module, "heads", None) or getattr(module, "n_heads", None)
+            dim_head = getattr(module, "dim_head", None) or getattr(module, "head_dim", None)
             if not isinstance(heads, int) or not isinstance(dim_head, int):
                 continue
             if heads % mesh.world_size != 0:
@@ -200,7 +216,11 @@ def parallelize_model(model):
                     f"world_size={mesh.world_size}"
                 )
             local_heads = heads // mesh.world_size
-            module.heads = local_heads
+            # Update whichever attribute name the module actually uses.
+            if hasattr(module, "heads"):
+                module.heads = local_heads
+            if hasattr(module, "n_heads"):
+                module.n_heads = local_heads
             head_overrides += 1
         if head_overrides:
             logging.info(
@@ -219,12 +239,18 @@ def load_tp_shards(model, sd, prefix=""):
         prefix: Optional key prefix to prepend (e.g., "model.diffusion_model.")
     """
     mesh = get_mesh()
+    loaded = 0
+    missing = 0
     for name, module in model.named_modules():
         if isinstance(module, ParallelLinear):
             weight_key = prefix + name + ".weight"
             if weight_key in sd:
                 full_weight = sd[weight_key]
                 module.load_shard(full_weight)
+                loaded += 1
+            else:
+                missing += 1
+                logging.warning(f"[TP] Weight not found in state dict: '{weight_key}' — layer keeps uninitialized weights")
 
             if module.bias is not None:
                 bias_key = prefix + name + ".bias"
@@ -236,4 +262,9 @@ def load_tp_shards(model, sd, prefix=""):
                         module.bias.data = full_bias[start:end].to(mesh.current_device)
                     else:
                         module.bias.data = full_bias.to(mesh.current_device)
-    logging.info(f"Loaded TP shards for {model.__class__.__name__}")
+                else:
+                    logging.warning(f"[TP] Bias not found in state dict: '{bias_key}'")
+    if missing > 0:
+        logging.error(f"[TP] load_tp_shards: {loaded} weights loaded, {missing} MISSING for {model.__class__.__name__} — outputs will be incorrect")
+    else:
+        logging.info(f"[TP] Loaded {loaded} TP weight shards for {model.__class__.__name__}")

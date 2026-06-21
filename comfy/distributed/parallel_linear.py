@@ -37,9 +37,15 @@ class ParallelLinear(nn.Module):
 
         # Determine local dimensions based on TP mode
         if mode == "colwise":
+            assert out_features % self.world_size == 0, (
+                f"[TP] colwise: out_features={out_features} not divisible by world_size={self.world_size}"
+            )
             self.local_out_features = out_features // self.world_size
             self.local_in_features = in_features
         elif mode == "rowwise":
+            assert in_features % self.world_size == 0, (
+                f"[TP] rowwise: in_features={in_features} not divisible by world_size={self.world_size}"
+            )
             self.local_in_features = in_features // self.world_size
             self.local_out_features = out_features
         else:
@@ -102,5 +108,7 @@ class ParallelLinear(nn.Module):
             start = self.rank * self.local_in_features
             end = start + self.local_in_features
             shard = full_weight_tensor[:, start:end]
+        else:
+            raise RuntimeError(f"[TP] load_shard: unexpected mode '{self.mode}'")
 
         self.weight.data = shard.to(device=self.mesh.current_device)
