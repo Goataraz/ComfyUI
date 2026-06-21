@@ -1,8 +1,5 @@
-# Pinned to origin/master tip (a commit SHA), NOT a release tag. Three high-value
-# commits (#14381 cu130 cuda-malloc, #14372 mm GC, #14364 QwenImage rotary) are
-# unreleased, past v0.24.1. The tag= field holds the pinned SHA so the upstream-pin
-# test (which runs git rev-parse on the tag field) still passes. See spec
+# Pinned to origin/master tip (a commit SHA), not a release tag. See spec
 # 2026-06-18-sub-project-a-resume-delta.md Decision 1.
 tag=039ed38ed10ad0072a13f6471e06913ed33d5e56
 sha=039ed38ed10ad0072a13f6471e06913ed33d5e56
-pinned_at=2026-06-21T04:57:53Z
+pinned_at=2026-06-21T05:48:05Z
