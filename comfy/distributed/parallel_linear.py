@@ -76,6 +76,20 @@ class ParallelLinear(nn.Module):
         # This handles the case where ComfyUI's manual casting system sets the compute dtype
         # but TP weights retain their storage dtype (fp8_e4m3fn, etc.)
         w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+
+        # Apply weight_function (LoRA patches via LowVramPatch) if present.
+        # The standard comfy ops check len(weight_function) > 0 and redirect
+        # to forward_comfy_cast_weights — ParallelLinear must do the same
+        # or LoRA patches registered as LowVramPatch would be silently ignored.
+        weight_function = getattr(self, 'weight_function', [])
+        bias_function = getattr(self, 'bias_function', [])
+        if len(weight_function) > 0:
+            for f in weight_function:
+                w = f(w)
+        if b is not None and len(bias_function) > 0:
+            for f in bias_function:
+                b = f(b)
 
         if ParallelLinear._forward_debug:
             logging.debug(f"[TP] {self.mode} forward: x.shape={x.shape}, w.shape={w.shape}, "
@@ -84,16 +98,16 @@ class ParallelLinear(nn.Module):
         if self.mode == "colwise":
             # Column Parallelism: Each GPU computes a shard of the output
             res = torch.matmul(x, w.t())
-            if self.bias is not None:
-                res += self.bias.to(x.dtype)
+            if b is not None:
+                res += b
             return res
 
         elif self.mode == "rowwise":
             # Row Parallelism: Each GPU computes a partial sum, then all-reduce
             res = torch.matmul(x, w.t())
             dist.all_reduce(res, op=dist.ReduceOp.SUM)
-            if self.bias is not None:
-                res += self.bias.to(x.dtype)
+            if b is not None:
+                res += b
             return res
 
     def load_shard(self, full_weight_tensor):
