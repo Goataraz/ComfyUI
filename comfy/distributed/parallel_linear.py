@@ -103,7 +103,14 @@ class ParallelLinear(nn.Module):
             return res
 
         elif self.mode == "rowwise":
-            # Row Parallelism: Each GPU computes a partial sum, then all-reduce
+            # Row Parallelism: Each GPU computes a partial sum, then all-reduce.
+            # If the input has more features than this rank's shard (e.g.,
+            # context from a non-TP text encoder in cross-attention), slice
+            # it to this rank's input shard before the matmul.
+            if x.shape[-1] > self.local_in_features:
+                start = self.rank * self.local_in_features
+                end = start + self.local_in_features
+                x = x[..., start:end]
             res = torch.matmul(x, w.t())
             dist.all_reduce(res, op=dist.ReduceOp.SUM)
             if b is not None:
