@@ -155,6 +155,13 @@ class BypassForwardHook:
             This is intentional - bypass mode is designed for quantized models
             where weights may not be in a usable format. All necessary shape
             information is provided via adapter attributes set during inject().
+
+        TP Handling:
+            When the module is a ParallelLinear (tensor parallelism), the LoRA
+            adapter's h(x) produces full-size output but the base forward
+            produces sharded output. We slice h_out to match the base output
+            shape for colwise layers. Rowwise layers all-reduce inside the
+            base forward, so base_out is already full-size and matches h_out.
         """
         # Check if adapter has custom bypass_forward (e.g., GLoRA)
         adapter_bypass = getattr(self.adapter, "bypass_forward", None)
@@ -172,6 +179,60 @@ class BypassForwardHook:
         # Default bypass: g(f(x) + h(x, f(x)))
         base_out = self.original_forward(x, *args, **kwargs)
         h_out = self.adapter.h(x, base_out)
+
+        # TP: If module is a ParallelLinear, adapt h_out to match base_out.
+        # Colwise: base_out has shape (..., out//ws). h_out has (..., out).
+        #   Slice h_out's output dim to this rank's shard.
+        # Rowwise: base_out is full (..., out) after all_reduce. But x is
+        #   sliced to (..., in//ws). The LoRA h(x) = up(down(x)) * scale where
+        #   down has shape (rank, in_full) — dimension mismatch with sliced x.
+        #   We must recompute h_out with down sliced to (rank, in//ws), then
+        #   all_reduce the result to get the full LoRA contribution.
+        if getattr(self.module, "is_tp_parallelized", False):
+            if h_out.shape != base_out.shape:
+                try:
+                    from comfy.distributed.mesh import get_mesh
+                    import torch.distributed as dist
+                    mesh = get_mesh()
+                    if self.module.mode == "colwise":
+                        local_out = self.module.local_out_features
+                        start = mesh.rank * local_out
+                        end = start + local_out
+                        h_out = h_out[..., start:end]
+                    elif self.module.mode == "rowwise":
+                        # Recompute h_out with sliced down matrix.
+                        # The adapter's h() already ran with full down —
+                        # it may have crashed or produced wrong shape.
+                        # Recompute: slice down's input dim, then run
+                        # F.linear(F.linear(x, down_sliced), up) * scale
+                        v = self.adapter.weights
+                        up_w = v[0]
+                        down_w = v[1]
+                        alpha = v[2]
+                        mid = v[3]
+                        lora_rank = down_w.shape[0]
+                        scale = (alpha / lora_rank) if alpha is not None else 1.0
+                        scale = scale * getattr(self.adapter, "multiplier", 1.0)
+                        local_in = self.module.local_in_features
+                        d_start = mesh.rank * local_in
+                        d_end = d_start + local_in
+                        down_s = down_w.to(dtype=x.dtype, device=x.device)[:, d_start:d_end]
+                        up_w = up_w.to(dtype=x.dtype, device=x.device)
+                        if mid is not None:
+                            mid = mid.to(dtype=x.dtype, device=x.device)
+                            hidden = torch.nn.functional.linear(x, down_s)
+                            hidden = torch.nn.functional.linear(hidden, mid)
+                            h_out = torch.nn.functional.linear(hidden, up_w)
+                        else:
+                            hidden = torch.nn.functional.linear(x, down_s)
+                            h_out = torch.nn.functional.linear(hidden, up_w)
+                        h_out = h_out * scale
+                        # All-reduce so each rank has the full LoRA contribution
+                        dist.all_reduce(h_out, op=dist.ReduceOp.SUM)
+                except (ImportError, RuntimeError) as e:
+                    import logging
+                    logging.debug(f"[BypassTP] Could not adapt h_out for TP: {e}")
+
         return self.adapter.g(base_out + h_out)
 
     def inject(self):

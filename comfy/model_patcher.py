@@ -969,16 +969,14 @@ class ModelPatcher:
 
                     if weight_key in self.patches:
                         if force_patch_weights:
-                            if not getattr(m, "is_tp_parallelized", False):
-                                self.patch_weight_to_device(weight_key)
+                            self.patch_weight_to_device(weight_key)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, weight_key)
                             m.weight_function = [LowVramPatch(weight_key, self.patches, convert_func, set_func)]
                             patch_counter += 1
                     if bias_key in self.patches:
                         if force_patch_weights:
-                            if not getattr(m, "is_tp_parallelized", False):
-                                self.patch_weight_to_device(bias_key)
+                            self.patch_weight_to_device(bias_key)
                         else:
                             _, set_func, convert_func = get_key_weight(self.model, bias_key)
                             m.bias_function = [LowVramPatch(bias_key, self.patches, convert_func, set_func)]
@@ -1022,8 +1020,7 @@ class ModelPatcher:
                         comfy.ops.disable_weight_init._zero_init_parameter(m, param)
                     key = key_param_name_to_key(n, param)
                     self.unpin_weight(key)
-                    if not getattr(m, "is_tp_parallelized", False):
-                        self.patch_weight_to_device(key, device_to=device_to)
+                    self.patch_weight_to_device(key, device_to=device_to)
                 if comfy.model_management.is_device_cuda(device_to):
                     torch.cuda.synchronize()
 
@@ -1181,16 +1178,14 @@ class ModelPatcher:
                         if lowvram_possible:
                             if weight_key in self.patches:
                                 if force_patch_weights:
-                                    if not getattr(m, "is_tp_parallelized", False):
-                                        self.patch_weight_to_device(weight_key)
+                                    self.patch_weight_to_device(weight_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, weight_key)
                                     m.weight_function.append(LowVramPatch(weight_key, self.patches, convert_func, set_func))
                                     patch_counter += 1
                             if bias_key in self.patches:
                                 if force_patch_weights:
-                                    if not getattr(m, "is_tp_parallelized", False):
-                                        self.patch_weight_to_device(bias_key)
+                                    self.patch_weight_to_device(bias_key)
                                 else:
                                     _, set_func, convert_func = get_key_weight(self.model, bias_key)
                                     m.bias_function.append(LowVramPatch(bias_key, self.patches, convert_func, set_func))

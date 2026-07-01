@@ -482,7 +482,35 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
 
             if strength != 0.0:
                 if diff.shape != weight.shape:
-                    logging.warning("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, diff.shape, weight.shape))
+                    # TP: try slicing the diff to match sharded weight
+                    tp_sliced = False
+                    try:
+                        from comfy.distributed.utils import is_tp_active
+                        if is_tp_active():
+                            from comfy.distributed.mesh import get_mesh
+                            mesh = get_mesh()
+                            if (len(weight.shape) == 2 and
+                                    diff.shape[0] != weight.shape[0] and
+                                    diff.shape[1] == weight.shape[1]):
+                                # Colwise: slice output dimension (rows)
+                                start = mesh.rank * weight.shape[0]
+                                end = start + weight.shape[0]
+                                diff = diff[start:end, :]
+                                tp_sliced = True
+                            elif (len(weight.shape) == 2 and
+                                  diff.shape[1] != weight.shape[1] and
+                                  diff.shape[0] == weight.shape[0]):
+                                # Rowwise: slice input dimension (cols)
+                                start = mesh.rank * weight.shape[1]
+                                end = start + weight.shape[1]
+                                diff = diff[:, start:end]
+                                tp_sliced = True
+                    except ImportError:
+                        pass
+                    if not tp_sliced:
+                        logging.warning("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, diff.shape, weight.shape))
+                    else:
+                        weight += function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype))
                 else:
                     weight += function(strength * comfy.model_management.cast_to_device(diff, weight.device, weight.dtype))
         elif patch_type == "set":

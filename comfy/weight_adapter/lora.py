@@ -267,8 +267,35 @@ class LoRAAdapter(WeightAdapterBase):
         try:
             lora_diff = torch.mm(
                 mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)
-            ).reshape(weight.shape)
+            )
             del mat1, mat2
+            # TP: slice LoRA diff to match the sharded weight shape.
+            # ParallelLinear shards the weight: colwise splits output dim
+            # (rows), rowwise splits input dim (cols). The full LoRA diff
+            # has the original (out, in) shape — slice it for this rank.
+            if lora_diff.shape != weight.shape:
+                try:
+                    from comfy.distributed.utils import is_tp_active
+                    if is_tp_active():
+                        from comfy.distributed.mesh import get_mesh
+                        mesh = get_mesh()
+                        if (len(weight.shape) == 2 and
+                                lora_diff.shape[0] != weight.shape[0] and
+                                lora_diff.shape[1] == weight.shape[1]):
+                            # Colwise: slice output dimension (rows)
+                            start = mesh.rank * weight.shape[0]
+                            end = start + weight.shape[0]
+                            lora_diff = lora_diff[start:end, :]
+                        elif (len(weight.shape) == 2 and
+                              lora_diff.shape[1] != weight.shape[1] and
+                              lora_diff.shape[0] == weight.shape[0]):
+                            # Rowwise: slice input dimension (cols)
+                            start = mesh.rank * weight.shape[1]
+                            end = start + weight.shape[1]
+                            lora_diff = lora_diff[:, start:end]
+                except ImportError:
+                    pass
+            lora_diff = lora_diff.reshape(weight.shape)
             if dora_scale is not None:
                 weight = weight_decompose(
                     dora_scale,
