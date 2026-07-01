@@ -505,6 +505,13 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
                                 end = start + weight.shape[1]
                                 diff = diff[:, start:end]
                                 tp_sliced = True
+                            elif (len(weight.shape) == 1 and
+                                  diff.shape[0] != weight.shape[0]):
+                                # Colwise bias: slice to this rank's shard
+                                start = mesh.rank * weight.shape[0]
+                                end = start + weight.shape[0]
+                                diff = diff[start:end]
+                                tp_sliced = True
                     except ImportError:
                         pass
                     if not tp_sliced:
@@ -519,6 +526,32 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
             target_weight: torch.Tensor = v[0]
             diff_weight = comfy.model_management.cast_to_device(target_weight, weight.device, intermediate_dtype) - \
                           comfy.model_management.cast_to_device(original_weights[key][0][0], weight.device, intermediate_dtype)
+            # TP: slice diff_weight to match sharded weight
+            if diff_weight.shape != weight.shape:
+                try:
+                    from comfy.distributed.utils import is_tp_active
+                    if is_tp_active():
+                        from comfy.distributed.mesh import get_mesh
+                        mesh = get_mesh()
+                        if (len(weight.shape) == 2 and
+                                diff_weight.shape[0] != weight.shape[0] and
+                                diff_weight.shape[1] == weight.shape[1]):
+                            start = mesh.rank * weight.shape[0]
+                            end = start + weight.shape[0]
+                            diff_weight = diff_weight[start:end, :]
+                        elif (len(weight.shape) == 2 and
+                              diff_weight.shape[1] != weight.shape[1] and
+                              diff_weight.shape[0] == weight.shape[0]):
+                            start = mesh.rank * weight.shape[1]
+                            end = start + weight.shape[1]
+                            diff_weight = diff_weight[:, start:end]
+                        elif (len(weight.shape) == 1 and
+                              diff_weight.shape[0] != weight.shape[0]):
+                            start = mesh.rank * weight.shape[0]
+                            end = start + weight.shape[0]
+                            diff_weight = diff_weight[start:end]
+                except ImportError:
+                    pass
             weight += function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype))
         else:
             logging.warning("patch type not recognized {} {}".format(patch_type, key))

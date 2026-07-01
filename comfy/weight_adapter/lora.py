@@ -293,6 +293,12 @@ class LoRAAdapter(WeightAdapterBase):
                             start = mesh.rank * weight.shape[1]
                             end = start + weight.shape[1]
                             lora_diff = lora_diff[:, start:end]
+                        elif (len(weight.shape) == 1 and
+                              lora_diff.shape[0] != weight.shape[0]):
+                            # Colwise bias: slice to this rank's shard
+                            start = mesh.rank * weight.shape[0]
+                            end = start + weight.shape[0]
+                            lora_diff = lora_diff[start:end]
                 except ImportError:
                     pass
             lora_diff = lora_diff.reshape(weight.shape)
