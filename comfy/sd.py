@@ -1979,7 +1979,12 @@ def _apply_tensor_parallelism(model, sd, prefix=""):
     # model.diffusion_model. parallelize_model() must operate on
     # the inner model to find the correct module prefixes.
     diffusion_model = getattr(model, 'diffusion_model', model)
-    parallelize_model(diffusion_model)
+    if not parallelize_model(diffusion_model):
+        # Unsupported / unmatched architecture — do NOT force the TP
+        # load/offload device path. Caller falls back to normal loading
+        # (fixes Cosmos GeneralDIT crashing under --tensor-parallel even
+        # when TP sharding is skipped).
+        return None, None
     load_tp_shards(diffusion_model, sd, prefix=prefix)
     # Move non-TP params (layer norms, embeddings) to CPU offload device.
     # TP shards stay on their rank's GPU.
@@ -2044,16 +2049,19 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
             inital_load_device = torch.device("cpu")
             logging.info(f"[TP] Building diffusion model on {inital_load_device}")
         model = model_config.get_model(sd, diffusion_model_prefix, device=inital_load_device)
+        tp_load_device = tp_offload_device = None
         if is_tp:
             tp_load_device, tp_offload_device = _apply_tensor_parallelism(model, sd, prefix=diffusion_model_prefix)
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
-        if is_tp:
+        if tp_load_device is not None:
             offload_device = tp_offload_device
             load_device = tp_load_device
         else:
+            # Single-GPU path, or TP-active but this architecture is unsupported.
             offload_device = model_options.get("offload_device", model_management.unet_offload_device())
+            load_device = model_options.get("load_device", model_management.get_torch_device())
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-        if not is_tp and not model_management.is_device_cpu(offload_device):
+        if tp_load_device is None and not model_management.is_device_cpu(offload_device):
             model.to(offload_device)
         model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.is_dynamic())
 
@@ -2200,13 +2208,18 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
         model = model_config.get_model(new_sd, "", device=torch.device("cpu"))
     else:
         model = model_config.get_model(new_sd, "")
+    tp_load_device = tp_offload_device = None
     if is_tp:
         tp_load_device, tp_offload_device = _apply_tensor_parallelism(model, new_sd)
     ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
-    offload_device = tp_offload_device if is_tp else model_management.unet_offload_device()
-    load_device = tp_load_device if is_tp else model_management.get_torch_device()
+    if tp_load_device is not None:
+        offload_device = tp_offload_device
+        load_device = tp_load_device
+    else:
+        offload_device = model_management.unet_offload_device()
+        load_device = model_management.get_torch_device()
     model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-    if not is_tp and not model_management.is_device_cpu(offload_device):
+    if tp_load_device is None and not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
     model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
     left_over = sd.keys()
