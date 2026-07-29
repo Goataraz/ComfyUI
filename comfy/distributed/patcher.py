@@ -208,8 +208,24 @@ def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
     return sliced
 
 
+# Models whose MRO would match a supported parent but that are NOT safe
+# to shard yet (architecture-specific head bookkeeping outside Attention).
+TP_UNSUPPORTED = {
+    # CausalWanModel(WanModel) keeps outer/block-level num_heads for KV cache
+    # allocation; head-split only updates nested Attention modules → cache
+    # shape mismatch. Needs dedicated causal-Wan TP work.
+    "CausalWanModel",
+    # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
+    "HiDreamO1Transformer",
+}
+
+
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
+    concrete = type(model).__name__
+    if concrete in TP_UNSUPPORTED:
+        logging.info(f"[TP] {concrete} is explicitly unsupported — skipping TP")
+        return []
     for cls in type(model).__mro__:
         if cls.__name__ in TP_TARGETS:
             return TP_TARGETS[cls.__name__]

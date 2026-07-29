@@ -1926,8 +1926,17 @@ class ModelPatcherDynamic(ModelPatcher):
                             # Rebuild fresh each load so patches don't stack across reloads.
                             func_list = []
                             if key in self.patches:
-                                func_list.append(LowVramPatch(key, self.patches))
-                                num_patches += 1
+                                # Skip shape-changing LoRAs — ParallelLinear shard
+                                # geometry is fixed; a resizing patch would return a
+                                # full-sized tensor and crash/corrupt the forward.
+                                if comfy.lora.calculate_shape(self.patches[key], weight, key) == weight.shape:
+                                    func_list.append(LowVramPatch(key, self.patches))
+                                    num_patches += 1
+                                else:
+                                    logging.warning(
+                                        f"[TP] Skipping resizing LoRA on sharded param {key} "
+                                        f"(shard shape {tuple(weight.shape)})"
+                                    )
                             if key in self.weight_wrapper_patches:
                                 func_list.extend(self.weight_wrapper_patches[key])
                             setattr(m, func_attr, func_list)

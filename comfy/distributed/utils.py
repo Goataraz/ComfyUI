@@ -38,7 +38,12 @@ def is_tp_active() -> bool:
 
 def get_tp_param_names(model) -> set[str]:
     """Collect the set of fully-qualified parameter names belonging to
-    TP-parallelized modules (ParallelLinear layers with is_tp_parallelized=True).
+    TP-owned shards that must be skipped during full state-dict loads.
+
+    Includes:
+      - ParallelLinear layers (`is_tp_parallelized=True`)
+      - Full-dim QK norms sliced for head-split (Wan / HiDream), marked
+        with `_tp_norm_shard` during parallelize_model
 
     Used by model_base and model_patcher to skip TP params during
     state dict loading and device transfers.
@@ -47,7 +52,11 @@ def get_tp_param_names(model) -> set[str]:
     for mod_name, mod in model.named_modules():
         if getattr(mod, 'is_tp_parallelized', False):
             for pn, _ in mod.named_parameters(recurse=False):
-                tp_param_names.add(f"{mod_name}.{pn}")
+                tp_param_names.add(f"{mod_name}.{pn}" if mod_name else pn)
+        elif getattr(mod, '_tp_norm_shard', None) is not None:
+            # Sliced RMSNorm / LayerNorm — checkpoint holds full-dim weight
+            for pn, _ in mod.named_parameters(recurse=False):
+                tp_param_names.add(f"{mod_name}.{pn}" if mod_name else pn)
     return tp_param_names
 
 

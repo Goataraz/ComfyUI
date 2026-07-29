@@ -805,3 +805,47 @@ class TestWanModelTP:
         # Rank 1 should hold the second half of the original norm weight
         import torch
         assert torch.allclose(attn.norm_q.weight.data, orig_norm[local_dim:])
+
+
+class TestTPParamNamesAndDeny:
+    def test_sliced_norms_included_in_tp_param_names(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher, utils as tp_utils
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.head_dim = 16
+                dim = 128
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Module()])
+                self.blocks[0].self_attn = SelfAttn()
+
+        model = WanModel()
+        patcher.parallelize_model(model)
+        names = tp_utils.get_tp_param_names(model)
+        assert "blocks.0.self_attn.q.weight" in names
+        assert "blocks.0.self_attn.norm_q.weight" in names, (
+            "sliced QK norms must be excluded from full state_dict loads"
+        )
+
+    def test_causal_wan_denied(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Wan = type("WanModel", (), {})
+        Causal = type("CausalWanModel", (Wan,), {})
+        assert get_tp_targets(Wan()) == ["blocks"]
+        assert get_tp_targets(Causal()) == []
