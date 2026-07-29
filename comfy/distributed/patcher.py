@@ -42,7 +42,8 @@ def _is_linear_layer(module):
 
 # Mapping of inner diffusion model class names to their TP target prefixes.
 # Keys must match the __name__ of the inner diffusion model class (not the BaseModel wrapper).
-# Subclasses are handled via MRO walk, so e.g. Anima(MiniTrainDIT) inherits "blocks".
+# Subclasses are handled via MRO walk, so e.g. Anima(MiniTrainDIT) / VaceWanModel(WanModel)
+# inherit the parent entry.
 TP_TARGETS = {
     "Flux": ["double_blocks", "single_blocks"],
     "OpenAISignatureMMDITWrapper": ["blocks"],       # SD3
@@ -55,6 +56,7 @@ TP_TARGETS = {
     # "HiDreamO1Transformer": ["language_model.layers"],
     "QwenImageTransformer2DModel": ["transformer_blocks"],
     "Llama2": ["layers"],
+    "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -63,8 +65,16 @@ TP_TARGETS = {
 # - mlp.2: MLP second linear (down-projection, rowwise with all-reduce)
 # - down/down_proj: general down-projection patterns
 # - w2: Megatron-style MLP down-projection
-ROWWISE_KEYWORDS = ["to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t", "o_proj", "down_proj", "mlp.layer2"]
-COLWISE_KEYWORDS = ["to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t", "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
+# - ffn.2 / block.layer2: Wan / Cosmos GeneralDIT MLP down-projections
+ROWWISE_KEYWORDS = [
+    "to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t",
+    "o_proj", "down_proj", "mlp.layer2", "ffn.2",
+]
+COLWISE_KEYWORDS = [
+    "to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t",
+    "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj",
+    "mlp.layer1",
+]
 
 # Layer names that must NOT be sharded. These are excluded because:
 # - Modulation layers (chunk() with full dim): modulation.lin, img_mod.lin, txt_mod.lin
@@ -81,7 +91,7 @@ EXCLUDED_LAYER_NAMES = [
     # at index 1 (not a ".lin" suffix). Output is 6*dim, chunked 2-way for
     # (shift, scale, gate).
     "img_mod.1", "txt_mod.1",
-    # Cosmos Predict2 / Anima: adaln modulation Sequentials
+    # Cosmos Predict2 / Anima: adaln modulation Sequentials (lowercase)
     # When use_adaln_lora=True the Sequential is (SiLU, Linear_down, Linear_up)
     # — two linears at indices .1 and .2 that form a bottleneck and must stay
     # together as un-sharded layers. When use_adaln_lora=False the Sequential
@@ -90,16 +100,113 @@ EXCLUDED_LAYER_NAMES = [
     "adaln_modulation_self_attn.1", "adaln_modulation_self_attn.2",
     "adaln_modulation_cross_attn.1", "adaln_modulation_cross_attn.2",
     "adaln_modulation_mlp.1", "adaln_modulation_mlp.2",
+    # Cosmos GeneralDIT + HiDream Image use capital LN: adaLN_modulation
+    # (chunked 3-way / 6-way / 12-way on full dim). Same suffix covers both.
+    "adaLN_modulation.1", "adaLN_modulation.2",
 ]
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
 # channels — i.e., a subset of heads with full per-head dim. The Attention
-# module's `self.heads` must be divided by world_size so that the model's
-# `.view(B, S, heads, dim_head)` reshape produces the correct
-# (B, S, heads//ws, dim_head) layout. The per-head RMSNorm weights and
-# rotary embeddings stay at full dim_head (replicated across ranks).
-TP_HEAD_SPLIT_MODELS = {"QwenImageTransformer2DModel", "MiniTrainDIT"}
+# module's `self.heads` / `n_heads` / `num_heads` must be divided by
+# world_size so that the model's `.view(B, S, heads, dim_head)` reshape
+# produces the correct (B, S, heads//ws, dim_head) layout.
+#
+# Norm policy:
+# - Per-head norms (normalized_shape == dim_head, applied AFTER rearrange):
+#   leave replicated. Covered by QwenImage / Cosmos GeneralDIT.
+# - Full-dim QK norms (normalized_shape == heads*dim_head, applied BEFORE
+#   rearrange): must be sliced to local_heads*dim_head. Covered by Wan and
+#   HiDream Image. See `_slice_full_dim_qk_norms`.
+TP_HEAD_SPLIT_MODELS = {
+    "QwenImageTransformer2DModel",
+    "MiniTrainDIT",
+    "GeneralDIT",
+    "WanModel",
+    "HiDreamImageTransformer2DModel",
+}
+
+# Attribute names used for the Q projection across architectures.
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q")
+# Attribute names for head count / head dim.
+_HEADS_ATTRS = ("heads", "n_heads", "num_heads")
+_DIM_HEAD_ATTRS = ("dim_head", "head_dim")
+# Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
+_FULL_DIM_QK_NORM_ATTRS = (
+    "norm_q", "norm_k", "norm_k_img",
+    "q_rms_norm", "k_rms_norm", "q_rms_norm_t", "k_rms_norm_t",
+)
+
+
+def _resolve_q_proj(module):
+    """Find the Q projection Linear/ParallelLinear on an Attention module.
+
+    Handles:
+      - Direct attrs: to_q / q_proj / q
+      - CosmOS Sequential: to_q = Sequential(Linear, Norm) → return Linear at [0]
+    """
+    for attr in _Q_PROJ_ATTRS:
+        q = getattr(module, attr, None)
+        if q is None:
+            continue
+        if isinstance(q, nn.Sequential) and len(q) > 0:
+            q = q[0]
+        if isinstance(q, ParallelLinear) or _is_linear_layer(q):
+            return q
+    return None
+
+
+def _get_attr_first(module, names):
+    for name in names:
+        val = getattr(module, name, None)
+        if val is not None:
+            return name, val
+    return None, None
+
+
+def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
+    """Slice full-dim QK RMSNorms to match the local head shard.
+
+    Wan and HiDream apply RMSNorm(dim) AFTER the colwise Q/K projection but
+    BEFORE the heads reshape. After colwise sharding the projection output is
+    `local_heads * dim_head` channels, so the norm weight and normalized_shape
+    must shrink to match. Per-head norms (weight.shape == dim_head) are left alone.
+    """
+    local_dim = local_heads * dim_head
+    full_dim = None
+    # Prefer the pre-override head count stored on the module if we kept it;
+    # otherwise derive from weight shape.
+    sliced = 0
+    for attr in _FULL_DIM_QK_NORM_ATTRS:
+        norm = getattr(module, attr, None)
+        if norm is None or not hasattr(norm, "weight") or norm.weight is None:
+            continue
+        w = norm.weight
+        if w.ndim != 1:
+            continue
+        # Skip per-head norms (already correct size) and already-sliced norms.
+        if w.shape[0] == dim_head or w.shape[0] == local_dim:
+            continue
+        # Only slice when weight is an exact multiple of dim_head matching
+        # the original full head count (heads * dim_head).
+        if w.shape[0] % dim_head != 0:
+            continue
+        if w.shape[0] // dim_head != local_heads * mesh.world_size:
+            # Unexpected size — leave alone rather than corrupt.
+            continue
+        start = mesh.rank * local_dim
+        end = start + local_dim
+        norm.weight = nn.Parameter(
+            w.data[start:end].clone(),
+            requires_grad=w.requires_grad,
+        )
+        if hasattr(norm, "normalized_shape"):
+            norm.normalized_shape = (local_dim,)
+        # Mark so load_tp_shards / diagnostics can see it.
+        norm._tp_norm_shard = (start, end)
+        sliced += 1
+    return sliced
+
 
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
@@ -116,11 +223,8 @@ def parallelize_model(model):
     if not targets:
         return False
 
-    # For head-split models (QwenImage) the colwise shard distributes a
-    # contiguous slice of heads across ranks. We need to override
-    # `self.heads` on each Attention module so the model's
-    # `.view(B, S, heads, dim_head)` reshape produces the right per-rank
-    # layout. Detect this once up front.
+    # For head-split models the colwise shard distributes a contiguous slice
+    # of heads across ranks. Detect once up front via MRO.
     model_class_name = None
     for cls in type(model).__mro__:
         if cls.__name__ in TP_HEAD_SPLIT_MODELS:
@@ -154,10 +258,23 @@ def parallelize_model(model):
                     # GELU/MLP first-Linear in a ModuleList (QwenImage) —
                     # structurally an up-projection, colwise with gather.
                     mode = "colwise"
-                elif any(k in name for k in ROWWISE_KEYWORDS) or name.endswith(".net.2"):
+                elif name.endswith((".q", ".k", ".v", ".k_img", ".v_img")):
+                    # Wan uses bare `.q`/`.k`/`.v` (not to_q / q_proj).
+                    mode = "colwise"
+                elif name.endswith((".ffn.0", ".layer1")):
+                    # Wan MLP up-projection / Cosmos GPT2FeedForward.layer1
+                    mode = "colwise"
+                elif (
+                    any(k in name for k in ROWWISE_KEYWORDS)
+                    or name.endswith(".net.2")
+                    or name.endswith(".o")  # Wan attention output proj
+                    or name.endswith(".layer2")  # Cosmos GPT2FeedForward.layer2
+                ):
                     # `.net.2` covers QwenImage's MLP down-projection
-                    # (the GELU+Droput+Linear ModuleList's index-2 Linear),
+                    # (the GELU+Dropout+Linear ModuleList's index-2 Linear),
                     # matching Flux's `mlp.2` rowwise convention.
+                    # `.o` covers Wan's self_attn.o / cross_attn.o.
+                    # `.layer2` covers Cosmos GeneralDIT / MiniTrainDIT MLP down.
                     mode = "rowwise"
 
                 # Skip layers where the shard dimension isn't evenly divisible
@@ -189,25 +306,23 @@ def parallelize_model(model):
     logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
                  f" ({skipped_dims} skipped for non-divisible dimensions)")
 
-    # Head-split override: for QwenImage-style models, the colwise shard
-    # distributes a contiguous slice of heads across ranks. Each rank's
-    # output of to_q/to_k/to_v is `(heads/world_size) * dim_head` channels,
-    # so the Attention module's `self.heads` must be divided by world_size
-    # to make the model's `.view(B, S, heads, dim_head)` reshape produce
-    # the right per-rank layout. Per-head norms and the rotary embedding
-    # stay at full dim_head on every rank (no slicing needed).
+    # Head-split override: for QwenImage/Cosmos/Wan/HiDream-style models, the
+    # colwise shard distributes a contiguous slice of heads across ranks.
+    # Each rank's output of to_q/to_k/to_v is `(heads/world_size) * dim_head`
+    # channels, so the Attention module's head count must be divided by
+    # world_size. Per-head norms stay full dim_head; full-dim QK norms
+    # (Wan/HiDream) are sliced via `_slice_full_dim_qk_norms`.
     if head_split_active:
         head_overrides = 0
+        norms_sliced = 0
+        local_heads = None
+        heads = None
         for module in model.modules():
-            # Duck-typed Attention detection. Two naming conventions:
-            #   QwenImage: to_q (ParallelLinear), heads, dim_head
-            #   Cosmos/Anima: q_proj (ParallelLinear), n_heads, head_dim
-            q_proj = getattr(module, "to_q", None) or getattr(module, "q_proj", None)
+            q_proj = _resolve_q_proj(module)
             if not isinstance(q_proj, ParallelLinear):
                 continue
-            # Resolve whichever naming convention this module uses.
-            heads = getattr(module, "heads", None) or getattr(module, "n_heads", None)
-            dim_head = getattr(module, "dim_head", None) or getattr(module, "head_dim", None)
+            heads_attr, heads = _get_attr_first(module, _HEADS_ATTRS)
+            dim_attr, dim_head = _get_attr_first(module, _DIM_HEAD_ATTRS)
             if not isinstance(heads, int) or not isinstance(dim_head, int):
                 continue
             if heads % mesh.world_size != 0:
@@ -216,16 +331,19 @@ def parallelize_model(model):
                     f"world_size={mesh.world_size}"
                 )
             local_heads = heads // mesh.world_size
-            # Update whichever attribute name the module actually uses.
-            if hasattr(module, "heads"):
-                module.heads = local_heads
-            if hasattr(module, "n_heads"):
-                module.n_heads = local_heads
+            if heads_attr is not None:
+                setattr(module, heads_attr, local_heads)
+            # Also keep sibling aliases in sync (some modules expose both).
+            for alt in _HEADS_ATTRS:
+                if alt != heads_attr and hasattr(module, alt):
+                    setattr(module, alt, local_heads)
+            norms_sliced += _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh)
             head_overrides += 1
         if head_overrides:
             logging.info(
-                f"[TP] Head-split override: set heads={local_heads} (from "
-                f"{heads}) on {head_overrides} Attention modules"
+                f"[TP] Head-split override ({model_class_name}): set heads={local_heads} "
+                f"(from {heads}) on {head_overrides} Attention modules"
+                + (f"; sliced {norms_sliced} full-dim QK norms" if norms_sliced else "")
             )
     return True
 
@@ -264,6 +382,22 @@ def load_tp_shards(model, sd, prefix=""):
                         module.bias.data = full_bias.to(mesh.current_device)
                 else:
                     logging.warning(f"[TP] Bias not found in state dict: '{bias_key}'")
+
+        # Reload full-dim QK norms that were sliced during parallelize_model.
+        # The checkpoint holds the full weight; we re-slice by the marker set
+        # on the module. (parallelize_model already sliced from the constructed
+        # module weights; this path covers load-from-sd after a fresh construct.)
+        shard_range = getattr(module, "_tp_norm_shard", None)
+        if shard_range is not None and hasattr(module, "weight") and module.weight is not None:
+            weight_key = prefix + name + ".weight"
+            if weight_key in sd:
+                full = sd[weight_key]
+                start, end = shard_range
+                if full.ndim == 1 and end <= full.shape[0]:
+                    module.weight.data = full[start:end].to(
+                        device=module.weight.device, dtype=module.weight.dtype
+                    )
+
     if missing > 0:
         logging.error(f"[TP] load_tp_shards: {loaded} weights loaded, {missing} MISSING for {model.__class__.__name__} — outputs will be incorrect")
     else:

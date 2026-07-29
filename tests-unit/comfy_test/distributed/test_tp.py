@@ -532,7 +532,9 @@ class TestQwenImageHeadSplit:
                 f"{n}: normalized_shape should stay (128,), got {tuple(norm.normalized_shape)}"
             )
 
-    def test_non_qwenimage_attn_not_heads_overridden(self, monkeypatch):
+    def test_hidream_heads_overridden_and_full_dim_norms_sliced(self, monkeypatch):
+        """HiDream Image is head-split; full-dim QK RMSNorms must shrink to the
+        local shard (unlike QwenImage's per-head norms which stay replicated)."""
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
         import torch.nn as nn
@@ -549,12 +551,17 @@ class TestQwenImageHeadSplit:
                 super().__init__()
                 self.heads = 20
                 self.dim_head = 64
-                self.to_q = nn.Linear(1280, 1280, bias=False)
+                inner = 20 * 64
+                self.to_q = nn.Linear(inner, inner, bias=False)
+                self.q_rms_norm = nn.RMSNorm(inner, eps=1e-6)
+                self.k_rms_norm = nn.RMSNorm(inner, eps=1e-6)
 
         class _Block(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.attn = _Attn()
+                self.attn1 = _Attn()
+                # Modulation must stay un-sharded (chunk on full dim)
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(1280, 6 * 1280))
 
         class _Outer(nn.Module):
             def __init__(self):
@@ -568,10 +575,16 @@ class TestQwenImageHeadSplit:
 
         patcher.parallelize_model(model)
 
-        attn = model.double_stream_blocks[0].attn
-        assert attn.heads == 20, (
-            f"HiDream heads should NOT be overridden, got {attn.heads}"
+        attn = model.double_stream_blocks[0].attn1
+        assert attn.heads == 10, f"HiDream heads should be 10 after TP, got {attn.heads}"
+        assert tuple(attn.q_rms_norm.weight.shape) == (640,), (
+            f"q_rms_norm should be sliced to 640, got {tuple(attn.q_rms_norm.weight.shape)}"
         )
+        assert tuple(attn.k_rms_norm.normalized_shape) == (640,)
+        # Modulation Linear must remain nn.Linear (not ParallelLinear)
+        from comfy.distributed.parallel_linear import ParallelLinear
+        mod_linear = model.double_stream_blocks[0].adaLN_modulation[1]
+        assert not isinstance(mod_linear, ParallelLinear), "adaLN_modulation.1 must be excluded"
 
 
 # ---------------------------------------------------------------------------
@@ -635,3 +648,160 @@ class TestParallelLinearWeightFunction:
         # Sanity: with weight of ones + patch (+1) => effective weight of 2s.
         expected = torch.matmul(x, (layer.weight.data + 1.0).t()) + layer.bias.data
         assert torch.allclose(out1, expected), "weight_function was not applied on forward"
+
+
+# ---------------------------------------------------------------------------
+# Cosmos GeneralDIT / Wan / expanded head-split coverage
+# ---------------------------------------------------------------------------
+
+class TestCosmosGeneralDITTP:
+    """GeneralDIT needs capital adaLN exclusions, block.layer1/2 modes,
+    Sequential-aware head-split (to_q = Sequential(Linear, Norm))."""
+
+    def test_targets_and_exclusions(self):
+        from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES, TP_HEAD_SPLIT_MODELS
+        GeneralDIT = type("GeneralDIT", (), {})
+        assert get_tp_targets(GeneralDIT()) == ["blocks"]
+        assert "adaLN_modulation.1" in EXCLUDED_LAYER_NAMES
+        assert "adaLN_modulation.2" in EXCLUDED_LAYER_NAMES
+        assert "GeneralDIT" in TP_HEAD_SPLIT_MODELS
+
+    def test_sharding_modes_and_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        def L(i, o):
+            return nn.Linear(i, o, bias=True)
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = 16
+                self.dim_head = 64
+                inner = 16 * 64
+                # CosmOS: Sequential(Linear, per-head Norm)
+                self.to_q = nn.Sequential(L(inner, inner), nn.RMSNorm(64))
+                self.to_k = nn.Sequential(L(inner, inner), nn.RMSNorm(64))
+                self.to_v = nn.Sequential(L(inner, inner), nn.Identity())
+                self.to_out = nn.Sequential(L(inner, inner), nn.Dropout(0.0))
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attn()
+                self.layer1 = L(1024, 4096)  # MLP up → colwise
+                self.layer2 = L(4096, 1024)  # MLP down → rowwise
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), L(1024, 3 * 1024))
+
+        class GeneralDIT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = GeneralDIT()
+        assert patcher.parallelize_model(model) is True
+
+        modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
+        assert modes["blocks.0.attn.to_q.0"] == "colwise"
+        assert modes["blocks.0.attn.to_out.0"] == "rowwise"
+        assert modes["blocks.0.layer1"] == "colwise"
+        assert modes["blocks.0.layer2"] == "rowwise"
+        assert "blocks.0.adaLN_modulation.1" not in modes
+
+        attn = model.blocks[0].attn
+        assert attn.heads == 8
+        # Per-head norm inside Sequential stays full dim_head
+        assert tuple(attn.to_q[1].weight.shape) == (64,)
+
+
+class TestWanModelTP:
+    """WanModel: bare .q/.k/.v/.o naming, ffn.0/ffn.2, full-dim QK norm slice."""
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Wan = type("WanModel", (), {})
+        Vace = type("VaceWanModel", (Wan,), {})
+        assert get_tp_targets(Wan()) == ["blocks"]
+        assert get_tp_targets(Vace()) == ["blocks"]  # MRO inherit
+        assert "WanModel" in TP_HEAD_SPLIT_MODELS
+
+    def test_sharding_modes_head_split_and_norm_slice(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 1  # non-zero rank to verify slice offset
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 768  # 12 heads * 64
+        n_heads = 12
+        head_dim = 64
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = SelfAttn()
+                self.ffn = nn.ModuleList([
+                    nn.Linear(dim, dim * 4, bias=True),  # .0 up
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim, bias=True),  # .2 down
+                ])
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = WanModel()
+        # Stash original norm weight to verify rank-1 slice
+        orig_norm = model.blocks[0].self_attn.norm_q.weight.data.clone()
+
+        assert patcher.parallelize_model(model) is True
+
+        modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
+        expected = {
+            "blocks.0.self_attn.q": "colwise",
+            "blocks.0.self_attn.k": "colwise",
+            "blocks.0.self_attn.v": "colwise",
+            "blocks.0.self_attn.o": "rowwise",
+            "blocks.0.ffn.0": "colwise",
+            "blocks.0.ffn.2": "rowwise",
+        }
+        for name, mode in expected.items():
+            assert name in modes, f"{name} not sharded"
+            assert modes[name] == mode, f"{name}: expected {mode}, got {modes[name]}"
+
+        attn = model.blocks[0].self_attn
+        assert attn.num_heads == 6
+        local_dim = 6 * 64
+        assert tuple(attn.norm_q.weight.shape) == (local_dim,)
+        assert tuple(attn.norm_q.normalized_shape) == (local_dim,)
+        # Rank 1 should hold the second half of the original norm weight
+        import torch
+        assert torch.allclose(attn.norm_q.weight.data, orig_norm[local_dim:])

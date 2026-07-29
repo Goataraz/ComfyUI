@@ -379,6 +379,11 @@ def prompt_worker(q, server_instance):
         timeout = 1000.0
         if need_gc:
             timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+        # In TP mode, use a short queue timeout so rank 0 returns quickly
+        # and enters the collective with rank 1. Otherwise rank 1 blocks
+        # in dist.broadcast while NCCL busy-polls GPU 1 at 100% util.
+        if is_tp:
+            timeout = 5.0
 
         queue_item = None
         if is_tp:
@@ -404,6 +409,11 @@ def prompt_worker(q, server_instance):
                     torch.cuda.synchronize(device=f"cuda:{local_rank}")
                     size_tensor = torch.tensor([-1], dtype=torch.int32, device=f"cuda:{local_rank}")
                     dist.broadcast(size_tensor, src=0)
+                    # Yield CPU + let GPU clocks drop when idle so the TP
+                    # worker doesn't hold GPU 1 at 100% util doing nothing.
+                    # 5s interval: at most 1 NCCL broadcast every 5 seconds
+                    # when idle — GPU clocks drop to idle between checks.
+                    time.sleep(5.0)
             else:
                 # Receive from rank 0
                 # cuda.synchronize mirrors the rank-0 send side so both ranks
@@ -422,6 +432,9 @@ def prompt_worker(q, server_instance):
                     queue_item = (tuple(decoded[0]), decoded[1])
                 else:
                     queue_item = None
+                    # Match rank 0's idle sleep — keeps GPU 1 from spinning
+                    # at 100% util when no prompts are queued.
+                    time.sleep(5.0)
         else:
             # Single GPU mode: just get from queue
             try:
