@@ -655,19 +655,29 @@ class TestParallelLinearWeightFunction:
 # ---------------------------------------------------------------------------
 
 class TestCosmosGeneralDITTP:
-    """GeneralDIT needs capital adaLN exclusions, block.layer1/2 modes,
-    Sequential-aware head-split (to_q = Sequential(Linear, Norm))."""
+    """GeneralDIT is TP_UNSUPPORTED until FA/CA cal_qkv layout is solved.
+    Keep MLP-only exclusion helpers ready for when it is re-enabled."""
 
     def test_targets_and_exclusions(self):
-        from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES, TP_HEAD_SPLIT_MODELS
+        from comfy.distributed.patcher import (
+            get_tp_targets, EXCLUDED_LAYER_NAMES, GENERALDIT_EXCLUDED_LAYER_NAMES,
+            TP_HEAD_SPLIT_MODELS, TP_UNSUPPORTED, TP_TARGETS,
+        )
         GeneralDIT = type("GeneralDIT", (), {})
-        assert get_tp_targets(GeneralDIT()) == ["blocks"]
+        assert "GeneralDIT" in TP_UNSUPPORTED
+        assert "GeneralDIT" in TP_TARGETS  # allowlist kept for re-enable
+        assert get_tp_targets(GeneralDIT()) == []
         assert "adaLN_modulation.1" in EXCLUDED_LAYER_NAMES
         assert "adaLN_modulation.2" in EXCLUDED_LAYER_NAMES
-        assert "attn.to_q.0" in EXCLUDED_LAYER_NAMES
+        # Must be GeneralDIT-scoped — QwenImage also uses attn.to_out.0
+        assert "attn.to_out.0" not in EXCLUDED_LAYER_NAMES
+        assert "attn.to_out.0" in GENERALDIT_EXCLUDED_LAYER_NAMES
+        assert "attn.to_q.0" in GENERALDIT_EXCLUDED_LAYER_NAMES
         assert "GeneralDIT" not in TP_HEAD_SPLIT_MODELS
 
-    def test_sharding_modes_and_head_split(self, monkeypatch):
+    def test_mlp_only_helpers_when_allowlisted(self, monkeypatch):
+        """If GeneralDIT is removed from TP_UNSUPPORTED, MLP-only TP must
+        preserve FA/CA projection shapes (nested ModuleDict layout)."""
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
@@ -679,49 +689,58 @@ class TestCosmosGeneralDITTP:
             current_device = "cpu"
         monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
         monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(patcher, "TP_UNSUPPORTED", set())
 
         def L(i, o):
             return nn.Linear(i, o, bias=True)
 
         class Attn(nn.Module):
-            def __init__(self):
+            def __init__(self, context_dim):
                 super().__init__()
                 self.heads = 16
                 self.dim_head = 64
                 inner = 16 * 64
-                # CosmOS: Sequential(Linear, per-head Norm)
                 self.to_q = nn.Sequential(L(inner, inner), nn.RMSNorm(64))
-                self.to_k = nn.Sequential(L(inner, inner), nn.RMSNorm(64))
-                self.to_v = nn.Sequential(L(inner, inner), nn.Identity())
+                self.to_k = nn.Sequential(L(context_dim, inner), nn.RMSNorm(64))
+                self.to_v = nn.Sequential(L(context_dim, inner), nn.Identity())
                 self.to_out = nn.Sequential(L(inner, inner), nn.Dropout(0.0))
 
-        class Block(nn.Module):
+        class BuildingBlock(nn.Module):
+            def __init__(self, kind):
+                super().__init__()
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), L(1024, 3 * 1024))
+                if kind == "mlp":
+                    self.block = nn.Module()
+                    self.block.layer1 = L(1024, 4096)
+                    self.block.layer2 = L(4096, 1024)
+                else:
+                    self.block = nn.Module()
+                    self.block.attn = Attn(1024 if kind == "ca" else 1024)
+
+        class TransformerBlock(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.attn = Attn()
-                self.layer1 = L(1024, 4096)  # MLP up → colwise
-                self.layer2 = L(4096, 1024)  # MLP down → rowwise
-                self.adaLN_modulation = nn.Sequential(nn.SiLU(), L(1024, 3 * 1024))
+                self.blocks = nn.ModuleList([
+                    BuildingBlock("fa"), BuildingBlock("ca"), BuildingBlock("mlp"),
+                ])
 
         class GeneralDIT(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.blocks = nn.ModuleList([Block()])
+                self.blocks = nn.ModuleDict({"block0": TransformerBlock()})
 
         model = GeneralDIT()
         assert patcher.parallelize_model(model) is True
 
         modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
-        # Attention projections excluded for GeneralDIT (MLP-only TP)
-        assert "blocks.0.attn.to_q.0" not in modes
-        assert "blocks.0.attn.to_out.0" not in modes
-        assert modes["blocks.0.layer1"] == "colwise"
-        assert modes["blocks.0.layer2"] == "rowwise"
-        assert "blocks.0.adaLN_modulation.1" not in modes
-
-        attn = model.blocks[0].attn
-        assert attn.heads == 16  # unchanged — no head-split for GeneralDIT
-        assert tuple(attn.to_q[1].weight.shape) == (64,)
+        assert "blocks.block0.blocks.0.block.attn.to_q.0" not in modes
+        assert "blocks.block0.blocks.0.block.attn.to_out.0" not in modes
+        assert "blocks.block0.blocks.1.block.attn.to_k.0" not in modes
+        assert modes["blocks.block0.blocks.2.block.layer1"] == "colwise"
+        assert modes["blocks.block0.blocks.2.block.layer2"] == "rowwise"
+        assert "blocks.block0.blocks.2.adaLN_modulation.1" not in modes
+        assert not isinstance(model.blocks["block0"].blocks[0].block.attn.to_q[0], ParallelLinear)
+        assert model.blocks["block0"].blocks[1].block.attn.to_k[0].in_features == 1024
 
 
 class TestWanModelTP:

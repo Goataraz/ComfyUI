@@ -103,12 +103,17 @@ EXCLUDED_LAYER_NAMES = [
     # Cosmos GeneralDIT + HiDream Image use capital LN: adaLN_modulation
     # (chunked 3-way / 6-way / 12-way on full dim). Same suffix covers both.
     "adaLN_modulation.1", "adaLN_modulation.2",
-    # GeneralDIT attention projections: cross-attn to_k/to_v are Linear(1024, 4096)
-    # while self-attn is Linear(4096, 4096). Full attention TP + head-split was
-    # crashing at runtime (matmul expected 4096, got 1024 on cross-attn path).
-    # Shard MLP only for GeneralDIT until cross/self attn TP is specialized.
-    "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
 ]
+
+# GeneralDIT-only exclusions. MUST NOT live in EXCLUDED_LAYER_NAMES:
+# QwenImage also uses `attn.to_out.0` (ModuleList Linear), and globally
+# excluding that suffix leaves Qwen QKV head-split while the out-proj stays
+# full-width → matmul (…x1536 @ 3072x3072). CosmOS wraps projections in
+# Sequential so names are `attn.to_{q,k,v,out}.0`; Qwen's QKV are bare
+# `attn.to_q` (no `.0`) and must remain sharded.
+GENERALDIT_EXCLUDED_LAYER_NAMES = (
+    "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
+)
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
@@ -222,6 +227,12 @@ TP_UNSUPPORTED = {
     "CausalWanModel",
     # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
     "HiDreamO1Transformer",
+    # GeneralDIT (Cosmos 1.0): FA/CA share the Attention class but CA K/V are
+    # Linear(1024→4096) while FA is Linear(4096→4096). Even MLP-only TP still
+    # crashes in cal_qkv (expected in=4096, got 1024) — root cause is NOT the
+    # attention ParallelLinear path (fails before any MLP runs). Needs a
+    # dedicated Cosmos TP strategy + conditioning/layout audit.
+    "GeneralDIT",
 }
 
 
@@ -256,13 +267,19 @@ def parallelize_model(model):
     logging.info(f"Applying Tensor Parallelism to {model.__class__.__name__} with targets: {targets}")
     mesh = get_mesh()
 
+    # GeneralDIT attention exclusions are class-scoped — see GENERALDIT_EXCLUDED_LAYER_NAMES.
+    is_general_dit = any(cls.__name__ == "GeneralDIT" for cls in type(model).__mro__)
+    excluded_names = EXCLUDED_LAYER_NAMES
+    if is_general_dit:
+        excluded_names = tuple(EXCLUDED_LAYER_NAMES) + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
+
     count = 0
     skipped_dims = 0
     for name, module in model.named_modules():
         if any(name.startswith(prefix) for prefix in targets):
             if _is_linear_layer(module):
                 # Skip layers that can't be simply sharded (fused layers, modulation layers)
-                if any(name.endswith(excl) for excl in EXCLUDED_LAYER_NAMES):
+                if any(name.endswith(excl) for excl in excluded_names):
                     continue
 
                 # Determine mode
