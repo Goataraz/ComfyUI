@@ -60,6 +60,11 @@ class ParallelLinear(nn.Module):
 
         self.is_tp_parallelized = True
 
+        # LoRA / weight-patch hooks (populated by the model patcher, e.g.
+        # LowVramPatch under DynamicVRAM). Empty by default.
+        self.weight_function = []
+        self.bias_function = []
+
         if bias:
             self.bias = nn.Parameter(torch.empty(
                 self.local_out_features,
@@ -75,15 +80,22 @@ class ParallelLinear(nn.Module):
         # Cast weight to match input dtype for manual-cast models (e.g., fp8 weights with fp16 compute)
         # This handles the case where ComfyUI's manual casting system sets the compute dtype
         # but TP weights retain their storage dtype (fp8_e4m3fn, etc.)
-        w = self.weight.to(x.dtype)
-        b = self.bias.to(x.dtype) if self.bias is not None else None
-
         # Apply weight_function (LoRA patches via LowVramPatch) if present.
         # The standard comfy ops check len(weight_function) > 0 and redirect
         # to forward_comfy_cast_weights — ParallelLinear must do the same
         # or LoRA patches registered as LowVramPatch would be silently ignored.
         weight_function = getattr(self, 'weight_function', [])
         bias_function = getattr(self, 'bias_function', [])
+
+        # When weight/bias functions are present, force a fresh copy on cast so
+        # a same-dtype .to() returns the real Parameter storage and the patch
+        # mutates a throwaway tensor rather than accumulating into it every forward.
+        w = self.weight.to(dtype=x.dtype, copy=True) if len(weight_function) > 0 else self.weight.to(x.dtype)
+        if self.bias is not None:
+            b = self.bias.to(dtype=x.dtype, copy=True) if len(bias_function) > 0 else self.bias.to(x.dtype)
+        else:
+            b = None
+
         if len(weight_function) > 0:
             for f in weight_function:
                 w = f(w)

@@ -572,3 +572,66 @@ class TestQwenImageHeadSplit:
         assert attn.heads == 20, (
             f"HiDream heads should NOT be overridden, got {attn.heads}"
         )
+
+
+# ---------------------------------------------------------------------------
+# ParallelLinear weight_function (LoRA) application tests
+# ---------------------------------------------------------------------------
+
+class TestParallelLinearWeightFunction:
+    """Verify that weight_function patches (e.g. LowVramPatch/LoRA) are applied
+    on forward WITHOUT mutating the underlying weight Parameter. A same-dtype
+    ``.to()`` returns the real storage, so patches must operate on a fresh copy
+    or LoRA would accumulate into the weight on every forward pass."""
+
+    def _make_layer(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        # colwise: out_features must be divisible by world_size (2)
+        layer = pl_module.ParallelLinear(64, 64, bias=True, mode="colwise")
+        # weight/bias are allocated empty on CPU — give them deterministic data
+        layer.weight.data = torch.ones((layer.local_out_features, layer.local_in_features),
+                                       dtype=torch.float32)
+        layer.bias.data = torch.zeros(layer.local_out_features, dtype=torch.float32)
+        return layer
+
+    def test_default_lists_present(self, monkeypatch):
+        layer = self._make_layer(monkeypatch)
+        assert layer.weight_function == []
+        assert layer.bias_function == []
+
+    def test_weight_not_mutated_across_forwards(self, monkeypatch):
+        import torch
+        layer = self._make_layer(monkeypatch)
+
+        # A dummy patch that adds 1.0 to the weight it receives (mimics a LoRA
+        # applied via LowVramPatch — same-dtype cast returns the live storage).
+        layer.weight_function = [lambda w: w + 1.0]
+
+        original = layer.weight.data.clone()
+        x = torch.randn(3, 64, dtype=torch.float32)
+
+        out1 = layer(x)
+        assert torch.equal(layer.weight.data, original), (
+            "weight Parameter mutated after first forward — LoRA leaked into storage"
+        )
+
+        out2 = layer(x)
+        assert torch.equal(layer.weight.data, original), (
+            "weight Parameter mutated after second forward — LoRA accumulated into storage"
+        )
+
+        # The patch effect must still be reflected in the output, and be stable
+        # across forwards (no accumulation).
+        assert torch.allclose(out1, out2), "forward output drifted across passes"
+
+        # Sanity: with weight of ones + patch (+1) => effective weight of 2s.
+        expected = torch.matmul(x, (layer.weight.data + 1.0).t()) + layer.bias.data
+        assert torch.allclose(out1, expected), "weight_function was not applied on forward"

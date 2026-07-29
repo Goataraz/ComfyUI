@@ -1916,6 +1916,21 @@ class ModelPatcherDynamic(ModelPatcher):
                         if is_tp_mod:
                             # TP shards stay on their assigned device; only cast dtype
                             casted_weight = weight.to(dtype=model_dtype)
+                            # Wire LoRA patches into ParallelLinear.forward via its
+                            # weight_function / bias_function lists. ParallelLinear has
+                            # no comfy_cast_weights path, so without this LoRAs targeting
+                            # sharded layers are silently dropped under DynamicVRAM.
+                            func_attr = param + "_function"
+                            if not hasattr(m, func_attr):
+                                setattr(m, func_attr, [])
+                            # Rebuild fresh each load so patches don't stack across reloads.
+                            func_list = []
+                            if key in self.patches:
+                                func_list.append(LowVramPatch(key, self.patches))
+                                num_patches += 1
+                            if key in self.weight_wrapper_patches:
+                                func_list.extend(self.weight_wrapper_patches[key])
+                            setattr(m, func_attr, func_list)
                         else:
                             casted_weight = weight.to(dtype=model_dtype, device=device_to)
                         comfy.utils.set_attr_param(self.model, key, casted_weight)
