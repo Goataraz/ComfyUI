@@ -115,6 +115,15 @@ GENERALDIT_EXCLUDED_LAYER_NAMES = (
     "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
 )
 
+# QwenImage dual-stream attention: head-split TP currently yields pure-black
+# e2e outputs (mean=0) despite correct shard shapes. Park attention on the
+# replicated path; keep img/txt MLP under TP until head-split+RoPE/Sage is fixed.
+QWENIMAGE_EXCLUDED_LAYER_NAMES = (
+    "attn.to_q", "attn.to_k", "attn.to_v",
+    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj",
+    "attn.to_out.0", "attn.to_add_out",
+)
+
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
 # channels — i.e., a subset of heads with full per-head dim. The Attention
@@ -124,12 +133,12 @@ GENERALDIT_EXCLUDED_LAYER_NAMES = (
 #
 # Norm policy:
 # - Per-head norms (normalized_shape == dim_head, applied AFTER rearrange):
-#   leave replicated. Covered by QwenImage / Cosmos GeneralDIT.
+#   leave replicated. Covered by MiniTrainDIT.
 # - Full-dim QK norms (normalized_shape == heads*dim_head, applied BEFORE
 #   rearrange): must be sliced to local_heads*dim_head. Covered by Wan and
 #   HiDream Image. See `_slice_full_dim_qk_norms`.
+# QwenImage: removed while attention is MLP-only (see QWENIMAGE_EXCLUDED).
 TP_HEAD_SPLIT_MODELS = {
-    "QwenImageTransformer2DModel",
     "MiniTrainDIT",
     # GeneralDIT: attn excluded from TP (MLP-only); head-split not needed.
     "WanModel",
@@ -270,11 +279,14 @@ def parallelize_model(model):
     logging.info(f"Applying Tensor Parallelism to {model.__class__.__name__} with targets: {targets}")
     mesh = get_mesh()
 
-    # GeneralDIT attention exclusions are class-scoped — see GENERALDIT_EXCLUDED_LAYER_NAMES.
-    is_general_dit = any(cls.__name__ == "GeneralDIT" for cls in type(model).__mro__)
-    excluded_names = EXCLUDED_LAYER_NAMES
-    if is_general_dit:
-        excluded_names = tuple(EXCLUDED_LAYER_NAMES) + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
+    # Class-scoped attention exclusions (must not live in the global list —
+    # suffix collisions across architectures, e.g. Qwen vs CosmOS to_out.0).
+    mro_names = {cls.__name__ for cls in type(model).__mro__}
+    excluded_names = tuple(EXCLUDED_LAYER_NAMES)
+    if "GeneralDIT" in mro_names:
+        excluded_names = excluded_names + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
+    if "QwenImageTransformer2DModel" in mro_names:
+        excluded_names = excluded_names + tuple(QWENIMAGE_EXCLUDED_LAYER_NAMES)
 
     count = 0
     skipped_dims = 0

@@ -285,13 +285,9 @@ class TestShardingMode:
                 if isinstance(module, ParallelLinear)}
 
     def test_qwen_image_sharding_modes(self, monkeypatch):
-        """QwenImageTransformerBlock has the following Linear layers under
-        `transformer_blocks.*`:
+        """QwenImage MLP-only TP (attention parked — head-split yields black e2e):
 
-          attn.to_q / attn.to_k / attn.to_v       → colwise
-          attn.add_q_proj / attn.add_k_proj / attn.add_v_proj → colwise
-          attn.to_out.0                            → rowwise
-          attn.to_add_out                          → rowwise
+          attn.*                                   → excluded
           img_mlp.net.0.proj (GELU inner Linear)   → colwise (up-projection)
           img_mlp.net.2 (MLP down-projection)     → rowwise
 
@@ -318,7 +314,7 @@ class TestShardingMode:
                 # Modulation: nn.Sequential(SiLU, Linear) — the Linear is at .1
                 self.img_mod = nn.Sequential(nn.SiLU(), L(64, 384))
                 self.txt_mod = nn.Sequential(nn.SiLU(), L(64, 384))
-                # Attention projections
+                # Attention projections (excluded under current Qwen policy)
                 self.attn = nn.Module()
                 self.attn.to_q = L(64, 64)
                 self.attn.to_k = L(64, 64)
@@ -352,14 +348,6 @@ class TestShardingMode:
 
         modes = self._collect_modes(model)
         expected = {
-            "transformer_blocks.0.attn.to_q": "colwise",
-            "transformer_blocks.0.attn.to_k": "colwise",
-            "transformer_blocks.0.attn.to_v": "colwise",
-            "transformer_blocks.0.attn.add_q_proj": "colwise",
-            "transformer_blocks.0.attn.add_k_proj": "colwise",
-            "transformer_blocks.0.attn.add_v_proj": "colwise",
-            "transformer_blocks.0.attn.to_out.0": "rowwise",
-            "transformer_blocks.0.attn.to_add_out": "rowwise",
             "transformer_blocks.0.img_mlp.net.0.proj": "colwise",
             "transformer_blocks.0.img_mlp.net.2": "rowwise",
         }
@@ -369,9 +357,14 @@ class TestShardingMode:
                 f"{layer_name}: expected {expected_mode}, got {modes[layer_name]}"
             )
 
-        # Modulation layers must be excluded
-        for excluded in ("transformer_blocks.0.img_mod.1",
-                         "transformer_blocks.0.txt_mod.1"):
+        # Attention + modulation must stay unsharded
+        for excluded in (
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_out.0",
+            "transformer_blocks.0.attn.to_add_out",
+            "transformer_blocks.0.img_mod.1",
+            "transformer_blocks.0.txt_mod.1",
+        ):
             assert excluded not in modes, f"{excluded} should be excluded"
 
     def test_llama2_sharding_modes(self, monkeypatch):
@@ -437,12 +430,8 @@ class TestShardingMode:
 
 
 class TestQwenImageHeadSplit:
-    """For QwenImage (and similar head-split models), the colwise shard of
-    to_q/to_k/to_v distributes a contiguous slice of heads across ranks,
-    so each rank holds `(heads/world_size) * dim_head` channels with full
-    per-head dim_head. The Attention module's `self.heads` is divided by
-    world_size; the per-head norm weights and rotary embeddings are NOT
-    sharded (they replicate on every rank).
+    """QwenImage attention TP/head-split is parked (black e2e). These tests
+    lock the MLP-only policy: heads stay full, attn linears unsharded.
     """
 
     def _build_synthetic_model(self, head_dim, n_heads, parent_class_name):
@@ -464,6 +453,14 @@ class TestQwenImageHeadSplit:
                 super().__init__()
                 dim = n_heads * head_dim
                 self.attn = _Attn(dim)
+                # MLP so parallelize_model still returns True under MLP-only policy
+                self.img_mlp = nn.Module()
+                self.img_mlp.net = nn.ModuleList()
+                gelu = nn.Sequential()
+                gelu.proj = nn.Linear(dim, dim * 4, bias=True)
+                self.img_mlp.net.append(gelu)
+                self.img_mlp.net.append(nn.Dropout(0.0))
+                self.img_mlp.net.append(nn.Linear(dim * 4, dim, bias=True))
 
         class _TransformerBlocks(nn.Module):
             def __init__(self):
@@ -477,9 +474,10 @@ class TestQwenImageHeadSplit:
             return Model()
         raise ValueError(f"Unknown parent class name: {parent_class_name}")
 
-    def test_heads_overridden_to_world_size_divisor(self, monkeypatch):
+    def test_heads_unchanged_under_mlp_only(self, monkeypatch):
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
 
         class FakeMesh:
             world_size = 2
@@ -491,19 +489,14 @@ class TestQwenImageHeadSplit:
         model = self._build_synthetic_model(
             head_dim=128, n_heads=24, parent_class_name="QwenImageTransformer2DModel"
         )
-        attn_before = model.transformer_blocks[0].attn
-        assert attn_before.heads == 24
-        assert attn_before.dim_head == 128
-
-        patcher.parallelize_model(model)
+        assert patcher.parallelize_model(model) is True
 
         attn_after = model.transformer_blocks[0].attn
-        assert attn_after.heads == 12, (
-            f"expected heads=12 after TP (world_size=2), got {attn_after.heads}"
+        assert attn_after.heads == 24, (
+            f"expected heads=24 (no head-split under MLP-only), got {attn_after.heads}"
         )
-        assert attn_after.dim_head == 128, (
-            f"expected dim_head=128 (unchanged), got {attn_after.dim_head}"
-        )
+        assert not isinstance(attn_after.to_q, ParallelLinear)
+        assert "QwenImageTransformer2DModel" not in patcher.TP_HEAD_SPLIT_MODELS
 
     def test_per_head_norms_not_flagged_or_sliced(self, monkeypatch):
         from comfy.distributed import patcher
@@ -523,7 +516,7 @@ class TestQwenImageHeadSplit:
 
         flagged = {n for n, m in model.named_modules() if getattr(m, "_tp_norm_shard", None) is not None}
         assert flagged == set(), (
-            f"Expected no _tp_norm_shard flags under head-split, got: {flagged}"
+            f"Expected no _tp_norm_shard flags under MLP-only, got: {flagged}"
         )
 
         attn = model.transformer_blocks[0].attn
