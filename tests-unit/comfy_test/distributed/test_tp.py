@@ -174,9 +174,11 @@ class TestGetTPTargets:
         assert get_tp_targets(SD3()) == ["blocks"]
 
     def test_cosmos_general_dit(self):
-        from comfy.distributed.patcher import get_tp_targets
+        from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         CosmosT2V = self._make_model_class("GeneralDIT")
-        assert get_tp_targets(CosmosT2V()) == ["blocks"]
+        # Parked in TP_UNSUPPORTED until FA/CA cal_qkv layout is solved.
+        assert "GeneralDIT" in TP_UNSUPPORTED
+        assert get_tp_targets(CosmosT2V()) == []
 
     def test_cosmos_mini_train_dit(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -198,9 +200,11 @@ class TestGetTPTargets:
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
         """Subclass of a matched class should inherit the TP targets."""
-        GeneralDIT = self._make_model_class("GeneralDIT")
-        Anima = self._make_model_class("Anima", (GeneralDIT,))
-        assert get_tp_targets(Anima()) == ["blocks"]
+        # Use WanModel — GeneralDIT is TP_UNSUPPORTED at the concrete class
+        # name only; MRO inheritance is covered by VaceWanModel below / Wan tests.
+        Wan = self._make_model_class("WanModel")
+        Vace = self._make_model_class("VaceWanModel", (Wan,))
+        assert get_tp_targets(Vace()) == ["blocks"]
 
     def test_unknown_model_returns_empty(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -210,12 +214,12 @@ class TestGetTPTargets:
     def test_mro_priority_first_match(self):
         from comfy.distributed.patcher import get_tp_targets
         """When a class inherits from multiple TP targets, the first MRO match wins."""
-        GeneralDIT = self._make_model_class("GeneralDIT")
-        HiDreamO1 = self._make_model_class("HiDreamO1Transformer")
+        Wan = self._make_model_class("WanModel")
+        Flux = self._make_model_class("Flux")
         # Create a class that inherits from both — first in MRO wins
-        Hybrid = self._make_model_class("HybridModel", (GeneralDIT, HiDreamO1))
+        Hybrid = self._make_model_class("HybridModel", (Wan, Flux))
         result = get_tp_targets(Hybrid())
-        # GeneralDIT appears first in MRO after HybridModel and object
+        # WanModel appears first in MRO after HybridModel
         assert result == ["blocks"]
 
 

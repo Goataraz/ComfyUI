@@ -239,9 +239,12 @@ TP_UNSUPPORTED = {
 def get_tp_targets(model):
     """Determines TP target prefixes by walking the model's MRO for an exact class name match."""
     concrete = type(model).__name__
-    if concrete in TP_UNSUPPORTED:
-        logging.info(f"[TP] {concrete} is explicitly unsupported — skipping TP")
-        return []
+    # Deny if the concrete class OR any MRO parent is explicitly unsupported
+    # (e.g. Anima(GeneralDIT) must not inherit GeneralDIT's allowlist entry).
+    for cls in type(model).__mro__:
+        if cls.__name__ in TP_UNSUPPORTED:
+            logging.info(f"[TP] {concrete} is explicitly unsupported via {cls.__name__} — skipping TP")
+            return []
     for cls in type(model).__mro__:
         if cls.__name__ in TP_TARGETS:
             return TP_TARGETS[cls.__name__]
