@@ -664,7 +664,8 @@ class TestCosmosGeneralDITTP:
         assert get_tp_targets(GeneralDIT()) == ["blocks"]
         assert "adaLN_modulation.1" in EXCLUDED_LAYER_NAMES
         assert "adaLN_modulation.2" in EXCLUDED_LAYER_NAMES
-        assert "GeneralDIT" in TP_HEAD_SPLIT_MODELS
+        assert "attn.to_q.0" in EXCLUDED_LAYER_NAMES
+        assert "GeneralDIT" not in TP_HEAD_SPLIT_MODELS
 
     def test_sharding_modes_and_head_split(self, monkeypatch):
         import torch.nn as nn
@@ -711,15 +712,15 @@ class TestCosmosGeneralDITTP:
         assert patcher.parallelize_model(model) is True
 
         modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
-        assert modes["blocks.0.attn.to_q.0"] == "colwise"
-        assert modes["blocks.0.attn.to_out.0"] == "rowwise"
+        # Attention projections excluded for GeneralDIT (MLP-only TP)
+        assert "blocks.0.attn.to_q.0" not in modes
+        assert "blocks.0.attn.to_out.0" not in modes
         assert modes["blocks.0.layer1"] == "colwise"
         assert modes["blocks.0.layer2"] == "rowwise"
         assert "blocks.0.adaLN_modulation.1" not in modes
 
         attn = model.blocks[0].attn
-        assert attn.heads == 8
-        # Per-head norm inside Sequential stays full dim_head
+        assert attn.heads == 16  # unchanged — no head-split for GeneralDIT
         assert tuple(attn.to_q[1].weight.shape) == (64,)
 
 

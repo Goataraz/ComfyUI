@@ -103,6 +103,11 @@ EXCLUDED_LAYER_NAMES = [
     # Cosmos GeneralDIT + HiDream Image use capital LN: adaLN_modulation
     # (chunked 3-way / 6-way / 12-way on full dim). Same suffix covers both.
     "adaLN_modulation.1", "adaLN_modulation.2",
+    # GeneralDIT attention projections: cross-attn to_k/to_v are Linear(1024, 4096)
+    # while self-attn is Linear(4096, 4096). Full attention TP + head-split was
+    # crashing at runtime (matmul expected 4096, got 1024 on cross-attn path).
+    # Shard MLP only for GeneralDIT until cross/self attn TP is specialized.
+    "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
 ]
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -121,7 +126,7 @@ EXCLUDED_LAYER_NAMES = [
 TP_HEAD_SPLIT_MODELS = {
     "QwenImageTransformer2DModel",
     "MiniTrainDIT",
-    "GeneralDIT",
+    # GeneralDIT: attn excluded from TP (MLP-only); head-split not needed.
     "WanModel",
     "HiDreamImageTransformer2DModel",
 }
