@@ -176,9 +176,8 @@ class TestGetTPTargets:
     def test_cosmos_general_dit(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         CosmosT2V = self._make_model_class("GeneralDIT")
-        # Parked in TP_UNSUPPORTED until FA/CA cal_qkv layout is solved.
-        assert "GeneralDIT" in TP_UNSUPPORTED
-        assert get_tp_targets(CosmosT2V()) == []
+        assert "GeneralDIT" not in TP_UNSUPPORTED
+        assert get_tp_targets(CosmosT2V()) == ["blocks"]
 
     def test_cosmos_mini_train_dit(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -200,8 +199,7 @@ class TestGetTPTargets:
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
         """Subclass of a matched class should inherit the TP targets."""
-        # Use WanModel — GeneralDIT is TP_UNSUPPORTED at the concrete class
-        # name only; MRO inheritance is covered by VaceWanModel below / Wan tests.
+        # Use WanModel — MRO inheritance also covered by VaceWanModel / Wan tests.
         Wan = self._make_model_class("WanModel")
         Vace = self._make_model_class("VaceWanModel", (Wan,))
         assert get_tp_targets(Vace()) == ["blocks"]
