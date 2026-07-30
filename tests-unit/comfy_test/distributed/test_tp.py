@@ -171,7 +171,7 @@ class TestGetTPTargets:
     def test_sd3_matches_openai_wrapper(self):
         from comfy.distributed.patcher import get_tp_targets
         SD3 = self._make_model_class("OpenAISignatureMMDITWrapper")
-        assert get_tp_targets(SD3()) == ["blocks"]
+        assert get_tp_targets(SD3()) == ["joint_blocks"]
 
     def test_cosmos_general_dit(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
@@ -285,9 +285,12 @@ class TestShardingMode:
                 if isinstance(module, ParallelLinear)}
 
     def test_qwen_image_sharding_modes(self, monkeypatch):
-        """QwenImage MLP-only TP (attention parked — head-split yields black e2e):
+        """QwenImageTransformerBlock under `transformer_blocks.*`:
 
-          attn.*                                   → excluded
+          attn.to_q / attn.to_k / attn.to_v       → colwise
+          attn.add_q_proj / attn.add_k_proj / attn.add_v_proj → colwise
+          attn.to_out.0                            → rowwise
+          attn.to_add_out                          → rowwise
           img_mlp.net.0.proj (GELU inner Linear)   → colwise (up-projection)
           img_mlp.net.2 (MLP down-projection)     → rowwise
 
@@ -304,17 +307,14 @@ class TestShardingMode:
             world_size = 2
             rank = 0
             current_device = "cpu"
-        # Patch both modules — patcher and ParallelLinear both call get_mesh()
         monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
         monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
 
         class QwenBlock(nn.Module):
             def __init__(self):
                 super().__init__()
-                # Modulation: nn.Sequential(SiLU, Linear) — the Linear is at .1
                 self.img_mod = nn.Sequential(nn.SiLU(), L(64, 384))
                 self.txt_mod = nn.Sequential(nn.SiLU(), L(64, 384))
-                # Attention projections (excluded under current Qwen policy)
                 self.attn = nn.Module()
                 self.attn.to_q = L(64, 64)
                 self.attn.to_k = L(64, 64)
@@ -324,21 +324,19 @@ class TestShardingMode:
                 self.attn.add_v_proj = L(64, 64)
                 self.attn.to_out = nn.ModuleList([L(64, 64), nn.Identity()])
                 self.attn.to_add_out = L(64, 64)
-                # MLP: ModuleList of [GELU-with-proj, Dropout, Linear]
                 self.img_mlp = nn.Module()
                 self.img_mlp.net = nn.ModuleList()
                 gelu = nn.Sequential()
-                gelu.proj = L(64, 256)  # up-projection
+                gelu.proj = L(64, 256)
                 self.img_mlp.net.append(gelu)
                 self.img_mlp.net.append(nn.Dropout(0.0))
-                self.img_mlp.net.append(L(256, 64))  # down-projection
+                self.img_mlp.net.append(L(256, 64))
 
         class QwenModel(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.transformer_blocks = nn.ModuleList([QwenBlock()])
 
-        # Tag the model class so the MRO match works
         class QwenImageTransformer2DModel(QwenModel):
             pass
 
@@ -348,6 +346,14 @@ class TestShardingMode:
 
         modes = self._collect_modes(model)
         expected = {
+            "transformer_blocks.0.attn.to_q": "colwise",
+            "transformer_blocks.0.attn.to_k": "colwise",
+            "transformer_blocks.0.attn.to_v": "colwise",
+            "transformer_blocks.0.attn.add_q_proj": "colwise",
+            "transformer_blocks.0.attn.add_k_proj": "colwise",
+            "transformer_blocks.0.attn.add_v_proj": "colwise",
+            "transformer_blocks.0.attn.to_out.0": "rowwise",
+            "transformer_blocks.0.attn.to_add_out": "rowwise",
             "transformer_blocks.0.img_mlp.net.0.proj": "colwise",
             "transformer_blocks.0.img_mlp.net.2": "rowwise",
         }
@@ -357,14 +363,8 @@ class TestShardingMode:
                 f"{layer_name}: expected {expected_mode}, got {modes[layer_name]}"
             )
 
-        # Attention + modulation must stay unsharded
-        for excluded in (
-            "transformer_blocks.0.attn.to_q",
-            "transformer_blocks.0.attn.to_out.0",
-            "transformer_blocks.0.attn.to_add_out",
-            "transformer_blocks.0.img_mod.1",
-            "transformer_blocks.0.txt_mod.1",
-        ):
+        for excluded in ("transformer_blocks.0.img_mod.1",
+                         "transformer_blocks.0.txt_mod.1"):
             assert excluded not in modes, f"{excluded} should be excluded"
 
     def test_llama2_sharding_modes(self, monkeypatch):
@@ -430,8 +430,8 @@ class TestShardingMode:
 
 
 class TestQwenImageHeadSplit:
-    """QwenImage attention TP/head-split is parked (black e2e). These tests
-    lock the MLP-only policy: heads stay full, attn linears unsharded.
+    """QwenImage head-split: colwise QKV distributes heads; self.heads /= world_size.
+    SageAttention is disabled under TP in qwen_image/model.py (black-image fix).
     """
 
     def _build_synthetic_model(self, head_dim, n_heads, parent_class_name):
@@ -453,14 +453,6 @@ class TestQwenImageHeadSplit:
                 super().__init__()
                 dim = n_heads * head_dim
                 self.attn = _Attn(dim)
-                # MLP so parallelize_model still returns True under MLP-only policy
-                self.img_mlp = nn.Module()
-                self.img_mlp.net = nn.ModuleList()
-                gelu = nn.Sequential()
-                gelu.proj = nn.Linear(dim, dim * 4, bias=True)
-                self.img_mlp.net.append(gelu)
-                self.img_mlp.net.append(nn.Dropout(0.0))
-                self.img_mlp.net.append(nn.Linear(dim * 4, dim, bias=True))
 
         class _TransformerBlocks(nn.Module):
             def __init__(self):
@@ -474,10 +466,9 @@ class TestQwenImageHeadSplit:
             return Model()
         raise ValueError(f"Unknown parent class name: {parent_class_name}")
 
-    def test_heads_unchanged_under_mlp_only(self, monkeypatch):
+    def test_heads_overridden_to_world_size_divisor(self, monkeypatch):
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
-        from comfy.distributed.parallel_linear import ParallelLinear
 
         class FakeMesh:
             world_size = 2
@@ -489,14 +480,19 @@ class TestQwenImageHeadSplit:
         model = self._build_synthetic_model(
             head_dim=128, n_heads=24, parent_class_name="QwenImageTransformer2DModel"
         )
-        assert patcher.parallelize_model(model) is True
+        attn_before = model.transformer_blocks[0].attn
+        assert attn_before.heads == 24
+        assert attn_before.dim_head == 128
+
+        patcher.parallelize_model(model)
 
         attn_after = model.transformer_blocks[0].attn
-        assert attn_after.heads == 24, (
-            f"expected heads=24 (no head-split under MLP-only), got {attn_after.heads}"
+        assert attn_after.heads == 12, (
+            f"expected heads=12 after TP (world_size=2), got {attn_after.heads}"
         )
-        assert not isinstance(attn_after.to_q, ParallelLinear)
-        assert "QwenImageTransformer2DModel" not in patcher.TP_HEAD_SPLIT_MODELS
+        assert attn_after.dim_head == 128, (
+            f"expected dim_head=128 (unchanged), got {attn_after.dim_head}"
+        )
 
     def test_per_head_norms_not_flagged_or_sliced(self, monkeypatch):
         from comfy.distributed import patcher
@@ -516,7 +512,7 @@ class TestQwenImageHeadSplit:
 
         flagged = {n for n, m in model.named_modules() if getattr(m, "_tp_norm_shard", None) is not None}
         assert flagged == set(), (
-            f"Expected no _tp_norm_shard flags under MLP-only, got: {flagged}"
+            f"Expected no _tp_norm_shard flags under head-split, got: {flagged}"
         )
 
         attn = model.transformer_blocks[0].attn
@@ -648,6 +644,72 @@ class TestParallelLinearWeightFunction:
 
 
 # ---------------------------------------------------------------------------
+class TestSD3JointBlocksTP:
+    """SD3 MMDiT uses joint_blocks + fused attn.qkv — MLP-only TP."""
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES
+        SD3 = type("OpenAISignatureMMDITWrapper", (), {})
+        assert get_tp_targets(SD3()) == ["joint_blocks"]
+        assert "attn.qkv" in EXCLUDED_LAYER_NAMES
+        assert "attn.proj" in EXCLUDED_LAYER_NAMES
+
+    def test_mlp_only_sharding(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        def L(i, o):
+            return nn.Linear(i, o, bias=True)
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 24
+                self.head_dim = 64
+                dim = 24 * 64
+                self.qkv = L(dim, dim * 3)
+                self.proj = L(dim, dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attn()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = L(1536, 6144)
+                self.mlp.fc2 = L(6144, 1536)
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), L(1536, 6 * 1536))
+
+        class JointBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.context_block = Block()
+                self.x_block = Block()
+
+        class OpenAISignatureMMDITWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.joint_blocks = nn.ModuleList([JointBlock()])
+
+        model = OpenAISignatureMMDITWrapper()
+        assert patcher.parallelize_model(model) is True
+        modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
+        assert "joint_blocks.0.x_block.attn.qkv" not in modes
+        assert "joint_blocks.0.x_block.attn.proj" not in modes
+        assert modes["joint_blocks.0.x_block.mlp.fc1"] == "colwise"
+        assert modes["joint_blocks.0.x_block.mlp.fc2"] == "rowwise"
+        assert modes["joint_blocks.0.context_block.mlp.fc1"] == "colwise"
+        assert "joint_blocks.0.x_block.adaLN_modulation.1" not in modes
+
+
 # Cosmos GeneralDIT / Wan / expanded head-split coverage
 # ---------------------------------------------------------------------------
 

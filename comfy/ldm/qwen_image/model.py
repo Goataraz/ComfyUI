@@ -189,9 +189,21 @@ class Attention(nn.Module):
         joint_query = apply_rope1(joint_query, image_rotary_emb)
         joint_key = apply_rope1(joint_key, image_rotary_emb)
 
-        joint_hidden_states = optimized_attention_masked(joint_query, joint_key, joint_value, self.heads,
-                                                         attn_mask, transformer_options=transformer_options,
-                                                         skip_reshape=True)
+        # Under tensor-parallel head-split, SageAttention + Qwen's
+        # skip_reshape=True HND layout has produced pure-black outputs.
+        # Force PyTorch SDPA when TP is active; Sage stays on for single-GPU.
+        attn_kwargs = {"transformer_options": transformer_options, "skip_reshape": True}
+        try:
+            from comfy.distributed.utils import is_tp_active
+            if is_tp_active():
+                attn_kwargs["low_precision_attention"] = False
+        except Exception:
+            pass
+
+        joint_hidden_states = optimized_attention_masked(
+            joint_query, joint_key, joint_value, self.heads,
+            attn_mask, **attn_kwargs,
+        )
 
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]
         img_attn_output = joint_hidden_states[:, seq_txt:, :]

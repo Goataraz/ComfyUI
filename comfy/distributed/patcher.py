@@ -46,7 +46,7 @@ def _is_linear_layer(module):
 # inherit the parent entry.
 TP_TARGETS = {
     "Flux": ["double_blocks", "single_blocks"],
-    "OpenAISignatureMMDITWrapper": ["blocks"],       # SD3
+    "OpenAISignatureMMDITWrapper": ["joint_blocks"],  # SD3 MMDiT (not "blocks")
     "GeneralDIT": ["blocks"],                          # Cosmos T2V/I2V
     "MiniTrainDIT": ["blocks"],                       # Cosmos Predict2 / Anima
     "HiDreamImageTransformer2DModel": ["double_stream_blocks", "single_stream_blocks"],
@@ -68,12 +68,12 @@ TP_TARGETS = {
 # - ffn.2 / block.layer2: Wan / Cosmos GeneralDIT MLP down-projections
 ROWWISE_KEYWORDS = [
     "to_out", "to_add_out", "proj", "down", "w2", "mlp.2", "to_out_t",
-    "o_proj", "down_proj", "mlp.layer2", "ffn.2",
+    "o_proj", "down_proj", "mlp.layer2", "ffn.2", "fc2",
 ]
 COLWISE_KEYWORDS = [
     "to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t",
     "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj",
-    "mlp.layer1",
+    "mlp.layer1", "fc1",
 ]
 
 # Layer names that must NOT be sharded. These are excluded because:
@@ -87,6 +87,11 @@ EXCLUDED_LAYER_NAMES = [
     "modulation.lin", "img_mod.lin", "txt_mod.lin",
     "img_attn.qkv", "txt_attn.qkv",
     "img_attn.proj", "txt_attn.proj",
+    # SD3 MMDiT fused QKV is packed as [Q|K|V] along out_features. Naive
+    # colwise sharding cuts across the Q/K/V packs instead of heads — exclude
+    # and leave attention replicated; MLP (fc1/fc2) still shards.
+    "attn.qkv", "attn.proj",
+    "attn2.qkv", "attn2.proj",
     # QwenImage uses nn.Sequential(SiLU, Linear) for modulation; the Linear is
     # at index 1 (not a ".lin" suffix). Output is 6*dim, chunked 2-way for
     # (shift, scale, gate).
@@ -115,15 +120,6 @@ GENERALDIT_EXCLUDED_LAYER_NAMES = (
     "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
 )
 
-# QwenImage dual-stream attention: head-split TP currently yields pure-black
-# e2e outputs (mean=0) despite correct shard shapes. Park attention on the
-# replicated path; keep img/txt MLP under TP until head-split+RoPE/Sage is fixed.
-QWENIMAGE_EXCLUDED_LAYER_NAMES = (
-    "attn.to_q", "attn.to_k", "attn.to_v",
-    "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj",
-    "attn.to_out.0", "attn.to_add_out",
-)
-
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
 # channels — i.e., a subset of heads with full per-head dim. The Attention
@@ -133,12 +129,12 @@ QWENIMAGE_EXCLUDED_LAYER_NAMES = (
 #
 # Norm policy:
 # - Per-head norms (normalized_shape == dim_head, applied AFTER rearrange):
-#   leave replicated. Covered by MiniTrainDIT.
+#   leave replicated. Covered by QwenImage / MiniTrainDIT.
 # - Full-dim QK norms (normalized_shape == heads*dim_head, applied BEFORE
 #   rearrange): must be sliced to local_heads*dim_head. Covered by Wan and
 #   HiDream Image. See `_slice_full_dim_qk_norms`.
-# QwenImage: removed while attention is MLP-only (see QWENIMAGE_EXCLUDED).
 TP_HEAD_SPLIT_MODELS = {
+    "QwenImageTransformer2DModel",
     "MiniTrainDIT",
     # GeneralDIT: attn excluded from TP (MLP-only); head-split not needed.
     "WanModel",
@@ -285,8 +281,6 @@ def parallelize_model(model):
     excluded_names = tuple(EXCLUDED_LAYER_NAMES)
     if "GeneralDIT" in mro_names:
         excluded_names = excluded_names + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
-    if "QwenImageTransformer2DModel" in mro_names:
-        excluded_names = excluded_names + tuple(QWENIMAGE_EXCLUDED_LAYER_NAMES)
 
     count = 0
     skipped_dims = 0
