@@ -445,7 +445,7 @@ def load_tp_shards(model, sd, prefix=""):
         if isinstance(module, ParallelLinear):
             weight_key = prefix + name + ".weight"
             if weight_key in sd:
-                full_weight = sd[weight_key]
+                full_weight = sd.pop(weight_key)
                 module.load_shard(full_weight)
                 loaded += 1
             else:
@@ -455,7 +455,7 @@ def load_tp_shards(model, sd, prefix=""):
             if module.bias is not None:
                 bias_key = prefix + name + ".bias"
                 if bias_key in sd:
-                    full_bias = sd[bias_key]
+                    full_bias = sd.pop(bias_key)
                     if module.mode == "colwise":
                         start = mesh.rank * module.local_out_features
                         end = start + module.local_out_features
@@ -473,7 +473,7 @@ def load_tp_shards(model, sd, prefix=""):
         if shard_range is not None and hasattr(module, "weight") and module.weight is not None:
             weight_key = prefix + name + ".weight"
             if weight_key in sd:
-                full = sd[weight_key]
+                full = sd.pop(weight_key)
                 start, end = shard_range
                 if full.ndim == 1 and end <= full.shape[0]:
                     module.weight.data = full[start:end].to(
