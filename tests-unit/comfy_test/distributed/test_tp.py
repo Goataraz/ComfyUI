@@ -709,6 +709,90 @@ class TestSD3JointBlocksTP:
         assert modes["joint_blocks.0.context_block.mlp.fc1"] == "colwise"
         assert "joint_blocks.0.x_block.adaLN_modulation.1" not in modes
 
+    def test_skips_scaled_fp8_companions(self, monkeypatch):
+        """FP8-scaled checkpoints attach weight_scale; ParallelLinear must
+        not replace those Linears or scales are dropped and quality tanks."""
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(1536, 6144)
+                self.mlp.fc2 = nn.Linear(6144, 1536)
+
+        class JointBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.x_block = Block()
+
+        class OpenAISignatureMMDITWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.joint_blocks = nn.ModuleList([JointBlock()])
+
+        model = OpenAISignatureMMDITWrapper()
+        # Only fc1 has a scale companion → must stay Linear; fc2 can shard.
+        sd = {
+            "joint_blocks.0.x_block.mlp.fc1.weight": torch.empty(6144, 1536),
+            "joint_blocks.0.x_block.mlp.fc1.weight_scale": torch.tensor(1.0),
+            "joint_blocks.0.x_block.mlp.fc2.weight": torch.empty(1536, 6144),
+        }
+        assert patcher.parallelize_model(model, sd=sd, prefix="") is True
+        assert not isinstance(model.joint_blocks[0].x_block.mlp.fc1, ParallelLinear)
+        assert isinstance(model.joint_blocks[0].x_block.mlp.fc1, nn.Linear)
+        assert isinstance(model.joint_blocks[0].x_block.mlp.fc2, ParallelLinear)
+        assert model.joint_blocks[0].x_block.mlp.fc2.mode == "rowwise"
+
+    def test_all_scaled_returns_false(self, monkeypatch):
+        """When every candidate linear is scaled, TP must no-op (fallback load)."""
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(1536, 6144)
+                self.mlp.fc2 = nn.Linear(6144, 1536)
+
+        class JointBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.x_block = Block()
+
+        class OpenAISignatureMMDITWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.joint_blocks = nn.ModuleList([JointBlock()])
+
+        model = OpenAISignatureMMDITWrapper()
+        sd = {
+            "joint_blocks.0.x_block.mlp.fc1.weight_scale": torch.tensor(1.0),
+            "joint_blocks.0.x_block.mlp.fc2.weight_scale": torch.tensor(1.0),
+        }
+        assert patcher.parallelize_model(model, sd=sd) is False
+
 
 # Cosmos GeneralDIT / Wan / expanded head-split coverage
 # ---------------------------------------------------------------------------

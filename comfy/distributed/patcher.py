@@ -255,9 +255,34 @@ def get_tp_targets(model):
             return TP_TARGETS[cls.__name__]
     return []
 
-def parallelize_model(model):
+# Companion keys that mark a Linear as scaled/quantized FP8 (or similar).
+# ParallelLinear does not carry these; sharding the weight alone drops the
+# scale → broken activations (e.g. SD3.5 fp8_scaled mean ~150 → ~79).
+_SCALED_COMPANION_SUFFIXES = (
+    ".weight_scale",
+    ".input_scale",
+    ".weight_scale_inv",
+    ".comfy_quant",
+)
+
+
+def _has_scaled_companions(sd, prefix, module_name):
+    """True if state dict has FP8/quant scale (or similar) keys for this module."""
+    if sd is None:
+        return False
+    base = f"{prefix}{module_name}"
+    return any((base + suffix) in sd for suffix in _SCALED_COMPANION_SUFFIXES)
+
+
+def parallelize_model(model, sd=None, prefix=""):
     """
     Replaces target linear layers in the model with ParallelLinear.
+
+    Args:
+        model: Diffusion transformer (inner model, not BaseModel wrapper).
+        sd: Optional full state dict. When provided, layers with companion
+            FP8/quant scale keys are left as plain Linear so scales load.
+        prefix: State-dict key prefix matching ``sd`` (e.g. diffusion prefix).
     """
     targets = get_tp_targets(model)
     if not targets:
@@ -284,11 +309,17 @@ def parallelize_model(model):
 
     count = 0
     skipped_dims = 0
+    skipped_scaled = 0
     for name, module in model.named_modules():
-        if any(name.startswith(prefix) for prefix in targets):
+        if any(name.startswith(t) for t in targets):
             if _is_linear_layer(module):
                 # Skip layers that can't be simply sharded (fused layers, modulation layers)
                 if any(name.endswith(excl) for excl in excluded_names):
+                    continue
+
+                # Skip scaled/quantized linears — ParallelLinear has no weight_scale
+                if _has_scaled_companions(sd, prefix, name):
+                    skipped_scaled += 1
                     continue
 
                 # Determine mode
@@ -346,12 +377,18 @@ def parallelize_model(model):
                 count += 1
 
     if count == 0:
-        logging.warning(f"[TP] parallelize_model: 0 layers parallelized for {model.__class__.__name__}"
-                        f" ({skipped_dims} skipped for non-divisible dimensions) — TP had no effect")
+        logging.warning(
+            f"[TP] parallelize_model: 0 layers parallelized for {model.__class__.__name__}"
+            f" ({skipped_dims} skipped for non-divisible dimensions"
+            f", {skipped_scaled} skipped for scaled/quant companions) — TP had no effect"
+        )
         return False
 
-    logging.info(f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
-                 f" ({skipped_dims} skipped for non-divisible dimensions)")
+    logging.info(
+        f"[TP] Parallelized {count} linear layers across {len(targets)} block groups"
+        f" ({skipped_dims} skipped for non-divisible dimensions"
+        f", {skipped_scaled} skipped for scaled/quant companions)"
+    )
 
     # Head-split override: for QwenImage/Cosmos/Wan/HiDream-style models, the
     # colwise shard distributes a contiguous slice of heads across ranks.

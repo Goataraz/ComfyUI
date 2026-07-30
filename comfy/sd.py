@@ -1979,7 +1979,10 @@ def _apply_tensor_parallelism(model, sd, prefix=""):
     # model.diffusion_model. parallelize_model() must operate on
     # the inner model to find the correct module prefixes.
     diffusion_model = getattr(model, 'diffusion_model', model)
-    if not parallelize_model(diffusion_model):
+    # Pass sd so parallelize_model can skip FP8-scaled / quantized linears
+    # (ParallelLinear does not carry weight_scale — sharding them alone
+    # silently tanks quality, e.g. SD3.5 fp8_scaled).
+    if not parallelize_model(diffusion_model, sd=sd, prefix=prefix):
         # Unsupported / unmatched architecture — do NOT force the TP
         # load/offload device path. Caller falls back to normal loading
         # (fixes Cosmos GeneralDIT crashing under --tensor-parallel even
