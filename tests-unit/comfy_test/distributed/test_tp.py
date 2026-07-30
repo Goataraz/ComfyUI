@@ -798,8 +798,7 @@ class TestSD3JointBlocksTP:
 # ---------------------------------------------------------------------------
 
 class TestCosmosGeneralDITTP:
-    """GeneralDIT is TP_UNSUPPORTED until FA/CA cal_qkv layout is solved.
-    Keep MLP-only exclusion helpers ready for when it is re-enabled."""
+    """GeneralDIT MLP-only TP: FA/CA projections stay replicated."""
 
     def test_targets_and_exclusions(self):
         from comfy.distributed.patcher import (
@@ -807,9 +806,9 @@ class TestCosmosGeneralDITTP:
             TP_HEAD_SPLIT_MODELS, TP_UNSUPPORTED, TP_TARGETS,
         )
         GeneralDIT = type("GeneralDIT", (), {})
-        assert "GeneralDIT" in TP_UNSUPPORTED
-        assert "GeneralDIT" in TP_TARGETS  # allowlist kept for re-enable
-        assert get_tp_targets(GeneralDIT()) == []
+        assert "GeneralDIT" not in TP_UNSUPPORTED
+        assert "GeneralDIT" in TP_TARGETS
+        assert get_tp_targets(GeneralDIT()) == ["blocks"]
         assert "adaLN_modulation.1" in EXCLUDED_LAYER_NAMES
         assert "adaLN_modulation.2" in EXCLUDED_LAYER_NAMES
         # Must be GeneralDIT-scoped — QwenImage also uses attn.to_out.0
@@ -818,9 +817,8 @@ class TestCosmosGeneralDITTP:
         assert "attn.to_q.0" in GENERALDIT_EXCLUDED_LAYER_NAMES
         assert "GeneralDIT" not in TP_HEAD_SPLIT_MODELS
 
-    def test_mlp_only_helpers_when_allowlisted(self, monkeypatch):
-        """If GeneralDIT is removed from TP_UNSUPPORTED, MLP-only TP must
-        preserve FA/CA projection shapes (nested ModuleDict layout)."""
+    def test_mlp_only_sharding(self, monkeypatch):
+        """MLP layer1/layer2 shard; FA/CA Sequential projections stay Linear."""
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
@@ -832,7 +830,6 @@ class TestCosmosGeneralDITTP:
             current_device = "cpu"
         monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
         monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
-        monkeypatch.setattr(patcher, "TP_UNSUPPORTED", set())
 
         def L(i, o):
             return nn.Linear(i, o, bias=True)

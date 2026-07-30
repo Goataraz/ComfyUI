@@ -232,12 +232,10 @@ TP_UNSUPPORTED = {
     "CausalWanModel",
     # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
     "HiDreamO1Transformer",
-    # GeneralDIT (Cosmos 1.0): FA/CA share the Attention class but CA K/V are
-    # Linear(1024→4096) while FA is Linear(4096→4096). Even MLP-only TP still
-    # crashes in cal_qkv (expected in=4096, got 1024) — root cause is NOT the
-    # attention ParallelLinear path (fails before any MLP runs). Needs a
-    # dedicated Cosmos TP strategy + conditioning/layout audit.
-    "GeneralDIT",
+    # GeneralDIT is allowlisted with MLP-only TP (attn projections stay
+    # replicated via GENERALDIT_EXCLUDED_LAYER_NAMES). Full FA/CA head-split
+    # needs a dedicated strategy: CA K/V are Linear(context→inner) while FA
+    # is Linear(query→inner), so naive colwise+head-split is unsafe.
 }
 
 
