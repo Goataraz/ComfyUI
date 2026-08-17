@@ -1265,6 +1265,18 @@ class PromptQueue:
             self.server.queue_updated()
             self.not_empty.notify()
 
+    def get_nowait(self):
+        """Non-blocking get: returns (item, id) if queue is non-empty, else None."""
+        with self.mutex:
+            if len(self.queue) == 0:
+                return None
+            item = heapq.heappop(self.queue)
+            i = self.task_counter
+            self.currently_running[i] = copy.deepcopy(item)
+            self.task_counter += 1
+            self.server.queue_updated()
+            return (item, i)
+
     def get(self, timeout=None):
         with self.not_empty:
             while len(self.queue) == 0:
