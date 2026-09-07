@@ -82,6 +82,9 @@ TP_TARGETS = {
     # MageFlow: 12× QwenImageTransformerBlock, not an MRO subclass of
     # QwenImageTransformer2DModel.
     "MageFlowTransformer2DModel": ["transformer_blocks"],
+    # Hunyuan3D: unfused QKV (not hydit's packed Wqkv). Last 6 layers are
+    # MoE — experts/gate/shared FF stay replicated.
+    "HunYuanDiTPlain": ["blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -380,6 +383,7 @@ TP_HEAD_SPLIT_MODELS = {
     "BooguTransformer2DModel",
     "SingleStreamDiT",
     "MageFlowTransformer2DModel",
+    "HunYuanDiTPlain",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -523,6 +527,7 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         bool(mro_names & _PACKED_QKV_FAMILIES)
         or "NextDiT" in mro_names
         or "SingleStreamDiT" in mro_names
+        or "HunYuanDiTPlain" in mro_names
     )
     synced = 0
     for name, module in model.named_modules():
@@ -541,9 +546,9 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         # RoPE metadata (attn_dim // num_heads) and must stay full.
         if type(module).__name__ in ("SingleStreamBlock", "PiTBlock"):
             continue
-        # Root Flux/Hunyuan/Chroma/SD3 num_heads, NextDiT.n_heads, and
-        # Krea2 SingleStreamDiT.heads are constructor / RoPE metadata —
-        # attention modules own the reshape.
+        # Root Flux/Hunyuan/Chroma/SD3 num_heads, NextDiT.n_heads,
+        # Krea2 SingleStreamDiT.heads, and HunYuanDiTPlain.num_heads are
+        # constructor / RoPE metadata — attention modules own the reshape.
         if skip_root_heads and not name:
             continue
         for attr in _HEADS_ATTRS:
@@ -663,6 +668,10 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(MOCHI_EXCLUDED_LAYER_NAMES)
     if "HunYuanDiT" in mro_names:
         excluded_names = excluded_names + tuple(HYDIT_EXCLUDED_LAYER_NAMES)
+    if "HunYuanDiTPlain" in mro_names:
+        # skip_linear cats 2×hidden; default_modulation is a full-width shift.
+        # MoE experts are skipped by subtree below, not this list.
+        excluded_names = excluded_names + tuple(HYDIT_EXCLUDED_LAYER_NAMES)
     if "PixArtMS" in mro_names:
         # AttentionKVCompress.qkv / .proj collide with the SD3 `.attn.qkv` suffix.
         excluded_names = tuple(
@@ -687,6 +696,9 @@ def parallelize_model(model, sd=None, prefix=""):
                 if any(name.endswith(excl) for excl in excluded_names):
                     continue
                 if "AudioDiffusionTransformer" in mro_names and ".conformer." in name:
+                    continue
+                if "HunYuanDiTPlain" in mro_names and ".moe." in name:
+                    # Last 6 layers: experts, shared FF, and gate stay full-width.
                     continue
 
                 # Skip scaled/quantized linears — ParallelLinear has no weight_scale

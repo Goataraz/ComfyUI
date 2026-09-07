@@ -265,7 +265,7 @@ class TestGetTPTargets:
         HY = self._make_model_class("HunYuanDiT")
         Plain = self._make_model_class("HunYuanDiTPlain")
         assert get_tp_targets(HY()) == ["blocks"]
-        assert get_tp_targets(Plain()) == []
+        assert get_tp_targets(Plain()) == ["blocks"]
 
     def test_pixart_matches(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -2714,6 +2714,106 @@ class TestMageFlowTP:
         assert isinstance(model.transformer_blocks[0].img_mod[1], nn.Linear)
         assert not isinstance(model.transformer_blocks[0].img_mod[1], ParallelLinear)
         assert isinstance(model.img_in, nn.Linear)
+
+
+class TestHunYuanDiTPlainTP:
+    """Hunyuan3D HunYuanDiTPlain: unfused QKV + dense MLP; MoE last layers stay."""
+
+    def test_unfused_attn_dense_mlp_moe_replicated(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, ctx, heads = 64, 32, 8
+        assert "HunYuanDiTPlain" in TP_HEAD_SPLIT_MODELS
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = dim // heads
+                self.to_q = nn.Linear(dim, dim)
+                self.to_k = nn.Linear(dim, dim)
+                self.to_v = nn.Linear(dim, dim)
+                self.out_proj = nn.Linear(dim, dim)
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = dim // heads
+                self.to_q = nn.Linear(dim, dim)
+                self.to_k = nn.Linear(ctx, dim)
+                self.to_v = nn.Linear(ctx, dim)
+                self.out_proj = nn.Linear(dim, dim)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(dim, dim * 4)
+                self.fc2 = nn.Linear(dim * 4, dim)
+
+        class MoEBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = nn.ModuleList([nn.Linear(dim, dim * 4), nn.Linear(dim, dim * 4)])
+                self.shared_experts = nn.Linear(dim, dim * 4)
+
+        class HunYuanDiTBlock(nn.Module):
+            def __init__(self, use_moe=False, skip=False):
+                super().__init__()
+                self.attn1 = Attention()
+                self.attn2 = CrossAttention()
+                if skip:
+                    self.skip_linear = nn.Linear(dim * 2, dim)
+                if use_moe:
+                    self.moe = MoEBlock()
+                else:
+                    self.mlp = MLP()
+
+        class HunYuanDiTPlain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.x_embedder = nn.Linear(16, dim)
+                self.blocks = nn.ModuleList([
+                    HunYuanDiTBlock(use_moe=False, skip=False),
+                    HunYuanDiTBlock(use_moe=True, skip=True),
+                ])
+
+        model = HunYuanDiTPlain()
+        assert patcher.parallelize_model(model) is True
+        dense = model.blocks[0]
+        moe = model.blocks[1]
+        assert isinstance(dense.attn1.to_q, ParallelLinear)
+        assert dense.attn1.to_q.mode == "colwise"
+        assert dense.attn1.out_proj.mode == "rowwise"
+        assert dense.attn1.num_heads == heads // 2
+        assert isinstance(dense.attn2.to_k, ParallelLinear)
+        assert dense.attn2.out_proj.mode == "rowwise"
+        assert dense.attn2.num_heads == heads // 2
+        assert isinstance(dense.mlp.fc1, ParallelLinear)
+        assert dense.mlp.fc1.mode == "colwise"
+        assert dense.mlp.fc2.mode == "rowwise"
+        assert isinstance(moe.moe.experts[0], nn.Linear)
+        assert not isinstance(moe.moe.experts[0], ParallelLinear)
+        assert isinstance(moe.moe.shared_experts, nn.Linear)
+        assert not isinstance(moe.moe.shared_experts, ParallelLinear)
+        assert isinstance(moe.skip_linear, nn.Linear)
+        assert not isinstance(moe.skip_linear, ParallelLinear)
+        assert moe.attn1.num_heads == heads // 2
+        assert isinstance(model.x_embedder, nn.Linear)
+        assert not isinstance(model.x_embedder, ParallelLinear)
+        assert model.num_heads == heads
 
 
 class TestPackedColwise:
