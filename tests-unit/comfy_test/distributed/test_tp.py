@@ -279,6 +279,17 @@ class TestGetTPTargets:
         Audio = self._make_model_class("AudioDiffusionTransformer")
         assert get_tp_targets(Audio()) == ["transformer.layers"]
 
+    def test_boogu_matches_omnigen2_denied(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Boogu = self._make_model_class("BooguTransformer2DModel")
+        Omni = self._make_model_class("OmniGen2Transformer2DModel")
+        assert get_tp_targets(Boogu()) == [
+            "noise_refiner", "ref_image_refiner", "context_refiner",
+            "double_stream_layers", "single_stream_layers",
+        ]
+        # Production OmniGen2 is 21/7 — neither divides by 2-GPU world_size.
+        assert get_tp_targets(Omni()) == []
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -2427,6 +2438,137 @@ class TestAudioDitTP:
         assert isinstance(model.transformer.project_in, nn.Linear)
         assert not isinstance(model.transformer.project_in, ParallelLinear)
         assert isinstance(model.transformer.project_out, nn.Linear)
+
+
+class TestBooguTP:
+    """Boogu 28/7 GQA: shard Q heads, keep K/V replicated when kv_heads % ws != 0."""
+
+    def test_q_split_kv_replicated(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, kv_heads, head_dim = 64, 8, 1, 8
+        inner = 128
+        assert "BooguTransformer2DModel" in TP_HEAD_SPLIT_MODELS
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kv_heads = kv_heads
+                self.dim_head = head_dim
+                self.to_q = nn.Linear(dim, heads * head_dim, bias=False)
+                self.to_k = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.to_v = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.to_out = nn.Sequential(nn.Linear(heads * head_dim, dim, bias=False), nn.Dropout(0.0))
+                self.norm_q = nn.RMSNorm(head_dim)
+                self.norm_k = nn.RMSNorm(head_dim)
+
+        class Processor(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kv_heads = kv_heads
+                self.dim_head = head_dim
+                self.img_to_q = nn.Linear(dim, heads * head_dim, bias=False)
+                self.img_to_k = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.img_to_v = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.instruct_to_q = nn.Linear(dim, heads * head_dim, bias=False)
+                self.instruct_to_k = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.instruct_to_v = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.instruct_out = nn.Linear(dim, dim, bias=False)
+                self.img_out = nn.Linear(dim, dim, bias=False)
+
+        class BooguJointAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kv_heads = kv_heads
+                self.dim_head = head_dim
+                self.to_out = nn.Sequential(nn.Linear(heads * head_dim, dim, bias=False), nn.Dropout(0.0))
+                self.processor = Processor()
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear_1 = nn.Linear(dim, inner, bias=False)
+                self.linear_2 = nn.Linear(inner, dim, bias=False)
+                self.linear_3 = nn.Linear(dim, inner, bias=False)
+
+        class OmniGen2TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.feed_forward = FeedForward()
+                self.norm1 = nn.Module()
+                self.norm1.linear = nn.Linear(dim, 4 * dim)
+
+        class BooguDoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.img_instruct_attn = BooguJointAttention()
+                self.img_self_attn = Attention()
+                self.img_feed_forward = FeedForward()
+                self.instruct_feed_forward = FeedForward()
+                self.img_norm1 = nn.Module()
+                self.img_norm1.linear = nn.Linear(dim, 4 * dim)
+
+        class BooguTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.noise_refiner = nn.ModuleList([OmniGen2TransformerBlock()])
+                self.ref_image_refiner = nn.ModuleList([OmniGen2TransformerBlock()])
+                self.context_refiner = nn.ModuleList([OmniGen2TransformerBlock()])
+                self.double_stream_layers = nn.ModuleList([BooguDoubleStreamBlock()])
+                self.single_stream_layers = nn.ModuleList([OmniGen2TransformerBlock()])
+                self.x_embedder = nn.Linear(16, dim)
+
+        model = BooguTransformer2DModel()
+        assert patcher.parallelize_model(model) is True
+
+        single = model.single_stream_layers[0]
+        assert isinstance(single.attn.to_q, ParallelLinear)
+        assert single.attn.to_q.mode == "colwise"
+        assert isinstance(single.attn.to_k, nn.Linear)
+        assert not isinstance(single.attn.to_k, ParallelLinear)
+        assert isinstance(single.attn.to_v, nn.Linear)
+        assert not isinstance(single.attn.to_v, ParallelLinear)
+        assert single.attn.to_out[0].mode == "rowwise"
+        assert single.attn.heads == heads // 2
+        assert single.attn.kv_heads == kv_heads
+        assert isinstance(single.feed_forward.linear_1, ParallelLinear)
+        assert single.feed_forward.linear_1.mode == "colwise"
+        assert isinstance(single.feed_forward.linear_3, ParallelLinear)
+        assert single.feed_forward.linear_2.mode == "rowwise"
+        assert isinstance(single.norm1.linear, nn.Linear)
+        assert not isinstance(single.norm1.linear, ParallelLinear)
+
+        joint = model.double_stream_layers[0].img_instruct_attn
+        proc = joint.processor
+        assert isinstance(proc.img_to_q, ParallelLinear)
+        assert isinstance(proc.instruct_to_q, ParallelLinear)
+        assert isinstance(proc.img_to_k, nn.Linear)
+        assert not isinstance(proc.img_to_k, ParallelLinear)
+        assert isinstance(proc.instruct_to_v, nn.Linear)
+        assert not isinstance(proc.instruct_to_v, ParallelLinear)
+        assert proc.img_out.mode == "rowwise"
+        assert proc.instruct_out.mode == "rowwise"
+        assert joint.to_out[0].mode == "rowwise"
+        assert joint.heads == heads // 2
+        assert joint.kv_heads == kv_heads
+        assert model.double_stream_layers[0].img_self_attn.heads == heads // 2
+        assert isinstance(model.x_embedder, nn.Linear)
+        assert not isinstance(model.x_embedder, ParallelLinear)
 
 
 class TestPackedColwise:

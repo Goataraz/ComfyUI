@@ -31,6 +31,10 @@ class BooguDoubleStreamProcessor(nn.Module):
         query_dim = head_dim * heads
         kv_dim = head_dim * kv_heads
 
+        self.heads = heads
+        self.kv_heads = kv_heads
+        self.dim_head = head_dim
+
         self.img_to_q = operations.Linear(query_dim, query_dim, bias=False, dtype=dtype, device=device)
         self.img_to_k = operations.Linear(query_dim, kv_dim, bias=False, dtype=dtype, device=device)
         self.img_to_v = operations.Linear(query_dim, kv_dim, bias=False, dtype=dtype, device=device)

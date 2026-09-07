@@ -72,6 +72,10 @@ TP_TARGETS = {
     "HunYuanDiT": ["blocks"],  # HunyuanDiT: packed Wqkv + packed kv_proj
     "PixArtMS": ["blocks"],  # packed attn.qkv + packed kv_linear; KV-compress stays
     "AudioDiffusionTransformer": ["transformer.layers"],  # packed to_qkv / to_kv / GLU
+    "BooguTransformer2DModel": [
+        "noise_refiner", "ref_image_refiner", "context_refiner",
+        "double_stream_layers", "single_stream_layers",
+    ],  # Q-split; KV stays when kv_heads % world_size != 0
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -194,6 +198,13 @@ AUDIO_EXCLUDED_LAYER_NAMES = (
     "to_local_embed.2",
 )
 
+# Boogu: LuminaRMSNormZero.linear is a 4-way chunk on full hidden.
+BOOGU_EXCLUDED_LAYER_NAMES = (
+    "norm1.linear",
+    "norm2.linear",
+    "norm3.linear",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -286,6 +297,20 @@ def _gqa_pack_sizes(name, module, parent, mro_names):
     return sizes
 
 
+def _keep_kv_replicated(name, parent, world_size):
+    """Leave K/V full-width when kv_heads is not divisible by world_size.
+
+    Naive colwise on to_k/to_v yields a fractional KV head (Boogu 7 on 2 GPUs).
+    Q can still split. RoPE is along dim_head, so unreplicated K stays valid.
+    """
+    if world_size <= 1 or parent is None:
+        return False
+    if not name.endswith((".to_k", ".to_v", "_to_k", "_to_v")):
+        return False
+    kv = getattr(parent, "kv_heads", None)
+    return isinstance(kv, int) and kv % world_size != 0
+
+
 def _pixart_keep_replicated(name, parent, mro_names):
     """PixArt KV-compress / full-dim QK-norm blocks stay unreplicated.
 
@@ -346,10 +371,11 @@ TP_HEAD_SPLIT_MODELS = {
     "HunYuanDiT",
     "PixArtMS",
     "AudioDiffusionTransformer",
+    "BooguTransformer2DModel",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
@@ -376,6 +402,11 @@ def _resolve_q_proj(module):
             q = q[0]
         if isinstance(q, ParallelLinear) or _is_linear_layer(q):
             return q
+    proc = getattr(module, "processor", None)
+    if proc is not None and proc is not module:
+        inner = _resolve_q_proj(proc)
+        if inner is not None:
+            return inner
     return None
 
 
@@ -626,6 +657,8 @@ def parallelize_model(model, sd=None, prefix=""):
         )
     if "AudioDiffusionTransformer" in mro_names:
         excluded_names = excluded_names + tuple(AUDIO_EXCLUDED_LAYER_NAMES)
+    if "BooguTransformer2DModel" in mro_names:
+        excluded_names = excluded_names + tuple(BOOGU_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -681,6 +714,14 @@ def parallelize_model(model, sd=None, prefix=""):
                         "AudioDiffusionTransformer" in mro_names
                         and name.endswith("ff.ff.2")
                     )
+                    or (
+                        "BooguTransformer2DModel" in mro_names
+                        and (
+                            name.endswith("feed_forward.linear_2")
+                            or name.endswith(".img_out")
+                            or name.endswith(".instruct_out")
+                        )
+                    )
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection
                     # (the GELU+Dropout+Linear ModuleList's index-2 Linear),
@@ -696,6 +737,8 @@ def parallelize_model(model, sd=None, prefix=""):
                     parent = comfy.utils.get_attr(model, parent_name)
 
                 if _pixart_keep_replicated(name, parent, mro_names):
+                    continue
+                if _keep_kv_replicated(name, parent, mesh.world_size):
                     continue
 
                 pack_sizes = _gqa_pack_sizes(name, module, parent, mro_names) if mode == "colwise" else None
