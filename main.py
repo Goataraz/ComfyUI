@@ -401,8 +401,13 @@ def prompt_worker(q, server_instance):
         queue_item = None
         if is_tp:
             if rank == 0:
+                # Non-blocking queue check: if empty, immediately broadcast
+                # "no work" so rank 1 can sleep too. This eliminates the
+                # 5-second NCCL busy-wait where rank 1 spins at ~50% CPU
+                # while rank 0 blocks in q.get(timeout=5.0). The idle
+                # sleep happens AFTER the broadcast, not before it.
                 try:
-                    queue_item = q.get(timeout=timeout)
+                    queue_item = q.get_nowait()
                 except Exception:
                     queue_item = None
 

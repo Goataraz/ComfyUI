@@ -111,3 +111,24 @@ def test_lowvram_flag_takes_no_effect_when_dynamic_enabled():
             f"--lowvram help text does not mention dynamic-vram: {help_text!r}. "
             "The mutual-exclusion behavior may have been changed."
         )
+
+
+def test_tp_idle_loop_uses_get_nowait():
+    """Rank 0 must not block in q.get(timeout=5) while rank 1 NCCL-spins.
+
+    PromptQueue.get_nowait() returns None on empty (does not raise). Rank 0
+    broadcasts size=-1 then sleeps; rank 1 mirrors the sleep after receiving
+    the empty signal.
+    """
+    main_py = _read(REPO_ROOT / "main.py")
+    assert "q.get_nowait()" in main_py, (
+        "TP prompt_worker rank 0 must drain the queue with get_nowait() so "
+        "idle NCCL broadcasts happen immediately instead of after a 5s block."
+    )
+    execution_py = _read(REPO_ROOT / "execution.py")
+    assert "def get_nowait(self):" in execution_py
+    # Empty-queue path must sleep on BOTH ranks so GPU 1 can drop clocks.
+    idle_sleep_hits = main_py.count("time.sleep(5.0)")
+    assert idle_sleep_hits >= 2, (
+        f"expected rank-0 and rank-1 idle sleeps in main.py, found {idle_sleep_hits}"
+    )
