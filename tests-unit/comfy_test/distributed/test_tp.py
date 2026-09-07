@@ -190,11 +190,14 @@ class TestGetTPTargets:
         assert get_tp_targets(HiDream()) == ["double_stream_blocks", "single_stream_blocks"]
 
     def test_hidream_o1_matches(self):
-        from comfy.distributed.patcher import get_tp_targets
+        from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         HiDreamO1 = self._make_model_class("HiDreamO1Transformer")
-        # HiDreamO1 is intentionally disabled in TP_TARGETS because its integrated
-        # Llama2 LLM can't be naively sharded (needs full-model TP strategy)
-        assert get_tp_targets(HiDreamO1()) == []
+        # Vision + LLM both divide on 2-GPU (16 heads / 32/8 GQA). Embeddings stay.
+        assert "HiDreamO1Transformer" not in TP_UNSUPPORTED
+        assert get_tp_targets(HiDreamO1()) == [
+            "language_model.layers",
+            "visual.blocks",
+        ]
 
     def test_ltxv_matches(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -3368,6 +3371,135 @@ class TestErnieImageTP:
         assert isinstance(model.final_linear, nn.Linear)
         assert not isinstance(model.final_linear, ParallelLinear)
         assert model.num_heads == heads
+
+
+class TestHiDreamO1TP:
+    """HiDreamO1: LLM GQA 32/8 + vision packed QKV. Embeddings / merger / patch embed stay."""
+
+    def test_llm_gqa_and_vision_packed(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS, TP_UNSUPPORTED
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        hidden, q_heads, kv_heads, head_dim = 128, 8, 4, 16
+        vis_dim, vis_heads = 64, 8
+        assert "HiDreamO1Transformer" in TP_HEAD_SPLIT_MODELS
+        assert "HiDreamO1Transformer" not in TP_UNSUPPORTED
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = q_heads
+                self.num_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(hidden, q_heads * head_dim, bias=False)
+                self.k_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
+                self.v_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
+                self.o_proj = nn.Linear(q_heads * head_dim, hidden, bias=False)
+                self.q_norm = nn.RMSNorm(head_dim)
+                self.k_norm = nn.RMSNorm(head_dim)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(hidden, hidden * 2, bias=False)
+                self.up_proj = nn.Linear(hidden, hidden * 2, bias=False)
+                self.down_proj = nn.Linear(hidden * 2, hidden, bias=False)
+
+        class TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.mlp = MLP()
+
+        class Llama2_(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(32, hidden)
+                self.layers = nn.ModuleList([TransformerBlock()])
+                self.norm = nn.RMSNorm(hidden)
+
+        class VisionAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = vis_heads
+                self.head_dim = vis_dim // vis_heads
+                self.qkv = nn.Linear(vis_dim, vis_dim * 3, bias=True)
+                self.proj = nn.Linear(vis_dim, vis_dim)
+
+        class VisionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = VisionAttention()
+                self.mlp = nn.Module()
+                self.mlp.linear_fc1 = nn.Linear(vis_dim, vis_dim * 2)
+                self.mlp.linear_fc2 = nn.Linear(vis_dim * 2, vis_dim)
+
+        class Qwen35VisionModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = vis_heads
+                self.patch_embed = nn.Linear(16, vis_dim)
+                self.blocks = nn.ModuleList([VisionBlock()])
+                self.merger = nn.Linear(vis_dim, hidden)
+
+        class BottleneckPatchEmbed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = nn.Linear(32, hidden // 4, bias=False)
+                self.proj2 = nn.Linear(hidden // 4, hidden)
+
+        class HiDreamO1Transformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual = Qwen35VisionModel()
+                self.language_model = Llama2_()
+                self.x_embedder = BottleneckPatchEmbed()
+                self.final_layer2 = nn.Linear(hidden, 32)
+
+        model = HiDreamO1Transformer()
+        assert patcher.parallelize_model(model) is True
+        attn = model.language_model.layers[0].self_attn
+        assert isinstance(attn.q_proj, ParallelLinear)
+        assert attn.q_proj.mode == "colwise"
+        assert attn.k_proj.mode == "colwise"
+        assert attn.v_proj.mode == "colwise"
+        assert attn.o_proj.mode == "rowwise"
+        assert attn.num_heads == q_heads // 2
+        assert attn.num_kv_heads == kv_heads // 2
+        assert tuple(attn.q_norm.weight.shape) == (head_dim,)
+        mlp = model.language_model.layers[0].mlp
+        assert mlp.gate_proj.mode == "colwise"
+        assert mlp.up_proj.mode == "colwise"
+        assert mlp.down_proj.mode == "rowwise"
+        assert not isinstance(model.language_model.embed_tokens, ParallelLinear)
+        vattn = model.visual.blocks[0].attn
+        assert isinstance(vattn.qkv, ParallelLinear)
+        assert vattn.qkv.mode == "colwise"
+        assert vattn.qkv.pack_count == 3
+        assert vattn.qkv.local_out_features == 3 * (vis_dim // 2)
+        assert vattn.proj.mode == "rowwise"
+        assert vattn.num_heads == vis_heads // 2
+        assert model.visual.blocks[0].mlp.linear_fc1.mode == "colwise"
+        assert model.visual.blocks[0].mlp.linear_fc2.mode == "rowwise"
+        assert isinstance(model.visual.patch_embed, nn.Linear)
+        assert not isinstance(model.visual.patch_embed, ParallelLinear)
+        assert isinstance(model.visual.merger, nn.Linear)
+        assert not isinstance(model.visual.merger, ParallelLinear)
+        assert model.visual.num_heads == vis_heads
+        assert isinstance(model.x_embedder.proj1, nn.Linear)
+        assert not isinstance(model.x_embedder.proj1, ParallelLinear)
+        assert isinstance(model.final_layer2, nn.Linear)
+        assert not isinstance(model.final_layer2, ParallelLinear)
 
 
 class TestTripoSplatTP:

@@ -50,10 +50,11 @@ TP_TARGETS = {
     "GeneralDIT": ["blocks"],                          # Cosmos T2V/I2V
     "MiniTrainDIT": ["blocks"],                       # Cosmos Predict2 / Anima
     "HiDreamImageTransformer2DModel": ["double_stream_blocks", "single_stream_blocks"],
-    # HiDreamO1Transformer has an integrated Llama2 language model that cannot be
-    # naively sharded — its layers receive input from non-TP visual/x_embedder
-    # components. Full TP support requires sharding the vision encoder too.
-    # "HiDreamO1Transformer": ["language_model.layers"],
+    # HiDreamO1: pixel-space DiT on Qwen3-VL. LLM is 32/8 GQA, vision is
+    # 16-head packed QKV — both 2-GPU-divisible. Prefixes keep embed_tokens,
+    # x_embedder, t_embedder, vision merger/patch_embed, and final_layer
+    # unreplicated (full hidden width into sharded attention, same as Flux img_in).
+    "HiDreamO1Transformer": ["language_model.layers", "visual.blocks"],
     "QwenImageTransformer2DModel": ["transformer_blocks"],
     "Llama2": ["layers"],
     "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
@@ -285,6 +286,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "HunYuanDiT",
     "PixArtMS",
     "LatentSeqMMFlowModel",
+    "HiDreamO1Transformer",
 })
 
 
@@ -443,6 +445,7 @@ TP_HEAD_SPLIT_MODELS = {
     "Kandinsky5",
     "ErnieImageModel",
     "LatentSeqMMFlowModel",
+    "HiDreamO1Transformer",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -591,8 +594,6 @@ def _slice_multihead_rmsnorm(model, local_heads, original_heads, mesh):
 # Models whose MRO would match a supported parent but that are NOT safe
 # to shard yet (architecture-specific coupling outside Attention).
 TP_UNSUPPORTED = {
-    # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
-    "HiDreamO1Transformer",
     # GeneralDIT is allowlisted with MLP-only TP (attn projections stay
     # replicated via GENERALDIT_EXCLUDED_LAYER_NAMES). Full FA/CA head-split
     # needs a dedicated strategy: CA K/V are Linear(context→inner) while FA
@@ -785,6 +786,11 @@ def parallelize_model(model, sd=None, prefix=""):
     if "LatentSeqMMFlowModel" in mro_names:
         excluded_names = excluded_names + tuple(TRIPOSPLAT_EXCLUDED_LAYER_NAMES)
         # RopeMultiHeadAttention.qkv collides with the SD3 `.attn.qkv` suffix.
+        excluded_names = tuple(
+            e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
+        )
+    if "HiDreamO1Transformer" in mro_names:
+        # Qwen35VisionAttention.qkv / .proj collide with the SD3 suffix.
         excluded_names = tuple(
             e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
         )
