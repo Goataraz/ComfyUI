@@ -277,6 +277,14 @@ class TestGetTPTargets:
         Na = self._make_model_class("NaDiT")
         assert get_tp_targets(Na()) == ["blocks"]
 
+    def test_auraflow_mmdit_does_not_steal_sd3_wrapper(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Aura = self._make_model_class("MMDiT")
+        SD3 = self._make_model_class("OpenAISignatureMMDITWrapper")
+        assert get_tp_targets(Aura()) == ["double_layers", "single_layers"]
+        # SD3 inner model is the wrapper; MRO hits that key first.
+        assert get_tp_targets(SD3()) == ["joint_blocks"]
+
     def test_pixart_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         PixArt = self._make_model_class("PixArtMS")
@@ -2964,6 +2972,105 @@ class TestNaDiTTP:
         assert mlp.proj_out.mode == "rowwise"
         assert isinstance(model.txt_in, nn.Linear)
         assert not isinstance(model.txt_in, ParallelLinear)
+
+
+class TestAuraFlowTP:
+    """AuraFlow MMDiT: unfused w1q/w2q. w2* must not hit Megatron w2 rowwise; c_fc2 is colwise."""
+
+    def test_double_single_and_swiglu_modes(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads = 64, 8
+        assert "MMDiT" in TP_HEAD_SPLIT_MODELS
+
+        class DoubleAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = heads
+                self.head_dim = dim // heads
+                self.w1q = nn.Linear(dim, dim, bias=False)
+                self.w1k = nn.Linear(dim, dim, bias=False)
+                self.w1v = nn.Linear(dim, dim, bias=False)
+                self.w1o = nn.Linear(dim, dim, bias=False)
+                self.w2q = nn.Linear(dim, dim, bias=False)
+                self.w2k = nn.Linear(dim, dim, bias=False)
+                self.w2v = nn.Linear(dim, dim, bias=False)
+                self.w2o = nn.Linear(dim, dim, bias=False)
+
+        class SingleAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = heads
+                self.head_dim = dim // heads
+                self.w1q = nn.Linear(dim, dim, bias=False)
+                self.w1k = nn.Linear(dim, dim, bias=False)
+                self.w1v = nn.Linear(dim, dim, bias=False)
+                self.w1o = nn.Linear(dim, dim, bias=False)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.c_fc1 = nn.Linear(dim, dim * 2, bias=False)
+                self.c_fc2 = nn.Linear(dim, dim * 2, bias=False)
+                self.c_proj = nn.Linear(dim * 2, dim, bias=False)
+
+        class MMDiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = DoubleAttention()
+                self.mlpX = MLP()
+                self.mlpC = MLP()
+                self.modC = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=False))
+                self.modX = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=False))
+
+        class DiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = SingleAttention()
+                self.mlp = MLP()
+                self.modCX = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=False))
+
+        class MMDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.double_layers = nn.ModuleList([MMDiTBlock()])
+                self.single_layers = nn.ModuleList([DiTBlock()])
+                self.init_x_linear = nn.Linear(16, dim)
+                self.final_linear = nn.Linear(dim, 16, bias=False)
+
+        model = MMDiT()
+        assert patcher.parallelize_model(model) is True
+        dattn = model.double_layers[0].attn
+        assert isinstance(dattn.w1q, ParallelLinear)
+        assert dattn.w1q.mode == "colwise"
+        assert dattn.w1o.mode == "rowwise"
+        assert isinstance(dattn.w2q, ParallelLinear)
+        assert dattn.w2q.mode == "colwise"
+        assert dattn.w2o.mode == "rowwise"
+        assert dattn.n_heads == heads // 2
+        mlp = model.double_layers[0].mlpX
+        assert mlp.c_fc1.mode == "colwise"
+        assert mlp.c_fc2.mode == "colwise"
+        assert mlp.c_proj.mode == "rowwise"
+        assert isinstance(model.double_layers[0].modC[1], nn.Linear)
+        assert not isinstance(model.double_layers[0].modC[1], ParallelLinear)
+        sattn = model.single_layers[0].attn
+        assert isinstance(sattn.w1q, ParallelLinear)
+        assert sattn.w1o.mode == "rowwise"
+        assert sattn.n_heads == heads // 2
+        assert isinstance(model.init_x_linear, nn.Linear)
+        assert not isinstance(model.init_x_linear, ParallelLinear)
 
 
 class TestPackedColwise:

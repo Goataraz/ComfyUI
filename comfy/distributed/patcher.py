@@ -90,6 +90,10 @@ TP_TARGETS = {
     "CogVideoXTransformer3DModel": ["blocks"],
     # SeedVR2: packed MMModule QKV under blocks. AdaSingle is Parameters.
     "NaDiT": ["blocks"],
+    # AuraFlow: same class name as SD3's parent MMDiT. SD3 inner model is
+    # OpenAISignatureMMDITWrapper and matches that key first. Aura's
+    # concrete class is MMDiT with double_layers / single_layers.
+    "MMDiT": ["double_layers", "single_layers"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -223,6 +227,13 @@ BOOGU_EXCLUDED_LAYER_NAMES = (
 COGVIDEO_EXCLUDED_LAYER_NAMES = (
     "norm1.linear",
     "norm2.linear",
+)
+
+# AuraFlow: Sequential modulation Linears chunk 6-way (or 2-way last block).
+AURA_EXCLUDED_LAYER_NAMES = (
+    "modC.1",
+    "modX.1",
+    "modCX.1",
 )
 
 
@@ -403,7 +414,7 @@ TP_HEAD_SPLIT_MODELS = {
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
@@ -705,6 +716,9 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(BOOGU_EXCLUDED_LAYER_NAMES)
     if "CogVideoXTransformer3DModel" in mro_names:
         excluded_names = excluded_names + tuple(COGVIDEO_EXCLUDED_LAYER_NAMES)
+    if "MMDiT" in mro_names and "OpenAISignatureMMDITWrapper" not in mro_names:
+        # AuraFlow concrete class is MMDiT; SD3 wrapper keeps SD3 exclusions.
+        excluded_names = excluded_names + tuple(AURA_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -738,7 +752,17 @@ def parallelize_model(model, sd=None, prefix=""):
                 # with no colwise keyword) explicitly so it does not fall
                 # through to the generic `proj` rowwise rule.
                 mode = "colwise"
-                if any(k in name for k in COLWISE_KEYWORDS):
+                if name.endswith((".w1o", ".w2o")):
+                    # AuraFlow output projs. `w1` is a colwise keyword so
+                    # w1o would stay colwise; `w2` is Megatron MLP down so
+                    # w2q would go rowwise without the branch below.
+                    mode = "rowwise"
+                elif name.endswith((".w2q", ".w2k", ".w2v")):
+                    mode = "colwise"
+                elif name.endswith(".c_fc2"):
+                    # Aura SwiGLU second up-proj; `fc2` is a rowwise keyword.
+                    mode = "colwise"
+                elif any(k in name for k in COLWISE_KEYWORDS):
                     mode = "colwise"
                 elif ".net.0.proj" in name:
                     # GELU/MLP first-Linear in a ModuleList (QwenImage) —
