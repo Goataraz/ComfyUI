@@ -89,7 +89,8 @@ COLWISE_KEYWORDS = [
 # - Fused QKV+MLP layers (torch.split with full dim, unequal packs): linear1, linear2
 # - Fused QKV projections (reshape with 3*num_heads): img_attn.qkv, txt_attn.qkv
 #   Flux / HunyuanVideo / Chroma un-exclude these at runtime and shard with
-#   packed colwise (pack_count=3). SD3 attn.qkv stays excluded (see below).
+#   packed colwise (pack_count=3). SD3 attn.qkv is also packed [Q|K|V] and
+#   un-excluded at runtime for OpenAISignatureMMDITWrapper / MMDiT.
 # - Coupled attention output projections: img_attn.proj, txt_attn.proj — stay
 #   unsharded when qkv is excluded; become rowwise when qkv is packed-colwise.
 EXCLUDED_LAYER_NAMES = [
@@ -97,10 +98,10 @@ EXCLUDED_LAYER_NAMES = [
     "modulation.lin", "img_mod.lin", "txt_mod.lin",
     "img_attn.qkv", "txt_attn.qkv",
     "img_attn.proj", "txt_attn.proj",
-    # SD3 MMDiT fused QKV is packed as [Q|K|V] along out_features. Naive
-    # colwise sharding cuts across the Q/K/V packs instead of heads — exclude
-    # and leave attention replicated; MLP (fc1/fc2) still shards.
-    # Leading dot is required: `img_attn.qkv`.endswith(`attn.qkv`) is True.
+    # SD3 MMDiT fused QKV is packed as [Q|K|V] along out_features. The
+    # default is to exclude (naive colwise cuts across packs). SD3 un-excludes
+    # at runtime and uses packed colwise. Leading dot is required:
+    # `img_attn.qkv`.endswith(`attn.qkv`) is True.
     ".attn.qkv", ".attn.proj",
     ".attn2.qkv", ".attn2.proj",
     # QwenImage uses nn.Sequential(SiLU, Linear) for modulation; the Linear is
