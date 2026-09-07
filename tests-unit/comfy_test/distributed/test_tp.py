@@ -238,6 +238,11 @@ class TestGetTPTargets:
             "visual_transformer_blocks",
         ]
 
+    def test_ernie_image_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Ernie = self._make_model_class("ErnieImageModel")
+        assert get_tp_targets(Ernie()) == ["layers"]
+
     def test_ace_step_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         ACE = self._make_model_class("ACEStepTransformer2DModel")
@@ -3267,6 +3272,86 @@ class TestKandinsky5TP:
         assert not isinstance(model.time_embeddings, ParallelLinear)
         assert isinstance(model.out_layer, nn.Linear)
         assert not isinstance(model.out_layer, ParallelLinear)
+
+
+class TestErnieImageTP:
+    """Ernie Image: unfused to_q; SwiGLU gate/up colwise; linear_fc2 rowwise; root adaLN stays."""
+
+    def test_unfused_qkv_and_swiglu(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim, ffn = 128, 8, 16, 256
+        assert "ErnieImageModel" in TP_HEAD_SPLIT_MODELS
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.to_k = nn.Linear(dim, dim, bias=False)
+                self.to_v = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(head_dim)
+                self.norm_k = nn.RMSNorm(head_dim)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(dim, ffn, bias=False)
+                self.up_proj = nn.Linear(dim, ffn, bias=False)
+                self.linear_fc2 = nn.Linear(ffn, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attention = Attention()
+                self.mlp = FeedForward()
+
+        class ErnieImageModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.x_embedder = nn.Linear(16, dim)
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.layers = nn.ModuleList([Block()])
+                self.final_linear = nn.Linear(dim, 16)
+
+        model = ErnieImageModel()
+        assert patcher.parallelize_model(model) is True
+        attn = model.layers[0].self_attention
+        assert isinstance(attn.to_q, ParallelLinear)
+        assert attn.to_q.mode == "colwise"
+        assert attn.to_k.mode == "colwise"
+        assert attn.to_v.mode == "colwise"
+        assert isinstance(attn.to_out[0], ParallelLinear)
+        assert attn.to_out[0].mode == "rowwise"
+        assert attn.heads == heads // 2
+        assert tuple(attn.norm_q.weight.shape) == (head_dim,)
+        mlp = model.layers[0].mlp
+        assert isinstance(mlp.gate_proj, ParallelLinear)
+        assert mlp.gate_proj.mode == "colwise"
+        assert mlp.up_proj.mode == "colwise"
+        assert isinstance(mlp.linear_fc2, ParallelLinear)
+        assert mlp.linear_fc2.mode == "rowwise"
+        assert isinstance(model.adaLN_modulation[1], nn.Linear)
+        assert not isinstance(model.adaLN_modulation[1], ParallelLinear)
+        assert isinstance(model.x_embedder, nn.Linear)
+        assert not isinstance(model.x_embedder, ParallelLinear)
+        assert isinstance(model.final_linear, nn.Linear)
+        assert not isinstance(model.final_linear, ParallelLinear)
+        assert model.num_heads == heads
 
 
 class TestPackedColwise:

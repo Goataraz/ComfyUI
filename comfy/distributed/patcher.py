@@ -100,6 +100,9 @@ TP_TARGETS = {
     # Kandinsky5: unfused to_query/to_key/to_value. Prefixes keep root
     # OutLayer / embeddings unreplicated. Modulation.out_layer stays.
     "Kandinsky5": ["text_transformer_blocks", "visual_transformer_blocks"],
+    # Ernie Image: unfused to_q. Prefix `layers` so x_embedder / text_proj /
+    # time embeddings / root adaLN / final_norm / final_linear stay.
+    "ErnieImageModel": ["layers"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -425,6 +428,7 @@ TP_HEAD_SPLIT_MODELS = {
     "NaDiT",
     "Hunyuan3Dv2",
     "Kandinsky5",
+    "ErnieImageModel",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -574,6 +578,7 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         or "SingleStreamDiT" in mro_names
         or "HunYuanDiTPlain" in mro_names
         or "CogVideoXTransformer3DModel" in mro_names
+        or "ErnieImageModel" in mro_names
     )
     synced = 0
     for name, module in model.named_modules():
