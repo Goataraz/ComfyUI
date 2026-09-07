@@ -88,6 +88,8 @@ TP_TARGETS = {
     # CogVideoX: unfused joint QKV. Prefix `blocks` so patch_embed /
     # time embeddings / proj_out stay. adaLN 6-way chunk excluded.
     "CogVideoXTransformer3DModel": ["blocks"],
+    # SeedVR2: packed MMModule QKV under blocks. AdaSingle is Parameters.
+    "NaDiT": ["blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -254,7 +256,8 @@ def _packed_colwise_count(name, mro_names, module=None):
     SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 / Ideogram /
     JoyImage / Lens / PixArt fused ``*qkv`` is ``[Q|K|V]`` (3). PixArt
     ``kv_linear`` is packed ``[K|V]`` (2). Audio DiT ``to_qkv`` is 3 or 5
-    equal packs, ``to_kv`` is 2 or 3, GLU ``ff.ff.0.proj`` is 2. Other
+    equal packs, ``to_kv`` is 2 or 3, GLU ``ff.ff.0.proj`` is 2. SeedVR
+    ``proj_qkv.{vid,txt,all}`` is packed ``[Q|K|V]`` (3). Other
     architectures keep pack_count=1.
     """
     if "MiniMaxH3Model" in mro_names:
@@ -273,6 +276,8 @@ def _packed_colwise_count(name, mro_names, module=None):
             return 2
         if name.endswith("ff.ff.0.proj"):
             return 2
+    if "NaDiT" in mro_names and ".proj_qkv." in name:
+        return 3
     if mro_names & _PACKED_QKV_FAMILIES:
         if (
             name.endswith(".qkv")
@@ -394,10 +399,11 @@ TP_HEAD_SPLIT_MODELS = {
     "MageFlowTransformer2DModel",
     "HunYuanDiTPlain",
     "CogVideoXTransformer3DModel",
+    "NaDiT",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
@@ -422,6 +428,10 @@ def _resolve_q_proj(module):
             continue
         if isinstance(q, nn.Sequential) and len(q) > 0:
             q = q[0]
+        # SeedVR MMModule: packed QKV Linear lives on .vid / .all
+        inner = getattr(q, "vid", None) or getattr(q, "all", None)
+        if inner is not None:
+            q = inner
         if isinstance(q, ParallelLinear) or _is_linear_layer(q):
             return q
     proc = getattr(module, "processor", None)
@@ -745,6 +755,13 @@ def parallelize_model(model, sd=None, prefix=""):
                     mode = "colwise"
                 elif "CogVideoXTransformer3DModel" in mro_names and name.endswith(".ff_proj"):
                     # GELU up-projection; generic `proj` would make this rowwise.
+                    mode = "colwise"
+                elif "NaDiT" in mro_names and (
+                    ".proj_qkv." in name
+                    or name.endswith(".proj_in")
+                    or name.endswith(".proj_in_gate")
+                ):
+                    # Packed QKV and MLP up-proj; generic `proj` is rowwise.
                     mode = "colwise"
                 elif (
                     any(k in name for k in ROWWISE_KEYWORDS)

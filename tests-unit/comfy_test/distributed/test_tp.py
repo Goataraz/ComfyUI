@@ -272,6 +272,11 @@ class TestGetTPTargets:
         Cog = self._make_model_class("CogVideoXTransformer3DModel")
         assert get_tp_targets(Cog()) == ["blocks"]
 
+    def test_nadit_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Na = self._make_model_class("NaDiT")
+        assert get_tp_targets(Na()) == ["blocks"]
+
     def test_pixart_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         PixArt = self._make_model_class("PixArtMS")
@@ -2883,6 +2888,82 @@ class TestCogVideoXTP:
         assert isinstance(model.proj_out, nn.Linear)
         assert not isinstance(model.proj_out, ParallelLinear)
         assert model.num_attention_heads == heads
+
+
+class TestNaDiTTP:
+    """SeedVR2 NaDiT: packed MMModule QKV (vid/txt), MLP proj_in colwise, ada is Parameter."""
+
+    def test_packed_qkv_mmmodule_and_mlp(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 64, 8, 8
+        assert "NaDiT" in TP_HEAD_SPLIT_MODELS
+
+        class MMLinear(nn.Module):
+            def __init__(self, in_f, out_f):
+                super().__init__()
+                self.vid = nn.Linear(in_f, out_f)
+                self.txt = nn.Linear(in_f, out_f)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj_in = nn.Linear(dim, dim * 4)
+                self.proj_out = nn.Linear(dim * 4, dim)
+
+        class MMMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.vid = MLP()
+                self.txt = MLP()
+
+        class NaMMAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.proj_qkv = MMLinear(dim, dim * 3)
+                self.proj_out = MMLinear(dim, dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = NaMMAttention()
+                self.mlp = MMMLP()
+
+        class NaDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+                self.txt_in = nn.Linear(32, dim)
+
+        model = NaDiT()
+        assert patcher.parallelize_model(model) is True
+        attn = model.blocks[0].attn
+        assert isinstance(attn.proj_qkv.vid, ParallelLinear)
+        assert attn.proj_qkv.vid.mode == "colwise"
+        assert attn.proj_qkv.vid.pack_count == 3
+        assert isinstance(attn.proj_qkv.txt, ParallelLinear)
+        assert attn.proj_qkv.txt.pack_count == 3
+        assert attn.proj_out.vid.mode == "rowwise"
+        assert attn.heads == heads // 2
+        mlp = model.blocks[0].mlp.vid
+        assert isinstance(mlp.proj_in, ParallelLinear)
+        assert mlp.proj_in.mode == "colwise"
+        assert mlp.proj_out.mode == "rowwise"
+        assert isinstance(model.txt_in, nn.Linear)
+        assert not isinstance(model.txt_in, ParallelLinear)
 
 
 class TestPackedColwise:
