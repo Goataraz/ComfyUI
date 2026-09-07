@@ -1001,9 +1001,71 @@ class TestTPParamNamesAndDeny:
             "sliced QK norms must be excluded from full state_dict loads"
         )
 
-    def test_causal_wan_denied(self):
-        from comfy.distributed.patcher import get_tp_targets
+    def test_causal_wan_inherits_wan_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         Wan = type("WanModel", (), {})
         Causal = type("CausalWanModel", (Wan,), {})
+        assert "CausalWanModel" not in TP_UNSUPPORTED
         assert get_tp_targets(Wan()) == ["blocks"]
-        assert get_tp_targets(Causal()) == []
+        assert get_tp_targets(Causal()) == ["blocks"]
+
+
+class TestCausalWanHeadBookkeeping:
+    """CausalWan KV cache uses outer/block num_heads. Head-split must sync them."""
+
+    def test_outer_and_block_heads_follow_attention_shard(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = 16
+
+        class CausalWanSelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class CausalWanAttentionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.self_attn = CausalWanSelfAttention()
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.blocks = nn.ModuleList([CausalWanAttentionBlock()])
+
+        class CausalWanModel(WanModel):
+            pass
+
+        model = CausalWanModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.blocks[0].self_attn.q, ParallelLinear)
+        local = n_heads // 2
+        assert model.blocks[0].self_attn.num_heads == local
+        assert model.blocks[0].num_heads == local, (
+            "block-level num_heads is used for cross-attn cache + optimized_attention"
+        )
+        assert model.num_heads == local, (
+            "CausalWanModel.init_kv_caches allocates [B, S, num_heads, head_dim]"
+        )

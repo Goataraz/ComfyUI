@@ -224,12 +224,8 @@ def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
 
 
 # Models whose MRO would match a supported parent but that are NOT safe
-# to shard yet (architecture-specific head bookkeeping outside Attention).
+# to shard yet (architecture-specific coupling outside Attention).
 TP_UNSUPPORTED = {
-    # CausalWanModel(WanModel) keeps outer/block-level num_heads for KV cache
-    # allocation; head-split only updates nested Attention modules → cache
-    # shape mismatch. Needs dedicated causal-Wan TP work.
-    "CausalWanModel",
     # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
     "HiDreamO1Transformer",
     # GeneralDIT is allowlisted with MLP-only TP (attn projections stay
@@ -237,6 +233,28 @@ TP_UNSUPPORTED = {
     # needs a dedicated strategy: CA K/V are Linear(context→inner) while FA
     # is Linear(query→inner), so naive colwise+head-split is unsafe.
 }
+
+
+def _sync_bookkeeping_heads(model, original_heads, local_heads):
+    """Divide leftover head-count bookkeeping that is not on Attention modules.
+
+    Head-split updates modules that own a colwise Q projection. CausalWan also
+    stores ``num_heads`` on the outer model (KV cache allocation) and on
+    ``WanAttentionBlock`` (cross-attn ``optimized_attention(..., heads=)``).
+    Those copies would stay at the full-model head count and blow cache /
+    attention shapes. Sync any remaining ``heads`` / ``n_heads`` / ``num_heads``
+    that still equal the pre-split value.
+    """
+    if original_heads == local_heads:
+        return 0
+    synced = 0
+    for module in model.modules():
+        for attr in _HEADS_ATTRS:
+            val = getattr(module, attr, None)
+            if val == original_heads:
+                setattr(module, attr, local_heads)
+                synced += 1
+    return synced
 
 
 def get_tp_targets(model):
@@ -422,10 +440,13 @@ def parallelize_model(model, sd=None, prefix=""):
             norms_sliced += _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh)
             head_overrides += 1
         if head_overrides:
+            original_heads = local_heads * mesh.world_size
+            synced = _sync_bookkeeping_heads(model, original_heads, local_heads)
             logging.info(
                 f"[TP] Head-split override ({model_class_name}): set heads={local_heads} "
                 f"(from {heads}) on {head_overrides} Attention modules"
                 + (f"; sliced {norms_sliced} full-dim QK norms" if norms_sliced else "")
+                + (f"; synced {synced} leftover head-count attrs" if synced else "")
             )
     return True
 

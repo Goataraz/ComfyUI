@@ -16,20 +16,26 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | Model | Class Name | TP Target Prefixes |
 |-------|-----------|-------------------|
 | Flux | `Flux` | `double_blocks`, `single_blocks` |
-| SD3 / MMDiT | `OpenAISignatureMMDITWrapper` | `blocks` |
-| Cosmos T2V/I2V | `GeneralDIT` | `blocks` |
+| SD3 / MMDiT | `OpenAISignatureMMDITWrapper` | `joint_blocks` |
+| Cosmos T2V/I2V | `GeneralDIT` | `blocks` (MLP-only; FA/CA stay replicated) |
 | Cosmos Predict2 / Anima | `MiniTrainDIT` | `blocks` |
 | HiDream Image | `HiDreamImageTransformer2DModel` | `double_stream_blocks`, `single_stream_blocks` |
 | QwenImage | `QwenImageTransformer2DModel` | `transformer_blocks` |
 | Qwen25 7B text encoder | `Llama2` | `layers` |
 | WanVideo (T2V/I2V + subclasses) | `WanModel` | `blocks` |
+| CausalWan | `CausalWanModel` | inherits `WanModel` (`blocks`) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, GeneralDIT, WanModel, HiDreamImageTransformer2DModel.
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel.
+GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
 Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos per-head norms stay replicated.
 
-HiDream O1 is **not** supported in this PR — its integrated Llama2 LLM receives input from non-TP visual/x_embedder components and needs a full-model TP strategy that shards the vision encoder too. The `HiDreamO1Transformer` class is intentionally not in `TP_TARGETS` and `get_tp_targets` returns `[]` for it.
+CausalWan keeps `num_heads` on the outer model (KV cache) and on `WanAttentionBlock` (cross-attn). After Attention modules are head-split, leftover `heads` / `n_heads` / `num_heads` that still equal the pre-split count are synced to the local shard.
 
-Model matching uses Python's MRO (Method Resolution Order) walk, so subclasses of supported models (e.g., `Anima(MiniTrainDIT)`) automatically inherit TP support.
+HiDream O1 is **not** supported — its integrated Llama2 LLM receives input from non-TP visual/x_embedder components and needs a full-model TP strategy that shards the vision encoder too. The `HiDreamO1Transformer` class is in `TP_UNSUPPORTED` and `get_tp_targets` returns `[]` for it.
+
+MiniMax H3 is **not** supported yet — fused `qkv_proj` (packed Q\|K\|V) and fused SwiGLU `fc1` (`ffn*2` then chunk) cannot be naively colwise-sharded.
+
+Model matching uses Python's MRO (Method Resolution Order) walk, so subclasses of supported models (e.g., `Anima(MiniTrainDIT)`, `CausalWanModel(WanModel)`) automatically inherit TP support.
 
 ## Launch Instructions
 
@@ -117,4 +123,5 @@ When any rank encounters an error during prompt execution:
 - **Dynamic batching**: All ranks must process the same prompt; batch parallelism is not combined with TP
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
 - **HiDream O1**: Disabled — needs full-model TP including vision encoder
-- **Cosmos TP exclusions**: GeneralDIT `blocks` has modulation/norm layers that may need architecture-specific exclusion analysis similar to Flux (not yet audited)
+- **MiniMax H3**: Disabled — fused QKV + fused SwiGLU need pack-aware sharding
+- **Cosmos GeneralDIT**: MLP-only. FA/CA Sequential projections (`attn.to_{q,k,v,out}.0`) stay replicated; `adaLN_modulation` is excluded globally.
