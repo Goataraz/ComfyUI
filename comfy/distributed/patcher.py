@@ -67,6 +67,7 @@ TP_TARGETS = {
     "MiniMaxH3Model": ["blocks"],  # packed QKV + packed SwiGLU
     "JoyImageTransformer3DModel": ["double_blocks"],  # packed img/txt_attn_qkv
     "LensTransformer2DModel": ["transformer_blocks"],  # packed img_qkv/txt_qkv
+    "PixDiT_T2I": ["patch_blocks", "pixel_blocks"],  # packed qkv_x/qkv_y + pixel qkv
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -159,6 +160,17 @@ MINIMAX_EXCLUDED_LAYER_NAMES = (
     "adaln_proj.linear",
 )
 
+# PixelDiT: 6-way / 3-way adaLN chunks stay full-width. compress/expand couple
+# P^2 pixel tokens to attn_dim and must not shard independently of qkv in_features.
+PIXELDiT_EXCLUDED_LAYER_NAMES = (
+    "adaLN_modulation_img.0",
+    "adaLN_modulation_txt.0",
+    "adaLN_modulation_msa",
+    "adaLN_modulation_mlp",
+    "compress_to_attn",
+    "expand_from_attn",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -176,6 +188,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "Ideogram4Transformer",
     "JoyImageTransformer3DModel",
     "LensTransformer2DModel",
+    "PixDiT_T2I",
 })
 
 
@@ -194,7 +207,12 @@ def _packed_colwise_count(name, mro_names):
             return 2
         return 1
     if mro_names & _PACKED_QKV_FAMILIES:
-        if name.endswith(".qkv") or name.endswith("_qkv"):
+        if (
+            name.endswith(".qkv")
+            or name.endswith("_qkv")
+            or name.endswith(".qkv_x")
+            or name.endswith(".qkv_y")
+        ):
             return 3
         return 1
     return 1
@@ -257,10 +275,11 @@ TP_HEAD_SPLIT_MODELS = {
     "LensTransformer2DModel",
     # Packed GQA qkv via pack_sizes; root n_heads stays (RoPE metadata).
     "NextDiT",
+    "PixDiT_T2I",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
@@ -373,8 +392,13 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     for name, module in model.named_modules():
         if name and not _name_under_targets(name, targets):
             continue
-        # Fused single-stream QKV+MLP stays replicated; do not divide heads.
-        if type(module).__name__ == "SingleStreamBlock":
+        # Attention modules with a sharded Q proj were already rewritten.
+        # Do not reuse another block's original_heads (PixelDiT mixes 24 and 16).
+        if isinstance(_resolve_q_proj(module), ParallelLinear):
+            continue
+        # Fused single-stream QKV+MLP stays replicated; PiTBlock.num_heads is
+        # RoPE metadata (attn_dim // num_heads) and must stay full.
+        if type(module).__name__ in ("SingleStreamBlock", "PiTBlock"):
             continue
         # Root Flux/Hunyuan/Chroma/SD3 num_heads and NextDiT.n_heads are
         # constructor / RoPE metadata — attention modules own the reshape.
@@ -489,6 +513,10 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(IDEOGRAM4_EXCLUDED_LAYER_NAMES)
     if "MiniMaxH3Model" in mro_names:
         excluded_names = excluded_names + tuple(MINIMAX_EXCLUDED_LAYER_NAMES)
+    if "PixDiT_T2I" in mro_names:
+        excluded_names = excluded_names + tuple(PIXELDiT_EXCLUDED_LAYER_NAMES)
+        # RotaryAttention.qkv / .proj collide with the SD3 `.attn.qkv` suffix.
+        excluded_names = tuple(e for e in excluded_names if e not in (".attn.qkv", ".attn.proj"))
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:

@@ -34,8 +34,9 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | MiniMax H3 | `MiniMaxH3Model` | `blocks` (packed QKV + packed SwiGLU, head-split) |
 | JoyImage | `JoyImageTransformer3DModel` | `double_blocks` (packed `img_attn_qkv` / `txt_attn_qkv`) |
 | Lens | `LensTransformer2DModel` | `transformer_blocks` (packed `img_qkv` / `txt_qkv`; unfused SwiGLU) |
+| PixelDiT | `PixDiT_T2I` | `patch_blocks`, `pixel_blocks` (packed `qkv_x`/`qkv_y` + pixel `qkv`) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens, NextDiT (`n_local_heads` / `n_local_kv_heads`; root `n_heads` stays).
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens, NextDiT (`n_local_heads` / `n_local_kv_heads`; root `n_heads` stays), PixelDiT (`MMDiTJointAttention` / `RotaryAttention`; `PiTBlock.num_heads` stays for RoPE dim).
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
 Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos / MiniMax per-head norms stay replicated.
 
@@ -143,4 +144,5 @@ When any rank encounters an error during prompt execution:
 - **Ideogram 4**: Packed colwise on `attention.qkv` (`[Q|K|V]`, `view(..., 3, heads, head_dim)`); `attention.o` is rowwise. `adaln_modulation` stays replicated.
 - **JoyImage**: Packed colwise on `img_attn_qkv` / `txt_attn_qkv`; `*_attn_proj` rowwise. MLP `net.0.proj` / `net.2` follow Qwen-style colwise/rowwise. `JoyImageModulate` is a Parameter table, not a Linear.
 - **Lens**: Packed colwise on `img_qkv` / `txt_qkv`; `to_out.0` / `to_add_out` rowwise. Unfused SwiGLU `w1`/`w3`/`w2`. `img_mod.1` / `txt_mod.1` stay (global 6-way chunk).
+- **PixelDiT**: Packed colwise on patch `attn.qkv_x` / `attn.qkv_y` and pixel `attn.qkv` (`[Q|K|V]`, `reshape(..., 3, heads, head_dim)`); `proj_*` / `attn.proj` rowwise. adaLN chunks, `compress_to_attn`, and `expand_from_attn` stay. `PiTBlock.num_heads` is RoPE metadata and is not divided. `PidNet` inherits via MRO (`lq_proj` is outside TP prefixes).
 - **Cosmos GeneralDIT**: MLP-only. FA/CA Sequential projections (`attn.to_{q,k,v,out}.0`) stay replicated; `adaLN_modulation` is excluded globally.

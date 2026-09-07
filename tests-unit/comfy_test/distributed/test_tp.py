@@ -248,6 +248,13 @@ class TestGetTPTargets:
         Lens = self._make_model_class("LensTransformer2DModel")
         assert get_tp_targets(Lens()) == ["transformer_blocks"]
 
+    def test_pixeldit_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Pix = self._make_model_class("PixDiT_T2I")
+        Pid = self._make_model_class("PidNet", (Pix,))
+        assert get_tp_targets(Pix()) == ["patch_blocks", "pixel_blocks"]
+        assert get_tp_targets(Pid()) == ["patch_blocks", "pixel_blocks"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -1862,6 +1869,112 @@ class TestLensTP:
         assert model.transformer_blocks[0].img_mlp.w1.mode == "colwise"
         assert model.transformer_blocks[0].img_mlp.w2.mode == "rowwise"
         assert model.transformer_blocks[0].attn.heads == 4
+
+
+class TestPixelDiTTP:
+    """PixelDiT: packed qkv_x/qkv_y + pixel RotaryAttention.qkv; adaLN/compress stay."""
+
+    def test_packed_joint_and_pixel_qkv(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, pixel_dim, attn_dim = 128, 16, 64
+        patch_heads, pixel_heads = 8, 4
+        assert "PixDiT_T2I" in TP_HEAD_SPLIT_MODELS
+
+        class MMDiTJointAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = patch_heads
+                self.head_dim = dim // patch_heads
+                self.qkv_x = nn.Linear(dim, dim * 3, bias=False)
+                self.qkv_y = nn.Linear(dim, dim * 3, bias=False)
+                self.proj_x = nn.Linear(dim, dim)
+                self.proj_y = nn.Linear(dim, dim)
+
+        class GateMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = nn.Linear(dim * 2, dim, bias=False)
+
+        class MMDiTBlockT2I(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = MMDiTJointAttention()
+                self.mlp_x = GateMLP()
+                self.mlp_y = GateMLP()
+                self.adaLN_modulation_img = nn.Sequential(nn.Linear(dim, 6 * dim))
+                self.adaLN_modulation_txt = nn.Sequential(nn.Linear(dim, 6 * dim))
+
+        class RotaryAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = pixel_heads
+                self.head_dim = attn_dim // pixel_heads
+                self.qkv = nn.Linear(attn_dim, attn_dim * 3, bias=False)
+                self.proj = nn.Linear(attn_dim, attn_dim)
+
+        class PiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = pixel_heads
+                self.attn_dim = attn_dim
+                self.compress_to_attn = nn.Linear(256 * pixel_dim, attn_dim)
+                self.expand_from_attn = nn.Linear(attn_dim, 256 * pixel_dim)
+                self.attn = RotaryAttention()
+                self.adaLN_modulation_msa = nn.Linear(dim, 3 * pixel_dim * 256)
+                self.adaLN_modulation_mlp = nn.Linear(dim, 3 * pixel_dim * 256)
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(pixel_dim, pixel_dim * 4)
+                self.mlp.fc2 = nn.Linear(pixel_dim * 4, pixel_dim)
+
+        class PixDiT_T2I(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_groups = patch_heads
+                self.pixel_num_groups = pixel_heads
+                self.patch_blocks = nn.ModuleList([MMDiTBlockT2I()])
+                self.pixel_blocks = nn.ModuleList([PiTBlock()])
+
+        model = PixDiT_T2I()
+        assert patcher.parallelize_model(model) is True
+        qkv_x = model.patch_blocks[0].attn.qkv_x
+        assert isinstance(qkv_x, ParallelLinear)
+        assert qkv_x.mode == "colwise"
+        assert qkv_x.pack_count == 3
+        assert isinstance(model.patch_blocks[0].attn.qkv_y, ParallelLinear)
+        assert model.patch_blocks[0].attn.qkv_y.pack_count == 3
+        assert model.patch_blocks[0].attn.proj_x.mode == "rowwise"
+        assert model.patch_blocks[0].attn.proj_y.mode == "rowwise"
+        assert isinstance(model.patch_blocks[0].adaLN_modulation_img[0], nn.Linear)
+        assert isinstance(model.patch_blocks[0].mlp_x.w1, ParallelLinear)
+        assert model.patch_blocks[0].mlp_x.w2.mode == "rowwise"
+        assert model.patch_blocks[0].attn.num_heads == patch_heads // 2
+        pixel_qkv = model.pixel_blocks[0].attn.qkv
+        assert isinstance(pixel_qkv, ParallelLinear)
+        assert pixel_qkv.pack_count == 3
+        assert model.pixel_blocks[0].attn.proj.mode == "rowwise"
+        assert isinstance(model.pixel_blocks[0].compress_to_attn, nn.Linear)
+        assert isinstance(model.pixel_blocks[0].expand_from_attn, nn.Linear)
+        assert isinstance(model.pixel_blocks[0].adaLN_modulation_msa, nn.Linear)
+        assert isinstance(model.pixel_blocks[0].mlp.fc1, ParallelLinear)
+        assert model.pixel_blocks[0].mlp.fc1.mode == "colwise"
+        assert model.pixel_blocks[0].mlp.fc2.mode == "rowwise"
+        assert model.pixel_blocks[0].attn.num_heads == pixel_heads // 2
+        assert model.pixel_blocks[0].num_heads == pixel_heads
+        assert model.num_groups == patch_heads
 
 
 class TestPackedColwise:
