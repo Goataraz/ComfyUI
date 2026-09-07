@@ -36,6 +36,33 @@ def is_tp_active() -> bool:
         return False
 
 
+def tp_runtime_info() -> dict:
+    """JSON-safe TP identity for /system_stats and the e2e generation gate.
+
+    Inactive / single-process runs report ``active=False`` and ``world_size=1``.
+    """
+    info = {"active": False, "world_size": 1, "rank": 0}
+    if not is_tp_active():
+        return info
+    try:
+        from comfy.distributed.mesh import get_mesh
+        mesh = get_mesh()
+        info["active"] = True
+        info["world_size"] = int(mesh.world_size)
+        info["rank"] = int(mesh.rank)
+        return info
+    except Exception:
+        pass
+    try:
+        import torch.distributed as dist
+        info["active"] = True
+        info["world_size"] = int(dist.get_world_size())
+        info["rank"] = int(dist.get_rank())
+    except Exception:
+        pass
+    return info
+
+
 def get_tp_param_names(model) -> set[str]:
     """Collect the set of fully-qualified parameter names belonging to
     TP-owned shards that must be skipped during full state-dict loads.

@@ -38,6 +38,7 @@ from comfy.cli_args import args
 from comfy.deploy_environment import get_deploy_environment
 import comfy.utils
 import comfy.model_management
+from comfy.distributed.utils import tp_runtime_info
 from comfy_api import feature_flags
 from comfy.comfy_api_env import get_environment_overrides
 import node_helpers
@@ -732,7 +733,8 @@ class PromptServer():
                     "deploy_environment": get_deploy_environment(),
                     "argv": sys.argv
                 },
-                "devices": device_entries
+                "devices": device_entries,
+                "tensor_parallel": tp_runtime_info(),
             }
             return web.json_response(system_stats)
 

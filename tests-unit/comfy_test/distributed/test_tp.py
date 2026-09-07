@@ -325,6 +325,25 @@ class TestIsTPActive:
             assert is_tp_active() is False
 
 
+class TestTPRuntimeInfo:
+    """JSON payload for /system_stats so the e2e gate can refuse non-TP servers."""
+
+    def test_inactive_defaults(self):
+        from comfy.distributed.utils import tp_runtime_info
+        assert tp_runtime_info() == {"active": False, "world_size": 1, "rank": 0}
+
+    def test_active_reads_mesh(self, monkeypatch):
+        from comfy.distributed import utils as tp_utils
+
+        class FakeMesh:
+            world_size = 2
+            rank = 1
+
+        monkeypatch.setattr(tp_utils, "is_tp_active", lambda: True)
+        monkeypatch.setattr("comfy.distributed.mesh.get_mesh", lambda: FakeMesh())
+        assert tp_utils.tp_runtime_info() == {"active": True, "world_size": 2, "rank": 1}
+
+
 # ---------------------------------------------------------------------------
 # QwenImage + Llama2 TP allowlist tests
 # ---------------------------------------------------------------------------

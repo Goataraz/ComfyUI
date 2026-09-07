@@ -90,6 +90,8 @@ torchrun --nproc_per_node=2 main.py \
 5. All ranks execute the same prompt; TP layers use all-reduce to synchronize
 6. Only rank 0 saves output images and sends WebSocket notifications
 
+`GET /system_stats` includes ``tensor_parallel: {active, world_size, rank}``. The e2e gate (`~/comfyui-beast/deploy/verify_tp_gen.py`) refuses servers with ``world_size < 2``. Legacy servers without that field still pass with a warning if argv contains ``--tensor-parallel``.
+
 ### Memory Requirements
 
 With 2 GPUs, each GPU holds approximately half of the parallelized layers plus the full non-parallelized components (embeddings, layer norms, VAE, text encoders). For example:
@@ -111,7 +113,7 @@ comfy/distributed/
   mesh.py            — DeviceMesh: NCCL process group and rank/device mapping
   parallel_linear.py — ParallelLinear: colwise/rowwise sharded linear layer
   patcher.py         — parallelize_model(), load_tp_shards(), TP_TARGETS
-  utils.py           — is_tp_active(), tp_aware_to(), get_tp_param_names()
+  utils.py           — is_tp_active(), tp_runtime_info(), tp_aware_to(), get_tp_param_names()
   null_server.py     — NullServer/NullProxy/NullQueue for worker ranks
 ```
 
@@ -121,6 +123,7 @@ Key integration points in core ComfyUI:
 - `comfy/model_patcher.py`: `is_tp_parallelized` guards and `tp_aware_to()`
 - `comfy/model_base.py`: Skip TP params during state dict loading
 - `comfy/cli_args.py`: `--tensor-parallel` flag
+- `GET /system_stats`: ``tensor_parallel`` identity (`active`, `world_size`, `rank`)
 
 ## Error Handling
 
