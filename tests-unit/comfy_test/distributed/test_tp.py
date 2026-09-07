@@ -196,6 +196,30 @@ class TestGetTPTargets:
         # Llama2 LLM can't be naively sharded (needs full-model TP strategy)
         assert get_tp_targets(HiDreamO1()) == []
 
+    def test_ltxv_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        LTXV = self._make_model_class("LTXVModel")
+        assert get_tp_targets(LTXV()) == ["transformer_blocks"]
+
+    def test_ltxav_inherits_ltxv(self):
+        from comfy.distributed.patcher import get_tp_targets
+        LTXV = self._make_model_class("LTXVModel")
+        LTXAV = self._make_model_class("LTXAVModel", (LTXV,))
+        assert get_tp_targets(LTXAV()) == ["transformer_blocks"]
+
+    def test_hunyuan_video_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        HY = self._make_model_class("HunyuanVideo")
+        HY15 = self._make_model_class("HunyuanVideo15", (HY,))
+        assert get_tp_targets(HY()) == ["double_blocks", "single_blocks"]
+        assert get_tp_targets(HY15()) == ["double_blocks", "single_blocks"]
+
+    def test_minimax_h3_denied(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
+        MiniMax = self._make_model_class("MiniMaxH3Model")
+        assert "MiniMaxH3Model" in TP_UNSUPPORTED
+        assert get_tp_targets(MiniMax()) == []
+
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
         """Subclass of a matched class should inherit the TP targets."""
@@ -1069,3 +1093,206 @@ class TestCausalWanHeadBookkeeping:
         assert model.num_heads == local, (
             "CausalWanModel.init_kv_caches allocates [B, S, num_heads, head_dim]"
         )
+
+
+class TestLTXVMLPOnly:
+    """LTXV MLP-only TP: RoPE + full-dim QK norms stay coupled to full heads."""
+
+    def test_targets_and_exclusions(self):
+        from comfy.distributed.patcher import (
+            get_tp_targets, TP_HEAD_SPLIT_MODELS, TP_TARGETS, LTXV_EXCLUDED_LAYER_NAMES,
+        )
+        LTXV = type("LTXVModel", (), {})
+        assert "LTXVModel" in TP_TARGETS
+        assert get_tp_targets(LTXV()) == ["transformer_blocks"]
+        assert "LTXVModel" not in TP_HEAD_SPLIT_MODELS
+        assert "to_q" in LTXV_EXCLUDED_LAYER_NAMES
+        assert "to_out.0" in LTXV_EXCLUDED_LAYER_NAMES
+        # Must stay LTX-scoped — QwenImage shards attn.to_q.
+        from comfy.distributed.patcher import EXCLUDED_LAYER_NAMES
+        assert "to_q" not in EXCLUDED_LAYER_NAMES
+
+    def test_mlp_only_sharding(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 128, 8, 16
+        inner_ff = dim * 4
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.dim_head = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=True)
+                self.to_k = nn.Linear(dim, dim, bias=True)
+                self.to_v = nn.Linear(dim, dim, bias=True)
+                self.to_out = nn.Sequential(nn.Linear(dim, dim), nn.Dropout(0.0))
+                self.q_norm = nn.RMSNorm(dim)
+                self.k_norm = nn.RMSNorm(dim)
+
+        class GELUApprox(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(dim, inner_ff)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(GELUApprox(), nn.Dropout(0.0), nn.Linear(inner_ff, dim))
+
+        class BasicTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn1 = CrossAttention()
+                self.attn2 = CrossAttention()
+                self.ff = FeedForward()
+
+        class LTXVModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = heads
+                self.inner_dim = dim
+                self.transformer_blocks = nn.ModuleList([BasicTransformerBlock()])
+
+        model = LTXVModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.transformer_blocks[0].attn1.to_q, nn.Linear)
+        assert isinstance(model.transformer_blocks[0].attn1.to_out[0], nn.Linear)
+        assert isinstance(model.transformer_blocks[0].ff.net[0].proj, ParallelLinear)
+        assert model.transformer_blocks[0].ff.net[0].proj.mode == "colwise"
+        assert isinstance(model.transformer_blocks[0].ff.net[2], ParallelLinear)
+        assert model.transformer_blocks[0].ff.net[2].mode == "rowwise"
+        assert model.transformer_blocks[0].attn1.heads == heads
+        assert model.num_attention_heads == heads
+        assert tuple(model.transformer_blocks[0].attn1.q_norm.weight.shape) == (dim,)
+
+    def test_ltxav_audio_ff_shards(self, monkeypatch):
+        """LTXAVModel inherits LTXV exclusions; audio_attn stays, audio_ff shards."""
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = 8
+                self.to_q = nn.Linear(dim, dim)
+                self.to_k = nn.Linear(dim, dim)
+                self.to_v = nn.Linear(dim, dim)
+                self.to_out = nn.Sequential(nn.Linear(dim, dim), nn.Dropout(0.0))
+
+        class GELUApprox(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(dim, dim * 4)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(GELUApprox(), nn.Dropout(0.0), nn.Linear(dim * 4, dim))
+
+        class BasicAVTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn1 = CrossAttention()
+                self.audio_attn1 = CrossAttention()
+                self.audio_to_video_attn = CrossAttention()
+                self.ff = FeedForward()
+                self.audio_ff = FeedForward()
+
+        class LTXVModel(nn.Module):
+            pass
+
+        class LTXAVModel(LTXVModel):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([BasicAVTransformerBlock()])
+
+        model = LTXAVModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.transformer_blocks[0].audio_attn1.to_q, nn.Linear)
+        assert isinstance(model.transformer_blocks[0].audio_to_video_attn.to_q, nn.Linear)
+        assert isinstance(model.transformer_blocks[0].audio_ff.net[0].proj, ParallelLinear)
+        assert model.transformer_blocks[0].audio_ff.net[0].proj.mode == "colwise"
+
+
+class TestHunyuanVideoTP:
+    """HunyuanVideo uses Flux Double/SingleStreamBlocks: fused QKV stays, MLP shards."""
+
+    def test_mlp_shards_fused_qkv_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_attn = SelfAttention()
+                self.txt_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+                self.txt_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+                self.img_mod = nn.Module()
+                self.img_mod.lin = nn.Linear(dim, 6 * dim)
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.linear1 = nn.Linear(dim, dim * 3 + dim * 4)
+                self.linear2 = nn.Linear(dim + dim * 4, dim)
+
+        class HunyuanVideo(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+                self.single_blocks = nn.ModuleList([SingleStreamBlock()])
+
+        model = HunyuanVideo()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.double_blocks[0].img_attn.qkv, nn.Linear)
+        assert isinstance(model.double_blocks[0].img_attn.proj, nn.Linear)
+        assert isinstance(model.single_blocks[0].linear1, nn.Linear)
+        assert isinstance(model.double_blocks[0].img_mlp[0], ParallelLinear)
+        assert model.double_blocks[0].img_mlp[0].mode == "colwise"
+        assert isinstance(model.double_blocks[0].img_mlp[2], ParallelLinear)
+        assert model.double_blocks[0].img_mlp[2].mode == "rowwise"
+        assert model.num_heads == 8

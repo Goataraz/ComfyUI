@@ -57,6 +57,8 @@ TP_TARGETS = {
     "QwenImageTransformer2DModel": ["transformer_blocks"],
     "Llama2": ["layers"],
     "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
+    "LTXVModel": ["transformer_blocks"],               # LTXV + LTXAV (MLP-only)
+    "HunyuanVideo": ["double_blocks", "single_blocks"],  # Flux-style fused QKV; MLP shards
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -118,6 +120,14 @@ EXCLUDED_LAYER_NAMES = [
 # `attn.to_q` (no `.0`) and must remain sharded.
 GENERALDIT_EXCLUDED_LAYER_NAMES = (
     "attn.to_q.0", "attn.to_k.0", "attn.to_v.0", "attn.to_out.0",
+)
+
+# LTXV / LTXAV-only. MUST NOT live in EXCLUDED_LAYER_NAMES:
+# QwenImage shards `attn.to_q` (no Sequential). LTX RoPE is built from
+# full `num_attention_heads` * `inner_dim`, so FA/CA stay replicated and
+# only GELU MLP (`ff.net.0.proj` / `ff.net.2`) shards.
+LTXV_EXCLUDED_LAYER_NAMES = (
+    "to_q", "to_k", "to_v", "to_out.0", "to_gate_logits",
 )
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -228,6 +238,9 @@ def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
 TP_UNSUPPORTED = {
     # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
     "HiDreamO1Transformer",
+    # MiniMax H3: fused attn.qkv_proj (packed Q|K|V) and fused SwiGLU
+    # mlp.fc1 (ffn*2 then chunk). Naive colwise cuts across packs.
+    "MiniMaxH3Model",
     # GeneralDIT is allowlisted with MLP-only TP (attn projections stay
     # replicated via GENERALDIT_EXCLUDED_LAYER_NAMES). Full FA/CA head-split
     # needs a dedicated strategy: CA K/V are Linear(context→inner) while FA
@@ -322,6 +335,8 @@ def parallelize_model(model, sd=None, prefix=""):
     excluded_names = tuple(EXCLUDED_LAYER_NAMES)
     if "GeneralDIT" in mro_names:
         excluded_names = excluded_names + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
+    if "LTXVModel" in mro_names:
+        excluded_names = excluded_names + tuple(LTXV_EXCLUDED_LAYER_NAMES)
 
     count = 0
     skipped_dims = 0
