@@ -263,6 +263,14 @@ class TestGetTPTargets:
         Next = self._make_model_class("NextDiT")
         assert get_tp_targets(Next()) == ["layers", "noise_refiner", "context_refiner", "siglip_refiner"]
 
+    def test_nextdit_pixel_space_inherits(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Next = self._make_model_class("NextDiT")
+        Pixel = self._make_model_class("NextDiTPixelSpace", (Next,))
+        assert get_tp_targets(Pixel()) == [
+            "layers", "noise_refiner", "context_refiner", "siglip_refiner",
+        ]
+
     def test_ideogram4_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         I4 = self._make_model_class("Ideogram4Transformer")
@@ -3474,6 +3482,49 @@ class TestTripoSplatTP:
         assert isinstance(model.out_layer, nn.Linear)
         assert not isinstance(model.out_layer, ParallelLinear)
         assert model.num_heads == heads
+
+    def test_mh_rmsnorm_gamma_reloaded_from_full_sd(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        heads, head_dim, dim = 8, 16, 128
+
+        class MultiHeadRMSNorm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gamma = nn.Parameter(torch.arange(heads * head_dim, dtype=torch.float32).reshape(heads, head_dim))
+
+        class RopeMultiHeadAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.q_norm = MultiHeadRMSNorm()
+                self.out = nn.Linear(dim, dim)
+
+        class LatentSeqMMFlowModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Module()])
+                self.blocks[0].attn = RopeMultiHeadAttention()
+
+        model = LatentSeqMMFlowModel()
+        full_gamma = model.blocks[0].attn.q_norm.gamma.data.clone()
+        assert patcher.parallelize_model(model) is True
+        torch.testing.assert_close(model.blocks[0].attn.q_norm.gamma.data, full_gamma[: heads // 2])
+        sd = {"blocks.0.attn.q_norm.gamma": full_gamma.clone()}
+        patcher.load_tp_shards(model, sd)
+        torch.testing.assert_close(model.blocks[0].attn.q_norm.gamma.data, full_gamma[: heads // 2])
 
 
 class TestPackedColwise:
