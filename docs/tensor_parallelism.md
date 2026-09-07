@@ -26,6 +26,9 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | CausalWan | `CausalWanModel` | inherits `WanModel` (`blocks`) |
 | LTXV / LTXAV | `LTXVModel` | `transformer_blocks` (MLP-only; FA/CA stay replicated) |
 | HunyuanVideo (+ I2V / 1.5 / Image 2.1) | `HunyuanVideo` | `double_blocks`, `single_blocks` (Flux-style fused QKV excluded; MLP shards) |
+| Chroma | `Chroma` | `double_blocks`, `single_blocks` |
+| ACE-Step 1.0 | `ACEStepTransformer2DModel` | `transformer_blocks` (head-split; conv FF unreplicated) |
+| ACE-Step 1.5 | `AceStepConditionGenerationModel` | `decoder.layers` (head-split + GQA; lyric encoder excluded) |
 
 Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel.
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
@@ -128,4 +131,7 @@ When any rank encounters an error during prompt execution:
 - **MiniMax H3**: Disabled — fused QKV + fused SwiGLU need pack-aware sharding
 - **LTXV / LTXAV**: MLP-only. RoPE is rebuilt from full `num_attention_heads` × `inner_dim`, so FA/CA (`to_q`/`to_k`/`to_v`/`to_out.0`) stay replicated.
 - **HunyuanVideo**: Same fused-QKV exclusions as Flux (`img_attn.qkv`, `linear1`/`linear2`); double-stream MLP shards.
+- **Chroma**: Same Flux-style MLP TP as HunyuanVideo (`double_blocks` / `single_blocks`).
+- **ACE-Step 1.0**: Head-split attention (`transformer_blocks`). FF is `GLUMBConv` and stays replicated.
+- **ACE-Step 1.5**: Head-split + GQA (`decoder.layers` only). Lyric/timbre encoders stay full-width. `num_kv_heads` is divided only under that prefix.
 - **Cosmos GeneralDIT**: MLP-only. FA/CA Sequential projections (`attn.to_{q,k,v,out}.0`) stay replicated; `adaLN_modulation` is excluded globally.

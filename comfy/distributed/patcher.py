@@ -59,6 +59,9 @@ TP_TARGETS = {
     "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
     "LTXVModel": ["transformer_blocks"],               # LTXV + LTXAV (MLP-only)
     "HunyuanVideo": ["double_blocks", "single_blocks"],  # Flux-style fused QKV; MLP shards
+    "Chroma": ["double_blocks", "single_blocks"],          # Flux blocks, not a Flux subclass
+    "ACEStepTransformer2DModel": ["transformer_blocks"],  # ACE-Step 1.0; FF is conv
+    "AceStepConditionGenerationModel": ["decoder.layers"],  # ACE-Step 1.5 GQA DiT
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -149,12 +152,15 @@ TP_HEAD_SPLIT_MODELS = {
     # GeneralDIT: attn excluded from TP (MLP-only); head-split not needed.
     "WanModel",
     "HiDreamImageTransformer2DModel",
+    "ACEStepTransformer2DModel",
+    "AceStepConditionGenerationModel",
 }
 
 # Attribute names used for the Q projection across architectures.
 _Q_PROJ_ATTRS = ("to_q", "q_proj", "q")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads")
+_KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads")
 _DIM_HEAD_ATTRS = ("dim_head", "head_dim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
 _FULL_DIM_QK_NORM_ATTRS = (
@@ -248,24 +254,55 @@ TP_UNSUPPORTED = {
 }
 
 
-def _sync_bookkeeping_heads(model, original_heads, local_heads):
+def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     """Divide leftover head-count bookkeeping that is not on Attention modules.
 
     Head-split updates modules that own a colwise Q projection. CausalWan also
     stores ``num_heads`` on the outer model (KV cache allocation) and on
     ``WanAttentionBlock`` (cross-attn ``optimized_attention(..., heads=)``).
     Those copies would stay at the full-model head count and blow cache /
-    attention shapes. Sync any remaining ``heads`` / ``n_heads`` / ``num_heads``
-    that still equal the pre-split value.
+    attention shapes. Sync remaining ``heads`` / ``n_heads`` / ``num_heads``
+    that still equal the pre-split value — on the root module and under TP
+    target prefixes only (ACE 1.5 lyric/timbre encoders stay full-width).
     """
     if original_heads == local_heads:
         return 0
     synced = 0
-    for module in model.modules():
+    for name, module in model.named_modules():
+        if name and not _name_under_targets(name, targets):
+            continue
         for attr in _HEADS_ATTRS:
             val = getattr(module, attr, None)
             if val == original_heads:
                 setattr(module, attr, local_heads)
+                synced += 1
+    return synced
+
+
+def _name_under_targets(name, targets):
+    if not name:
+        return False
+    return any(name == t or name.startswith(t + ".") for t in targets)
+
+
+def _sync_kv_heads(model, targets, world_size):
+    """Divide GQA KV head counts on modules inside TP target prefixes.
+
+    Head-split only rewrites attrs that match the Q-head count. ACE-Step 1.5
+    uses ``num_kv_heads != num_heads`` (16/8). ``k_proj`` is still colwise-
+    sharded, so KV bookkeeping must be divided independently — but only under
+    the TP prefixes, or lyric/timbre encoders outside the DiT get corrupted.
+    """
+    if world_size <= 1:
+        return 0
+    synced = 0
+    for name, module in model.named_modules():
+        if not _name_under_targets(name, targets):
+            continue
+        for attr in _KV_HEADS_ATTRS:
+            val = getattr(module, attr, None)
+            if isinstance(val, int) and val >= world_size and val % world_size == 0:
+                setattr(module, attr, val // world_size)
                 synced += 1
     return synced
 
@@ -438,7 +475,7 @@ def parallelize_model(model, sd=None, prefix=""):
                 continue
             heads_attr, heads = _get_attr_first(module, _HEADS_ATTRS)
             dim_attr, dim_head = _get_attr_first(module, _DIM_HEAD_ATTRS)
-            if not isinstance(heads, int) or not isinstance(dim_head, int):
+            if not isinstance(heads, int):
                 continue
             if heads % mesh.world_size != 0:
                 raise RuntimeError(
@@ -446,6 +483,13 @@ def parallelize_model(model, sd=None, prefix=""):
                     f"world_size={mesh.world_size}"
                 )
             local_heads = heads // mesh.world_size
+            if not isinstance(dim_head, int):
+                # ACE-Step 1.0 Attention stores heads but not dim_head.
+                # After colwise shard, local_out_features is the local slice.
+                local_out = getattr(q_proj, "local_out_features", None)
+                if local_heads == 0 or not isinstance(local_out, int) or local_out % local_heads != 0:
+                    continue
+                dim_head = local_out // local_heads
             if heads_attr is not None:
                 setattr(module, heads_attr, local_heads)
             # Also keep sibling aliases in sync (some modules expose both).
@@ -456,12 +500,14 @@ def parallelize_model(model, sd=None, prefix=""):
             head_overrides += 1
         if head_overrides:
             original_heads = local_heads * mesh.world_size
-            synced = _sync_bookkeeping_heads(model, original_heads, local_heads)
+            synced = _sync_bookkeeping_heads(model, original_heads, local_heads, targets)
+            kv_synced = _sync_kv_heads(model, targets, mesh.world_size)
             logging.info(
                 f"[TP] Head-split override ({model_class_name}): set heads={local_heads} "
                 f"(from {heads}) on {head_overrides} Attention modules"
                 + (f"; sliced {norms_sliced} full-dim QK norms" if norms_sliced else "")
                 + (f"; synced {synced} leftover head-count attrs" if synced else "")
+                + (f"; synced {kv_synced} GQA kv-head attrs" if kv_synced else "")
             )
     return True
 

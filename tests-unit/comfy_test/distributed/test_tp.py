@@ -214,6 +214,18 @@ class TestGetTPTargets:
         assert get_tp_targets(HY()) == ["double_blocks", "single_blocks"]
         assert get_tp_targets(HY15()) == ["double_blocks", "single_blocks"]
 
+    def test_chroma_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Chroma = self._make_model_class("Chroma")
+        assert get_tp_targets(Chroma()) == ["double_blocks", "single_blocks"]
+
+    def test_ace_step_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        ACE = self._make_model_class("ACEStepTransformer2DModel")
+        ACE15 = self._make_model_class("AceStepConditionGenerationModel")
+        assert get_tp_targets(ACE()) == ["transformer_blocks"]
+        assert get_tp_targets(ACE15()) == ["decoder.layers"]
+
     def test_minimax_h3_denied(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -1296,3 +1308,168 @@ class TestHunyuanVideoTP:
         assert isinstance(model.double_blocks[0].img_mlp[2], ParallelLinear)
         assert model.double_blocks[0].img_mlp[2].mode == "rowwise"
         assert model.num_heads == 8
+
+
+class TestChromaTP:
+    def test_chroma_mlp_shards_like_flux(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.img_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class Chroma(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+                self.single_blocks = nn.ModuleList([nn.Module()])
+
+        model = Chroma()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.double_blocks[0].img_attn.qkv, nn.Linear)
+        assert isinstance(model.double_blocks[0].img_mlp[0], ParallelLinear)
+        assert model.double_blocks[0].img_mlp[0].mode == "colwise"
+
+
+class TestACEStepTP:
+    """ACE-Step 1.0: head-split attention. ACE 1.5: GQA + unfused SwiGLU under decoder.layers."""
+
+    def test_ace10_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 128, 8, 16
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.to_q = nn.Linear(dim, dim)
+                self.to_k = nn.Linear(dim, dim)
+                self.to_v = nn.Linear(dim, dim)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim), nn.Dropout(0.0)])
+
+        class LinearTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+
+        class ACEStepTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = heads
+                self.transformer_blocks = nn.ModuleList([LinearTransformerBlock()])
+
+        model = ACEStepTransformer2DModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.transformer_blocks[0].attn.to_q, ParallelLinear)
+        assert model.transformer_blocks[0].attn.to_q.mode == "colwise"
+        assert isinstance(model.transformer_blocks[0].attn.to_out[0], ParallelLinear)
+        assert model.transformer_blocks[0].attn.to_out[0].mode == "rowwise"
+        assert model.transformer_blocks[0].attn.heads == heads // 2
+
+    def test_ace15_gqa_and_mlp_under_decoder(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        hidden, heads, kv_heads, head_dim = 128, 16, 8, 8
+        q_dim = heads * head_dim
+        kv_dim = kv_heads * head_dim
+        ffn = 256
+
+        class AceStepAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.num_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(hidden, q_dim, bias=False)
+                self.k_proj = nn.Linear(hidden, kv_dim, bias=False)
+                self.v_proj = nn.Linear(hidden, kv_dim, bias=False)
+                self.o_proj = nn.Linear(q_dim, hidden, bias=False)
+                self.q_norm = nn.RMSNorm(head_dim)
+                self.k_norm = nn.RMSNorm(head_dim)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(hidden, ffn, bias=False)
+                self.up_proj = nn.Linear(hidden, ffn, bias=False)
+                self.down_proj = nn.Linear(ffn, hidden, bias=False)
+
+        class AceStepDiTLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = AceStepAttention()
+                self.mlp = MLP()
+
+        class LyricEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.num_kv_heads = kv_heads
+                self.q_proj = nn.Linear(hidden, q_dim, bias=False)
+
+        class AceStepConditionGenerationModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = nn.Module()
+                self.decoder.layers = nn.ModuleList([AceStepDiTLayer()])
+                self.lyric_encoder = LyricEncoder()
+
+        model = AceStepConditionGenerationModel()
+        assert patcher.parallelize_model(model) is True
+        attn = model.decoder.layers[0].self_attn
+        assert isinstance(attn.q_proj, ParallelLinear)
+        assert attn.q_proj.mode == "colwise"
+        assert isinstance(attn.k_proj, ParallelLinear)
+        assert isinstance(attn.o_proj, ParallelLinear)
+        assert attn.o_proj.mode == "rowwise"
+        assert attn.num_heads == heads // 2
+        assert attn.num_kv_heads == kv_heads // 2, "GQA kv heads must follow the k_proj shard"
+        mlp = model.decoder.layers[0].mlp
+        assert isinstance(mlp.gate_proj, ParallelLinear) and mlp.gate_proj.mode == "colwise"
+        assert isinstance(mlp.down_proj, ParallelLinear) and mlp.down_proj.mode == "rowwise"
+        # Lyric encoder is outside decoder.layers — must stay full-width.
+        assert isinstance(model.lyric_encoder.q_proj, nn.Linear)
+        assert model.lyric_encoder.num_heads == heads
+        assert model.lyric_encoder.num_kv_heads == kv_heads
