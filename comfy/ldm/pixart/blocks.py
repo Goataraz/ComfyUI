@@ -40,6 +40,7 @@ class MultiHeadCrossAttention(nn.Module):
     def forward(self, x, cond, mask=None):
         # query/value: img tokens; key: condition; mask: if padding tokens
         B, N, C = x.shape
+        L = cond.shape[1]
 
         q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
@@ -71,7 +72,10 @@ class MultiHeadCrossAttention(nn.Module):
         #             attn_mask = torch.block_diag(attn_mask, attn_mask_template)
         #     x = optimized_attention(q, k, v, self.num_heads, mask=attn_mask, skip_reshape=True)
 
-        x = optimized_attention(q.view(B, -1, C), k.view(B, -1, C), v.view(B, -1, C), self.num_heads, mask=None)
+        x = optimized_attention(
+            q.reshape(B, N, -1), k.reshape(B, L, -1), v.reshape(B, L, -1),
+            self.num_heads, mask=None,
+        )
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -143,7 +147,9 @@ class AttentionKVCompress(nn.Module):
             H = W = int(N ** 0.5)
         else:
             H, W = HW
-        qkv = self.qkv(x).reshape(B, N, 3, C)
+        qkv = self.qkv(x)
+        inner = qkv.shape[-1] // 3
+        qkv = qkv.reshape(B, N, 3, inner)
 
         q, k, v = qkv.unbind(2)
         q = self.q_norm(q)
@@ -154,9 +160,9 @@ class AttentionKVCompress(nn.Module):
             k, new_N = self.downsample_2d(k, H, W, self.sr_ratio, sampling=self.sampling)
             v, new_N = self.downsample_2d(v, H, W, self.sr_ratio, sampling=self.sampling)
 
-        q = q.reshape(B, N, self.num_heads, C // self.num_heads)
-        k = k.reshape(B, new_N, self.num_heads, C // self.num_heads)
-        v = v.reshape(B, new_N, self.num_heads, C // self.num_heads)
+        q = q.reshape(B, N, self.num_heads, inner // self.num_heads)
+        k = k.reshape(B, new_N, self.num_heads, inner // self.num_heads)
+        v = v.reshape(B, new_N, self.num_heads, inner // self.num_heads)
 
         if mask is not None:
             raise NotImplementedError("Attn mask logic not added for self attention")
@@ -171,7 +177,7 @@ class AttentionKVCompress(nn.Module):
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v),)
         x = optimized_attention(q, k, v, self.num_heads, mask=None, skip_reshape=True)
 
-        x = x.view(B, N, C)
+        x = x.view(B, N, inner)
         x = self.proj(x)
         return x
 

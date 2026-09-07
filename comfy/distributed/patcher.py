@@ -70,6 +70,7 @@ TP_TARGETS = {
     "PixDiT_T2I": ["patch_blocks", "pixel_blocks"],  # packed qkv_x/qkv_y + pixel qkv
     "AsymmDiTJoint": ["blocks"],  # Mochi: packed qkv_x/qkv_y + packed SwiGLU w1
     "HunYuanDiT": ["blocks"],  # HunyuanDiT: packed Wqkv + packed kv_proj
+    "PixArtMS": ["blocks"],  # packed attn.qkv + packed kv_linear; KV-compress stays
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -205,6 +206,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "PixDiT_T2I",
     "AsymmDiTJoint",
     "HunYuanDiT",
+    "PixArtMS",
 })
 
 
@@ -213,8 +215,8 @@ def _packed_colwise_count(name, mro_names):
 
     MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
     SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 / Ideogram /
-    JoyImage / Lens fused ``*qkv`` is ``[Q|K|V]`` (3). Other architectures
-    keep pack_count=1.
+    JoyImage / Lens / PixArt fused ``*qkv`` is ``[Q|K|V]`` (3). PixArt
+    ``kv_linear`` is packed ``[K|V]`` (2). Other architectures keep pack_count=1.
     """
     if "MiniMaxH3Model" in mro_names:
         if name.endswith("qkv_proj"):
@@ -234,6 +236,8 @@ def _packed_colwise_count(name, mro_names):
         if "AsymmDiTJoint" in mro_names and name.endswith(".w1"):
             return 2
         if "HunYuanDiT" in mro_names and name.endswith(".kv_proj"):
+            return 2
+        if "PixArtMS" in mro_names and name.endswith(".kv_linear"):
             return 2
         return 1
     return 1
@@ -260,6 +264,27 @@ def _gqa_pack_sizes(name, module, parent, mro_names):
     if sum(sizes) != module.out_features:
         return None
     return sizes
+
+
+def _pixart_keep_replicated(name, parent, mro_names):
+    """PixArt KV-compress / full-dim QK-norm blocks stay unreplicated.
+
+    ``downsample_2d`` Conv2d and ``LayerNorm(dim)`` couple to the residual
+    width. Default Alpha/Sigma blocks use ``sr_ratio=1`` and Identity norms
+    and are safe to pack.
+    """
+    if "PixArtMS" not in mro_names or parent is None:
+        return False
+    if not (name.endswith(".qkv") or name.endswith(".attn.proj") or name.endswith(".attn.qkv")):
+        return False
+    if int(getattr(parent, "sr_ratio", 1) or 1) > 1:
+        return True
+    qn = getattr(parent, "q_norm", None)
+    if qn is not None and hasattr(qn, "weight") and qn.weight is not None and qn.weight.ndim == 1:
+        head_dim = int(getattr(parent, "head_dim", 0) or 0)
+        if head_dim and qn.weight.shape[0] != head_dim:
+            return True
+    return False
 
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -299,10 +324,11 @@ TP_HEAD_SPLIT_MODELS = {
     "PixDiT_T2I",
     "AsymmDiTJoint",
     "HunYuanDiT",
+    "PixArtMS",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
@@ -440,7 +466,12 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
             continue
         # Attention modules with a sharded Q proj were already rewritten.
         # Do not reuse another block's original_heads (PixelDiT mixes 24 and 16).
-        if isinstance(_resolve_q_proj(module), ParallelLinear):
+        q_proj = _resolve_q_proj(module)
+        if isinstance(q_proj, ParallelLinear):
+            continue
+        # Intentionally unreplicated attention (PixArt KV-compress / full-dim
+        # QK-norm) keeps full-width Q and must keep full num_heads.
+        if q_proj is not None and _is_linear_layer(q_proj):
             continue
         # Fused single-stream QKV+MLP stays replicated; PiTBlock.num_heads is
         # RoPE metadata (attn_dim // num_heads) and must stay full.
@@ -567,6 +598,11 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(MOCHI_EXCLUDED_LAYER_NAMES)
     if "HunYuanDiT" in mro_names:
         excluded_names = excluded_names + tuple(HYDIT_EXCLUDED_LAYER_NAMES)
+    if "PixArtMS" in mro_names:
+        # AttentionKVCompress.qkv / .proj collide with the SD3 `.attn.qkv` suffix.
+        excluded_names = tuple(
+            e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
+        )
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -626,6 +662,9 @@ def parallelize_model(model, sd=None, prefix=""):
                 parent = model
                 if parent_name:
                     parent = comfy.utils.get_attr(model, parent_name)
+
+                if _pixart_keep_replicated(name, parent, mro_names):
+                    continue
 
                 pack_sizes = _gqa_pack_sizes(name, module, parent, mro_names) if mode == "colwise" else None
                 is_nextdit_qkv = "NextDiT" in mro_names and name.endswith("attention.qkv")

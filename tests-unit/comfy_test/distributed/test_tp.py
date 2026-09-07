@@ -267,6 +267,13 @@ class TestGetTPTargets:
         assert get_tp_targets(HY()) == ["blocks"]
         assert get_tp_targets(Plain()) == []
 
+    def test_pixart_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        PixArt = self._make_model_class("PixArtMS")
+        Sigma = self._make_model_class("PixArtMSSigma", (PixArt,))
+        assert get_tp_targets(PixArt()) == ["blocks"]
+        assert get_tp_targets(Sigma()) == ["blocks"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -2135,6 +2142,154 @@ class TestHunYuanDiTTP:
         assert model.num_heads == heads
         assert isinstance(model.blocks[0].mlp.fc1, ParallelLinear)
         assert model.blocks[0].mlp.fc2.mode == "rowwise"
+
+
+class TestPixArtTP:
+    """PixArtMS: packed attn.qkv + packed kv_linear; KV-compress / QK-norm stay."""
+
+    def test_packed_qkv_and_keep_replicated_blocks(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 64, 8, 8
+        assert "PixArtMS" in TP_HEAD_SPLIT_MODELS
+
+        class AttentionKVCompress(nn.Module):
+            def __init__(self, sr_ratio=1, qk_norm=False):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.sr_ratio = sr_ratio
+                self.qkv = nn.Linear(dim, dim * 3, bias=True)
+                self.proj = nn.Linear(dim, dim)
+                self.q_norm = nn.LayerNorm(dim) if qk_norm else nn.Identity()
+
+        class MultiHeadCrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.q_linear = nn.Linear(dim, dim)
+                self.kv_linear = nn.Linear(dim, dim * 2)
+                self.proj = nn.Linear(dim, dim)
+
+        class PixArtMSBlock(nn.Module):
+            def __init__(self, sr_ratio=1, qk_norm=False):
+                super().__init__()
+                self.attn = AttentionKVCompress(sr_ratio=sr_ratio, qk_norm=qk_norm)
+                self.cross_attn = MultiHeadCrossAttention()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(dim, dim * 4)
+                self.mlp.fc2 = nn.Linear(dim * 4, dim)
+
+        class PixArtMS(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.blocks = nn.ModuleList([
+                    PixArtMSBlock(),
+                    PixArtMSBlock(sr_ratio=2),
+                    PixArtMSBlock(qk_norm=True),
+                ])
+
+        model = PixArtMS()
+        assert patcher.parallelize_model(model) is True
+
+        packed = model.blocks[0]
+        qkv = packed.attn.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.pack_count == 3
+        assert packed.attn.proj.mode == "rowwise"
+        kv = packed.cross_attn.kv_linear
+        assert isinstance(kv, ParallelLinear)
+        assert kv.pack_count == 2
+        assert isinstance(packed.cross_attn.q_linear, ParallelLinear)
+        assert packed.cross_attn.q_linear.mode == "colwise"
+        assert packed.cross_attn.proj.mode == "rowwise"
+        assert isinstance(packed.mlp.fc1, ParallelLinear)
+        assert packed.mlp.fc2.mode == "rowwise"
+        assert packed.attn.num_heads == heads // 2
+        assert packed.cross_attn.num_heads == heads // 2
+
+        compressed = model.blocks[1]
+        assert isinstance(compressed.attn.qkv, nn.Linear)
+        assert not isinstance(compressed.attn.qkv, ParallelLinear)
+        assert isinstance(compressed.attn.proj, nn.Linear)
+        assert not isinstance(compressed.attn.proj, ParallelLinear)
+        assert compressed.attn.num_heads == heads
+        assert isinstance(compressed.cross_attn.kv_linear, ParallelLinear)
+        assert compressed.cross_attn.num_heads == heads // 2
+
+        qknorm = model.blocks[2]
+        assert isinstance(qknorm.attn.qkv, nn.Linear)
+        assert not isinstance(qknorm.attn.qkv, ParallelLinear)
+        assert qknorm.attn.num_heads == heads
+
+        assert isinstance(model.t_block[1], nn.Linear)
+        assert not isinstance(model.t_block[1], ParallelLinear)
+        assert model.num_heads == heads
+
+    def test_self_attn_reshape_uses_qkv_width_not_residual(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        import comfy.ldm.pixart.blocks as pixart_blocks
+        from comfy.ldm.pixart.blocks import AttentionKVCompress
+
+        def fake_attn(q, k, v, heads, mask=None, skip_reshape=False):
+            # Packed local inner is dim/2. skip_reshape inputs are (B, H, N, D).
+            B = q.shape[0]
+            if skip_reshape:
+                heads_dim, seq, head_dim = q.shape[1], q.shape[2], q.shape[3]
+                return torch.zeros(B, seq, heads_dim * head_dim)
+            return torch.zeros_like(q)
+
+        monkeypatch.setattr(pixart_blocks, "optimized_attention", fake_attn)
+
+        dim, heads = 32, 4
+        attn = AttentionKVCompress(
+            dim=dim, num_heads=heads, sr_ratio=1, qk_norm=False, operations=nn,
+        )
+        # Simulate packed colwise (ws=2): local QKV is 3 * (dim/2), local heads.
+        attn.qkv = nn.Linear(dim, dim * 3 // 2, bias=True)
+        attn.num_heads = heads // 2
+        attn.proj = nn.Linear(dim // 2, dim, bias=True)
+        x = torch.randn(2, 16, dim)
+        out = attn(x, HW=(4, 4))
+        assert out.shape == (2, 16, dim)
+
+    def test_cross_attn_reshape_uses_local_inner(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        import comfy.ldm.pixart.blocks as pixart_blocks
+        from comfy.ldm.pixart.blocks import MultiHeadCrossAttention
+
+        def fake_attn(q, k, v, heads, mask=None, skip_reshape=False):
+            return torch.zeros_like(q)
+
+        monkeypatch.setattr(pixart_blocks, "optimized_attention", fake_attn)
+
+        dim, heads = 32, 4
+        ca = MultiHeadCrossAttention(d_model=dim, num_heads=heads, operations=nn)
+        ca.q_linear = nn.Linear(dim, dim // 2)
+        ca.kv_linear = nn.Linear(dim, dim)
+        ca.num_heads = heads // 2
+        ca.head_dim = dim // heads
+        ca.proj = nn.Linear(dim // 2, dim)
+        x = torch.randn(2, 16, dim)
+        cond = torch.randn(2, 8, dim)
+        out = ca(x, cond)
+        assert out.shape == (2, 16, dim)
 
 
 class TestPackedColwise:
