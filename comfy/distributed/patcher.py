@@ -85,6 +85,9 @@ TP_TARGETS = {
     # Hunyuan3D: unfused QKV (not hydit's packed Wqkv). Last 6 layers are
     # MoE — experts/gate/shared FF stay replicated.
     "HunYuanDiTPlain": ["blocks"],
+    # CogVideoX: unfused joint QKV. Prefix `blocks` so patch_embed /
+    # time embeddings / proj_out stay. adaLN 6-way chunk excluded.
+    "CogVideoXTransformer3DModel": ["blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -212,6 +215,12 @@ BOOGU_EXCLUDED_LAYER_NAMES = (
     "norm1.linear",
     "norm2.linear",
     "norm3.linear",
+)
+
+# CogVideoX: LayerNormZero.linear is a 6-way chunk on full hidden.
+COGVIDEO_EXCLUDED_LAYER_NAMES = (
+    "norm1.linear",
+    "norm2.linear",
 )
 
 
@@ -384,6 +393,7 @@ TP_HEAD_SPLIT_MODELS = {
     "SingleStreamDiT",
     "MageFlowTransformer2DModel",
     "HunYuanDiTPlain",
+    "CogVideoXTransformer3DModel",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -528,6 +538,7 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         or "NextDiT" in mro_names
         or "SingleStreamDiT" in mro_names
         or "HunYuanDiTPlain" in mro_names
+        or "CogVideoXTransformer3DModel" in mro_names
     )
     synced = 0
     for name, module in model.named_modules():
@@ -547,8 +558,9 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         if type(module).__name__ in ("SingleStreamBlock", "PiTBlock"):
             continue
         # Root Flux/Hunyuan/Chroma/SD3 num_heads, NextDiT.n_heads,
-        # Krea2 SingleStreamDiT.heads, and HunYuanDiTPlain.num_heads are
-        # constructor / RoPE metadata — attention modules own the reshape.
+        # Krea2 SingleStreamDiT.heads, HunYuanDiTPlain.num_heads, and
+        # CogVideoX num_attention_heads are constructor / RoPE metadata —
+        # attention modules own the reshape.
         if skip_root_heads and not name:
             continue
         for attr in _HEADS_ATTRS:
@@ -681,6 +693,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(AUDIO_EXCLUDED_LAYER_NAMES)
     if "BooguTransformer2DModel" in mro_names:
         excluded_names = excluded_names + tuple(BOOGU_EXCLUDED_LAYER_NAMES)
+    if "CogVideoXTransformer3DModel" in mro_names:
+        excluded_names = excluded_names + tuple(COGVIDEO_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -729,6 +743,9 @@ def parallelize_model(model, sd=None, prefix=""):
                 elif name.endswith((".ffn.0", ".layer1")):
                     # Wan MLP up-projection / Cosmos GPT2FeedForward.layer1
                     mode = "colwise"
+                elif "CogVideoXTransformer3DModel" in mro_names and name.endswith(".ff_proj"):
+                    # GELU up-projection; generic `proj` would make this rowwise.
+                    mode = "colwise"
                 elif (
                     any(k in name for k in ROWWISE_KEYWORDS)
                     or name.endswith(".net.2")
@@ -736,6 +753,13 @@ def parallelize_model(model, sd=None, prefix=""):
                     or name.endswith(".wo")  # Krea2 Attention.wo (not Wan `.o`)
                     or name.endswith(".layer2")  # Cosmos GPT2FeedForward.layer2
                     or name.endswith(".attention.out")  # NextDiT JointAttention.out
+                    or (
+                        "CogVideoXTransformer3DModel" in mro_names
+                        and (
+                            name.endswith(".attn_out")
+                            or name.endswith(".ff_out")
+                        )
+                    )
                     or (
                         "AudioDiffusionTransformer" in mro_names
                         and name.endswith("ff.ff.2")

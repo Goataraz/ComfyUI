@@ -267,6 +267,11 @@ class TestGetTPTargets:
         assert get_tp_targets(HY()) == ["blocks"]
         assert get_tp_targets(Plain()) == ["blocks"]
 
+    def test_cogvideox_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Cog = self._make_model_class("CogVideoXTransformer3DModel")
+        assert get_tp_targets(Cog()) == ["blocks"]
+
     def test_pixart_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         PixArt = self._make_model_class("PixArtMS")
@@ -2814,6 +2819,70 @@ class TestHunYuanDiTPlainTP:
         assert isinstance(model.x_embedder, nn.Linear)
         assert not isinstance(model.x_embedder, ParallelLinear)
         assert model.num_heads == heads
+
+
+class TestCogVideoXTP:
+    """CogVideoX: unfused joint QKV, attn_out/ff_out rowwise, adaLN 6-way chunk stays."""
+
+    def test_unfused_qkv_and_ff_modes(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 64, 8, 8
+        assert "CogVideoXTransformer3DModel" in TP_HEAD_SPLIT_MODELS
+
+        class CogVideoXBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim)
+                self.k = nn.Linear(dim, dim)
+                self.v = nn.Linear(dim, dim)
+                self.attn_out = nn.Linear(dim, dim)
+                self.ff_proj = nn.Linear(dim, dim * 4)
+                self.ff_out = nn.Linear(dim * 4, dim)
+                self.norm1 = nn.Module()
+                self.norm1.linear = nn.Linear(32, 6 * dim)
+                self.norm2 = nn.Module()
+                self.norm2.linear = nn.Linear(32, 6 * dim)
+
+        class CogVideoXTransformer3DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = heads
+                self.blocks = nn.ModuleList([CogVideoXBlock()])
+                self.proj_out = nn.Linear(dim, 16)
+
+        model = CogVideoXTransformer3DModel()
+        assert patcher.parallelize_model(model) is True
+        block = model.blocks[0]
+        assert isinstance(block.q, ParallelLinear)
+        assert block.q.mode == "colwise"
+        assert isinstance(block.k, ParallelLinear)
+        assert isinstance(block.v, ParallelLinear)
+        assert block.attn_out.mode == "rowwise"
+        assert isinstance(block.ff_proj, ParallelLinear)
+        assert block.ff_proj.mode == "colwise"
+        assert block.ff_out.mode == "rowwise"
+        assert block.num_heads == heads // 2
+        assert isinstance(block.norm1.linear, nn.Linear)
+        assert not isinstance(block.norm1.linear, ParallelLinear)
+        assert isinstance(block.norm2.linear, nn.Linear)
+        assert not isinstance(block.norm2.linear, ParallelLinear)
+        assert isinstance(model.proj_out, nn.Linear)
+        assert not isinstance(model.proj_out, ParallelLinear)
+        assert model.num_attention_heads == heads
 
 
 class TestPackedColwise:
