@@ -58,7 +58,7 @@ TP_TARGETS = {
     "Llama2": ["layers"],
     "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
     "LTXVModel": ["transformer_blocks"],               # LTXV + LTXAV (MLP-only)
-    "HunyuanVideo": ["double_blocks", "single_blocks"],  # Flux-style fused QKV; MLP shards
+    "HunyuanVideo": ["double_blocks", "single_blocks"],  # packed double-stream QKV; linear1 stays
     "Chroma": ["double_blocks", "single_blocks"],          # Flux blocks, not a Flux subclass
     "ACEStepTransformer2DModel": ["transformer_blocks"],  # ACE-Step 1.0; FF is conv
     "AceStepConditionGenerationModel": ["decoder.layers"],  # ACE-Step 1.5 GQA DiT
@@ -86,10 +86,12 @@ COLWISE_KEYWORDS = [
 
 # Layer names that must NOT be sharded. These are excluded because:
 # - Modulation layers (chunk() with full dim): modulation.lin, img_mod.lin, txt_mod.lin
-# - Fused QKV+MLP layers (torch.split with full dim): linear1, linear2
+# - Fused QKV+MLP layers (torch.split with full dim, unequal packs): linear1, linear2
 # - Fused QKV projections (reshape with 3*num_heads): img_attn.qkv, txt_attn.qkv
-# - Coupled attention output projections (receive full-dim input from excluded qkv):
-#   img_attn.proj, txt_attn.proj — must stay unsharded when qkv is excluded
+#   Flux / HunyuanVideo / Chroma un-exclude these at runtime and shard with
+#   packed colwise (pack_count=3). SD3 attn.qkv stays excluded (see below).
+# - Coupled attention output projections: img_attn.proj, txt_attn.proj — stay
+#   unsharded when qkv is excluded; become rowwise when qkv is packed-colwise.
 EXCLUDED_LAYER_NAMES = [
     "linear1", "linear2",
     "modulation.lin", "img_mod.lin", "txt_mod.lin",
@@ -98,8 +100,9 @@ EXCLUDED_LAYER_NAMES = [
     # SD3 MMDiT fused QKV is packed as [Q|K|V] along out_features. Naive
     # colwise sharding cuts across the Q/K/V packs instead of heads — exclude
     # and leave attention replicated; MLP (fc1/fc2) still shards.
-    "attn.qkv", "attn.proj",
-    "attn2.qkv", "attn2.proj",
+    # Leading dot is required: `img_attn.qkv`.endswith(`attn.qkv`) is True.
+    ".attn.qkv", ".attn.proj",
+    ".attn2.qkv", ".attn2.proj",
     # QwenImage uses nn.Sequential(SiLU, Linear) for modulation; the Linear is
     # at index 1 (not a ".lin" suffix). Output is 6*dim, chunked 2-way for
     # (shift, scale, gate).
@@ -154,18 +157,31 @@ MINIMAX_EXCLUDED_LAYER_NAMES = (
 )
 
 
+# Flux-family double-stream attention: equal-width packed [Q|K|V].
+# Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
+_DOUBLE_STREAM_QKV_FAMILIES = frozenset({"Flux", "HunyuanVideo", "Chroma"})
+_DOUBLE_STREAM_ATTN_TP = (
+    "img_attn.qkv", "txt_attn.qkv", "img_attn.proj", "txt_attn.proj",
+)
+
+
 def _packed_colwise_count(name, mro_names):
     """Equal-sized output packs that must be sharded independently.
 
     MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
-    SwiGLU ``[gate|up]`` (2). Other architectures keep pack_count=1.
+    SwiGLU ``[gate|up]`` (2). Flux / HunyuanVideo / Chroma double-stream
+    ``*.qkv`` is ``[Q|K|V]`` (3). Other architectures keep pack_count=1.
     """
-    if "MiniMaxH3Model" not in mro_names:
+    if "MiniMaxH3Model" in mro_names:
+        if name.endswith("qkv_proj"):
+            return 3
+        if name.endswith("fc1"):
+            return 2
         return 1
-    if name.endswith("qkv_proj"):
-        return 3
-    if name.endswith("fc1"):
-        return 2
+    if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
+        if name.endswith(".qkv"):
+            return 3
+        return 1
     return 1
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -190,10 +206,15 @@ TP_HEAD_SPLIT_MODELS = {
     "ACEStepTransformer2DModel",
     "AceStepConditionGenerationModel",
     "MiniMaxH3Model",
+    # Double-stream packed QKV. SingleStreamBlock.num_heads is skipped in
+    # bookkeeping because fused linear1 stays full-width.
+    "Flux",
+    "HunyuanVideo",
+    "Chroma",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads")
@@ -300,9 +321,19 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     """
     if original_heads == local_heads:
         return 0
+    flux_family = any(
+        cls.__name__ in _DOUBLE_STREAM_QKV_FAMILIES for cls in type(model).__mro__
+    )
     synced = 0
     for name, module in model.named_modules():
         if name and not _name_under_targets(name, targets):
+            continue
+        # Fused single-stream QKV+MLP stays replicated; do not divide heads.
+        if type(module).__name__ == "SingleStreamBlock":
+            continue
+        # Root Flux/Hunyuan/Chroma num_heads is constructor metadata (PE dim,
+        # TokenRefiner) — blocks own the attention reshape.
+        if flux_family and not name:
             continue
         for attr in _HEADS_ATTRS:
             val = getattr(module, attr, None)
@@ -413,6 +444,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(IDEOGRAM4_EXCLUDED_LAYER_NAMES)
     if "MiniMaxH3Model" in mro_names:
         excluded_names = excluded_names + tuple(MINIMAX_EXCLUDED_LAYER_NAMES)
+    if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
+        excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
 
     count = 0
     skipped_dims = 0

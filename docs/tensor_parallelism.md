@@ -15,7 +15,7 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 
 | Model | Class Name | TP Target Prefixes |
 |-------|-----------|-------------------|
-| Flux | `Flux` | `double_blocks`, `single_blocks` |
+| Flux | `Flux` | `double_blocks`, `single_blocks` (packed double-stream QKV; fused `linear1` stays) |
 | SD3 / MMDiT | `OpenAISignatureMMDITWrapper` | `joint_blocks` |
 | Cosmos T2V/I2V | `GeneralDIT` | `blocks` (MLP-only; FA/CA stay replicated) |
 | Cosmos Predict2 / Anima | `MiniTrainDIT` | `blocks` |
@@ -25,15 +25,15 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | WanVideo (T2V/I2V + subclasses) | `WanModel` | `blocks` |
 | CausalWan | `CausalWanModel` | inherits `WanModel` (`blocks`) |
 | LTXV / LTXAV | `LTXVModel` | `transformer_blocks` (MLP-only; FA/CA stay replicated) |
-| HunyuanVideo (+ I2V / 1.5 / Image 2.1) | `HunyuanVideo` | `double_blocks`, `single_blocks` (Flux-style fused QKV excluded; MLP shards) |
-| Chroma | `Chroma` | `double_blocks`, `single_blocks` |
+| HunyuanVideo (+ I2V / 1.5 / Image 2.1) | `HunyuanVideo` | `double_blocks`, `single_blocks` (packed double-stream QKV; fused `linear1` stays) |
+| Chroma | `Chroma` | `double_blocks`, `single_blocks` (same packed QKV as Flux) |
 | ACE-Step 1.0 | `ACEStepTransformer2DModel` | `transformer_blocks` (head-split; conv FF unreplicated) |
 | ACE-Step 1.5 | `AceStepConditionGenerationModel` | `decoder.layers` (head-split + GQA; lyric encoder excluded) |
 | Lumina NextDiT / Z-Image | `NextDiT` | `layers`, `noise_refiner`, `context_refiner`, `siglip_refiner` (MLP-only) |
 | Ideogram 4 | `Ideogram4Transformer` | `layers` (MLP-only) |
 | MiniMax H3 | `MiniMaxH3Model` | `blocks` (packed QKV + packed SwiGLU, head-split) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3.
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated).
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
 Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos / MiniMax per-head norms stay replicated.
 
@@ -132,9 +132,8 @@ When any rank encounters an error during prompt execution:
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
 - **HiDream O1**: Disabled — needs full-model TP including vision encoder
 - **MiniMax H3**: Packed colwise. `qkv_proj` shards each of `[Q|K|V]` by heads; `fc1` shards each of `[gate|up]`; `fc2`/`out_proj` are rowwise. adaLN stays replicated.
+- **Flux / HunyuanVideo / Chroma**: Packed colwise on double-stream `img_attn.qkv` / `txt_attn.qkv` (`[Q|K|V]`); `*.proj` is rowwise. Single-stream fused `linear1`/`linear2` stay replicated (QKV+MLP unequal packs). `SingleStreamBlock.num_heads` is not divided. Hunyuan `txt_in` TokenRefiner is outside TP prefixes and stays full-width.
 - **LTXV / LTXAV**: MLP-only. RoPE is rebuilt from full `num_attention_heads` × `inner_dim`, so FA/CA (`to_q`/`to_k`/`to_v`/`to_out.0`) stay replicated.
-- **HunyuanVideo**: Same fused-QKV exclusions as Flux (`img_attn.qkv`, `linear1`/`linear2`); double-stream MLP shards.
-- **Chroma**: Same Flux-style MLP TP as HunyuanVideo (`double_blocks` / `single_blocks`).
 - **ACE-Step 1.0**: Head-split attention (`transformer_blocks`). FF is `GLUMBConv` and stays replicated.
 - **ACE-Step 1.5**: Head-split + GQA (`decoder.layers` only). Lyric/timbre encoders stay full-width. `num_kv_heads` is divided only under that prefix.
 - **Lumina NextDiT / Z-Image**: MLP-only. Fused GQA `attention.qkv` stays replicated; unfused SwiGLU `w1`/`w3`/`w2` shards.

@@ -697,8 +697,8 @@ class TestSD3JointBlocksTP:
         from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES
         SD3 = type("OpenAISignatureMMDITWrapper", (), {})
         assert get_tp_targets(SD3()) == ["joint_blocks"]
-        assert "attn.qkv" in EXCLUDED_LAYER_NAMES
-        assert "attn.proj" in EXCLUDED_LAYER_NAMES
+        assert ".attn.qkv" in EXCLUDED_LAYER_NAMES
+        assert ".attn.proj" in EXCLUDED_LAYER_NAMES
 
     def test_mlp_only_sharding(self, monkeypatch):
         import torch.nn as nn
@@ -1260,10 +1260,78 @@ class TestLTXVMLPOnly:
         assert model.transformer_blocks[0].audio_ff.net[0].proj.mode == "colwise"
 
 
-class TestHunyuanVideoTP:
-    """HunyuanVideo uses Flux Double/SingleStreamBlocks: fused QKV stays, MLP shards."""
+class TestFluxDoubleStreamTP:
+    """Flux: packed double-stream [Q|K|V]; fused single-stream linear1 stays excluded."""
 
-    def test_mlp_shards_fused_qkv_stays(self, monkeypatch):
+    def test_packed_qkv_and_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        assert "Flux" in TP_HEAD_SPLIT_MODELS
+        assert "HunyuanVideo" in TP_HEAD_SPLIT_MODELS
+        assert "Chroma" in TP_HEAD_SPLIT_MODELS
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_attn = SelfAttention()
+                self.txt_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+                self.txt_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.linear1 = nn.Linear(dim, dim * 3 + dim * 4)
+                self.linear2 = nn.Linear(dim + dim * 4, dim)
+
+        class Flux(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+                self.single_blocks = nn.ModuleList([SingleStreamBlock()])
+
+        model = Flux()
+        assert patcher.parallelize_model(model) is True
+        qkv = model.double_blocks[0].img_attn.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert qkv.local_out_features == 3 * (dim // 2)
+        assert isinstance(model.double_blocks[0].img_attn.proj, ParallelLinear)
+        assert model.double_blocks[0].img_attn.proj.mode == "rowwise"
+        assert isinstance(model.single_blocks[0].linear1, nn.Linear)
+        assert model.double_blocks[0].img_attn.num_heads == 4
+        assert model.double_blocks[0].num_heads == 4
+        assert model.single_blocks[0].num_heads == 8
+        assert model.num_heads == 8
+
+
+class TestHunyuanVideoTP:
+    """HunyuanVideo: packed double-stream QKV; single-stream linear1 stays; MLP shards."""
+
+    def test_double_stream_packed_qkv_single_stream_stays(self, monkeypatch):
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
@@ -1312,18 +1380,31 @@ class TestHunyuanVideoTP:
 
         model = HunyuanVideo()
         assert patcher.parallelize_model(model) is True
-        assert isinstance(model.double_blocks[0].img_attn.qkv, nn.Linear)
-        assert isinstance(model.double_blocks[0].img_attn.proj, nn.Linear)
+        img_attn = model.double_blocks[0].img_attn
+        assert isinstance(img_attn.qkv, ParallelLinear)
+        assert img_attn.qkv.mode == "colwise"
+        assert img_attn.qkv.pack_count == 3
+        assert img_attn.qkv.local_out_features == 3 * (dim // 2)
+        assert isinstance(img_attn.proj, ParallelLinear)
+        assert img_attn.proj.mode == "rowwise"
+        txt_attn = model.double_blocks[0].txt_attn
+        assert isinstance(txt_attn.qkv, ParallelLinear)
+        assert txt_attn.qkv.pack_count == 3
         assert isinstance(model.single_blocks[0].linear1, nn.Linear)
+        assert isinstance(model.single_blocks[0].linear2, nn.Linear)
         assert isinstance(model.double_blocks[0].img_mlp[0], ParallelLinear)
         assert model.double_blocks[0].img_mlp[0].mode == "colwise"
         assert isinstance(model.double_blocks[0].img_mlp[2], ParallelLinear)
         assert model.double_blocks[0].img_mlp[2].mode == "rowwise"
+        assert isinstance(model.double_blocks[0].img_mod.lin, nn.Linear)
+        assert img_attn.num_heads == 4
+        assert model.double_blocks[0].num_heads == 4
+        assert model.single_blocks[0].num_heads == 8
         assert model.num_heads == 8
 
 
 class TestChromaTP:
-    def test_chroma_mlp_shards_like_flux(self, monkeypatch):
+    def test_chroma_packed_qkv_like_flux(self, monkeypatch):
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
@@ -1348,20 +1429,38 @@ class TestChromaTP:
         class DoubleStreamBlock(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.num_heads = 8
                 self.img_attn = SelfAttention()
                 self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.linear1 = nn.Linear(dim, dim * 3 + dim * 4)
+                self.linear2 = nn.Linear(dim + dim * 4, dim)
 
         class Chroma(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.num_heads = 8
                 self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
-                self.single_blocks = nn.ModuleList([nn.Module()])
+                self.single_blocks = nn.ModuleList([SingleStreamBlock()])
 
         model = Chroma()
         assert patcher.parallelize_model(model) is True
-        assert isinstance(model.double_blocks[0].img_attn.qkv, nn.Linear)
+        qkv = model.double_blocks[0].img_attn.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert isinstance(model.double_blocks[0].img_attn.proj, ParallelLinear)
+        assert model.double_blocks[0].img_attn.proj.mode == "rowwise"
         assert isinstance(model.double_blocks[0].img_mlp[0], ParallelLinear)
         assert model.double_blocks[0].img_mlp[0].mode == "colwise"
+        assert isinstance(model.single_blocks[0].linear1, nn.Linear)
+        assert model.double_blocks[0].num_heads == 4
+        assert model.single_blocks[0].num_heads == 8
+        assert model.num_heads == 8
 
 
 class TestACEStepTP:
