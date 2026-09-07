@@ -35,8 +35,9 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | JoyImage | `JoyImageTransformer3DModel` | `double_blocks` (packed `img_attn_qkv` / `txt_attn_qkv`) |
 | Lens | `LensTransformer2DModel` | `transformer_blocks` (packed `img_qkv` / `txt_qkv`; unfused SwiGLU) |
 | PixelDiT | `PixDiT_T2I` | `patch_blocks`, `pixel_blocks` (packed `qkv_x`/`qkv_y` + pixel `qkv`) |
+| Mochi | `AsymmDiTJoint` | `blocks` (packed `qkv_x`/`qkv_y` + packed SwiGLU `w1`; per-head RoPE sliced) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens, NextDiT (`n_local_heads` / `n_local_kv_heads`; root `n_heads` stays), PixelDiT (`MMDiTJointAttention` / `RotaryAttention`; `PiTBlock.num_heads` stays for RoPE dim).
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens, NextDiT (`n_local_heads` / `n_local_kv_heads`; root `n_heads` stays), PixelDiT (`MMDiTJointAttention` / `RotaryAttention`; `PiTBlock.num_heads` stays for RoPE dim), Mochi (`AsymmetricAttention`; root `num_heads` stays, `pos_frequencies` is sliced).
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
 Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos / MiniMax per-head norms stay replicated.
 
@@ -130,10 +131,11 @@ When any rank encounters an error during prompt execution:
 ## Limitations
 
 - **NCCL only**: Currently requires NVIDIA GPUs with NCCL backend
-- **LoRA**: DynamicVRAM attaches LowVramPatch to ParallelLinear.weight_function. Packed colwise layers (Flux/Hunyuan/Chroma `*.qkv`, MiniMax `qkv_proj`/`fc1`) slice LoRA diffs per pack — a naive row cut would mix Q/K/V. Flux+LoRA verified on unreplicated QKV; packed QKV LoRA is unit-tested. Qwen/Cosmos/Wan LoRA e2e still being expanded. DoRA/LoHa/OFT under TP are not yet fully supported.
+- **LoRA**: DynamicVRAM attaches LowVramPatch to ParallelLinear.weight_function. Packed colwise layers (Flux/Hunyuan/Chroma `*.qkv`, MiniMax `qkv_proj`/`fc1`, NextDiT GQA `pack_sizes`) slice LoRA diffs per pack — a naive row cut would mix Q/K/V. Flux+LoRA verified on unreplicated QKV; packed QKV LoRA is unit-tested (equal packs and GQA `pack_sizes`). Qwen/Cosmos/Wan LoRA e2e still being expanded. DoRA/LoHa/OFT under TP are not yet fully supported.
 - **Dynamic batching**: All ranks must process the same prompt; batch parallelism is not combined with TP
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
 - **HiDream O1**: Disabled — needs full-model TP including vision encoder
+- **Boogu / OmniGen2**: Unfused GQA (`to_q`/`to_k`/`to_v`) with `num_kv_heads=7`, which is not divisible by 2-GPU world_size. Head-splitting Q while naively slicing KV would yield a fractional KV head. Left denied until a GQA strategy that does not require `kv_heads % world_size == 0`.
 - **MiniMax H3**: Packed colwise. `qkv_proj` shards each of `[Q|K|V]` by heads; `fc1` shards each of `[gate|up]`; `fc2`/`out_proj` are rowwise. adaLN stays replicated.
 - **Flux / HunyuanVideo / Chroma**: Packed colwise on double-stream `img_attn.qkv` / `txt_attn.qkv` (`[Q|K|V]`); `*.proj` is rowwise. Single-stream fused `linear1`/`linear2` stay replicated (QKV+MLP unequal packs). `SingleStreamBlock.num_heads` is not divided. Hunyuan `txt_in` TokenRefiner is outside TP prefixes and stays full-width.
 - **SD3 / MMDiT**: Packed colwise on `attn.qkv` / `attn2.qkv` (`[Q|K|V]`, `split_qkv` layout); `*.proj` is rowwise. adaLN stays replicated. Root `num_heads` (depth metadata) is not divided.
@@ -145,4 +147,5 @@ When any rank encounters an error during prompt execution:
 - **JoyImage**: Packed colwise on `img_attn_qkv` / `txt_attn_qkv`; `*_attn_proj` rowwise. MLP `net.0.proj` / `net.2` follow Qwen-style colwise/rowwise. `JoyImageModulate` is a Parameter table, not a Linear.
 - **Lens**: Packed colwise on `img_qkv` / `txt_qkv`; `to_out.0` / `to_add_out` rowwise. Unfused SwiGLU `w1`/`w3`/`w2`. `img_mod.1` / `txt_mod.1` stay (global 6-way chunk).
 - **PixelDiT**: Packed colwise on patch `attn.qkv_x` / `attn.qkv_y` and pixel `attn.qkv` (`[Q|K|V]`, `reshape(..., 3, heads, head_dim)`); `proj_*` / `attn.proj` rowwise. adaLN chunks, `compress_to_attn`, and `expand_from_attn` stay. `PiTBlock.num_heads` is RoPE metadata and is not divided. `PidNet` inherits via MRO (`lq_proj` is outside TP prefixes).
+- **Mochi (`AsymmDiTJoint`)**: Packed colwise on `qkv_x`/`qkv_y` (`[Q|K|V]`) and fused SwiGLU `w1` (`chunk(2)`); `proj_*`/`w2` rowwise. `mod_x`/`mod_y` stay. Root `num_heads` is constructor metadata; learned `pos_frequencies` (`[3, heads, dim/2]`) is sliced to the local head shard so mixed RoPE matches packed QKV.
 - **Cosmos GeneralDIT**: MLP-only. FA/CA Sequential projections (`attn.to_{q,k,v,out}.0`) stay replicated; `adaLN_modulation` is excluded globally.

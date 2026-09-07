@@ -68,6 +68,7 @@ TP_TARGETS = {
     "JoyImageTransformer3DModel": ["double_blocks"],  # packed img/txt_attn_qkv
     "LensTransformer2DModel": ["transformer_blocks"],  # packed img_qkv/txt_qkv
     "PixDiT_T2I": ["patch_blocks", "pixel_blocks"],  # packed qkv_x/qkv_y + pixel qkv
+    "AsymmDiTJoint": ["blocks"],  # Mochi: packed qkv_x/qkv_y + packed SwiGLU w1
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -171,6 +172,12 @@ PIXELDiT_EXCLUDED_LAYER_NAMES = (
     "expand_from_attn",
 )
 
+# Mochi AsymmDiTJoint: 4-way (or 1-way last-block) modulation stays full-width.
+MOCHI_EXCLUDED_LAYER_NAMES = (
+    "mod_x",
+    "mod_y",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -189,6 +196,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "JoyImageTransformer3DModel",
     "LensTransformer2DModel",
     "PixDiT_T2I",
+    "AsymmDiTJoint",
 })
 
 
@@ -214,6 +222,8 @@ def _packed_colwise_count(name, mro_names):
             or name.endswith(".qkv_y")
         ):
             return 3
+        if "AsymmDiTJoint" in mro_names and name.endswith(".w1"):
+            return 2
         return 1
     return 1
 
@@ -276,6 +286,7 @@ TP_HEAD_SPLIT_MODELS = {
     # Packed GQA qkv via pack_sizes; root n_heads stays (RoPE metadata).
     "NextDiT",
     "PixDiT_T2I",
+    "AsymmDiTJoint",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -359,6 +370,29 @@ def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
         norm._tp_norm_shard = (start, end)
         sliced += 1
     return sliced
+
+
+def _slice_mochi_pos_frequencies(model, local_heads, original_heads, mesh):
+    """Slice Mochi per-head RoPE frequencies to the local head shard.
+
+    ``pos_frequencies`` is ``[3, num_heads, head_dim/2]``. After packed QKV
+    head-split, ``compute_mixed_rotation`` must emit ``(N, local_heads, *)``.
+    """
+    pf = getattr(model, "pos_frequencies", None)
+    if pf is None or not hasattr(pf, "data"):
+        return 0
+    if pf.ndim != 3 or pf.shape[1] != original_heads:
+        return 0
+    if original_heads % mesh.world_size != 0:
+        return 0
+    start = mesh.rank * local_heads
+    end = start + local_heads
+    model.pos_frequencies = nn.Parameter(
+        pf.data[:, start:end].clone(),
+        requires_grad=pf.requires_grad,
+    )
+    model._tp_pos_freq_shard = (start, end)
+    return 1
 
 
 # Models whose MRO would match a supported parent but that are NOT safe
@@ -517,6 +551,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(PIXELDiT_EXCLUDED_LAYER_NAMES)
         # RotaryAttention.qkv / .proj collide with the SD3 `.attn.qkv` suffix.
         excluded_names = tuple(e for e in excluded_names if e not in (".attn.qkv", ".attn.proj"))
+    if "AsymmDiTJoint" in mro_names:
+        excluded_names = excluded_names + tuple(MOCHI_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -683,12 +719,16 @@ def parallelize_model(model, sd=None, prefix=""):
             original_heads = local_heads * mesh.world_size
             synced = _sync_bookkeeping_heads(model, original_heads, local_heads, targets)
             kv_synced = _sync_kv_heads(model, targets, mesh.world_size)
+            pos_sliced = 0
+            if "AsymmDiTJoint" in {cls.__name__ for cls in type(model).__mro__}:
+                pos_sliced = _slice_mochi_pos_frequencies(model, local_heads, original_heads, mesh)
             logging.info(
                 f"[TP] Head-split override ({model_class_name}): set heads={local_heads} "
                 f"(from {heads}) on {head_overrides} Attention modules"
                 + (f"; sliced {norms_sliced} full-dim QK norms" if norms_sliced else "")
                 + (f"; synced {synced} leftover head-count attrs" if synced else "")
                 + (f"; synced {kv_synced} GQA kv-head attrs" if kv_synced else "")
+                + (f"; sliced pos_frequencies heads [{mesh.rank * local_heads}:{mesh.rank * local_heads + local_heads}]" if pos_sliced else "")
             )
     return True
 
@@ -740,6 +780,16 @@ def load_tp_shards(model, sd, prefix=""):
                     module.weight.data = full[start:end].to(
                         device=module.weight.device, dtype=module.weight.dtype
                     )
+
+        pos_range = getattr(module, "_tp_pos_freq_shard", None)
+        pf = getattr(module, "pos_frequencies", None)
+        if pos_range is not None and pf is not None:
+            pf_key = prefix + ("pos_frequencies" if not name else name + ".pos_frequencies")
+            if pf_key in sd:
+                full = sd.pop(pf_key)
+                start, end = pos_range
+                if full.ndim == 3 and end <= full.shape[1]:
+                    pf.data = full[:, start:end].to(device=pf.device, dtype=pf.dtype)
 
     if missing > 0:
         logging.error(f"[TP] load_tp_shards: {loaded} weights loaded, {missing} MISSING for {model.__class__.__name__} — outputs will be incorrect")

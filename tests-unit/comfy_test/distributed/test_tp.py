@@ -255,6 +255,11 @@ class TestGetTPTargets:
         assert get_tp_targets(Pix()) == ["patch_blocks", "pixel_blocks"]
         assert get_tp_targets(Pid()) == ["patch_blocks", "pixel_blocks"]
 
+    def test_mochi_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Mochi = self._make_model_class("AsymmDiTJoint")
+        assert get_tp_targets(Mochi()) == ["blocks"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -1977,6 +1982,79 @@ class TestPixelDiTTP:
         assert model.num_groups == patch_heads
 
 
+class TestMochiTP:
+    """Mochi AsymmDiTJoint: packed qkv_x/qkv_y + packed SwiGLU w1; per-head RoPE sliced."""
+
+    def test_packed_qkv_swiglu_and_pos_frequencies(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 128, 8, 16
+        assert "AsymmDiTJoint" in TP_HEAD_SPLIT_MODELS
+
+        class AsymmetricAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv_x = nn.Linear(dim, dim * 3, bias=True)
+                self.qkv_y = nn.Linear(dim, dim * 3, bias=True)
+                self.proj_x = nn.Linear(dim, dim)
+                self.proj_y = nn.Linear(dim, dim)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                hidden = 64
+                self.w1 = nn.Linear(dim, 2 * hidden, bias=False)
+                self.w2 = nn.Linear(hidden, dim, bias=False)
+
+        class AsymmetricJointBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mod_x = nn.Linear(dim, 4 * dim)
+                self.mod_y = nn.Linear(dim, 4 * dim)
+                self.attn = AsymmetricAttention()
+                self.mlp_x = FeedForward()
+                self.mlp_y = FeedForward()
+
+        class AsymmDiTJoint(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.pos_frequencies = nn.Parameter(torch.arange(3 * heads * (head_dim // 2), dtype=torch.float32).reshape(3, heads, head_dim // 2))
+                self.blocks = nn.ModuleList([AsymmetricJointBlock()])
+
+        model = AsymmDiTJoint()
+        full_pf = model.pos_frequencies.data.clone()
+        assert patcher.parallelize_model(model) is True
+        qkv = model.blocks[0].attn.qkv_x
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.pack_count == 3
+        assert isinstance(model.blocks[0].attn.qkv_y, ParallelLinear)
+        assert model.blocks[0].attn.proj_x.mode == "rowwise"
+        assert isinstance(model.blocks[0].mod_x, nn.Linear)
+        assert isinstance(model.blocks[0].mlp_x.w1, ParallelLinear)
+        assert model.blocks[0].mlp_x.w1.pack_count == 2
+        assert model.blocks[0].mlp_x.w2.mode == "rowwise"
+        assert model.blocks[0].attn.num_heads == heads // 2
+        assert model.num_heads == heads
+        assert model.pos_frequencies.shape == (3, heads // 2, head_dim // 2)
+        torch.testing.assert_close(model.pos_frequencies.data, full_pf[:, : heads // 2])
+
+
 class TestPackedColwise:
     """Fused QKV / SwiGLU: shard each pack, then concat — not a naive out-dim cut."""
 
@@ -2110,6 +2188,33 @@ class TestPackedColwiseLoRA:
         assert not torch.equal(packed, naive)
 
         from comfy.distributed.parallel_linear import shard_like_tp_weight, stamp_tp_shard_meta
+        stamp_tp_shard_meta(layer.weight, layer)
+        got = shard_like_tp_weight(full, layer.weight)
+        torch.testing.assert_close(got, packed)
+
+    def test_shard_like_tp_weight_gqa_pack_sizes(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import shard_like_tp_weight, stamp_tp_shard_meta
+
+        hidden, ws, rank_id = 4, 2, 0
+        pack_sizes = (128, 64, 64)
+        full_out = sum(pack_sizes)
+
+        class FakeMesh:
+            world_size = ws
+            current_device = "cpu"
+        FakeMesh.rank = rank_id
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        layer = pl_module.ParallelLinear(
+            hidden, full_out, bias=False, mode="colwise", pack_sizes=pack_sizes,
+        )
+        full = torch.arange(full_out * hidden, dtype=torch.float32).reshape(full_out, hidden)
+        layer.load_shard(full)
+        packed = layer.weight.data.clone()
+        naive = full[: packed.shape[0]]
+        assert not torch.equal(packed, naive)
         stamp_tp_shard_meta(layer.weight, layer)
         got = shard_like_tp_weight(full, layer.weight)
         torch.testing.assert_close(got, packed)
