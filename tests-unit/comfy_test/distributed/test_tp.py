@@ -691,16 +691,18 @@ class TestParallelLinearWeightFunction:
 
 # ---------------------------------------------------------------------------
 class TestSD3JointBlocksTP:
-    """SD3 MMDiT uses joint_blocks + fused attn.qkv — MLP-only TP."""
+    """SD3 MMDiT: packed attn.qkv [Q|K|V]; MLP fc1/fc2; adaLN stays."""
 
     def test_targets(self):
-        from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES
+        from comfy.distributed.patcher import get_tp_targets, EXCLUDED_LAYER_NAMES, TP_HEAD_SPLIT_MODELS
         SD3 = type("OpenAISignatureMMDITWrapper", (), {})
         assert get_tp_targets(SD3()) == ["joint_blocks"]
+        # Global list still names the suffixes; SD3 un-excludes them at runtime.
         assert ".attn.qkv" in EXCLUDED_LAYER_NAMES
         assert ".attn.proj" in EXCLUDED_LAYER_NAMES
+        assert "OpenAISignatureMMDITWrapper" in TP_HEAD_SPLIT_MODELS
 
-    def test_mlp_only_sharding(self, monkeypatch):
+    def test_packed_qkv_and_mlp_sharding(self, monkeypatch):
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
@@ -743,17 +745,26 @@ class TestSD3JointBlocksTP:
         class OpenAISignatureMMDITWrapper(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.num_heads = 24
                 self.joint_blocks = nn.ModuleList([JointBlock()])
 
         model = OpenAISignatureMMDITWrapper()
         assert patcher.parallelize_model(model) is True
+        qkv = model.joint_blocks[0].x_block.attn.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert qkv.local_out_features == 3 * (1536 // 2)
+        proj = model.joint_blocks[0].x_block.attn.proj
+        assert isinstance(proj, ParallelLinear)
+        assert proj.mode == "rowwise"
         modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
-        assert "joint_blocks.0.x_block.attn.qkv" not in modes
-        assert "joint_blocks.0.x_block.attn.proj" not in modes
         assert modes["joint_blocks.0.x_block.mlp.fc1"] == "colwise"
         assert modes["joint_blocks.0.x_block.mlp.fc2"] == "rowwise"
         assert modes["joint_blocks.0.context_block.mlp.fc1"] == "colwise"
         assert "joint_blocks.0.x_block.adaLN_modulation.1" not in modes
+        assert model.joint_blocks[0].x_block.attn.num_heads == 12
+        assert model.num_heads == 24
 
     def test_skips_scaled_fp8_companions(self, monkeypatch):
         """FP8-scaled checkpoints attach weight_scale; ParallelLinear must

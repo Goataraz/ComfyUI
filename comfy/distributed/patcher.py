@@ -163,14 +163,21 @@ _DOUBLE_STREAM_QKV_FAMILIES = frozenset({"Flux", "HunyuanVideo", "Chroma"})
 _DOUBLE_STREAM_ATTN_TP = (
     "img_attn.qkv", "txt_attn.qkv", "img_attn.proj", "txt_attn.proj",
 )
+# SD3 MMDiT fused QKV is the same equal-width [Q|K|V] layout (split_qkv
+# reshapes to (B, S, 3, heads, head_dim)). Un-exclude at runtime.
+_SD3_QKV_FAMILIES = frozenset({"OpenAISignatureMMDITWrapper", "MMDiT"})
+_SD3_ATTN_TP = (
+    ".attn.qkv", ".attn.proj", ".attn2.qkv", ".attn2.proj",
+)
+_PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES
 
 
 def _packed_colwise_count(name, mro_names):
     """Equal-sized output packs that must be sharded independently.
 
     MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
-    SwiGLU ``[gate|up]`` (2). Flux / HunyuanVideo / Chroma double-stream
-    ``*.qkv`` is ``[Q|K|V]`` (3). Other architectures keep pack_count=1.
+    SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 ``*.qkv`` is
+    ``[Q|K|V]`` (3). Other architectures keep pack_count=1.
     """
     if "MiniMaxH3Model" in mro_names:
         if name.endswith("qkv_proj"):
@@ -178,7 +185,7 @@ def _packed_colwise_count(name, mro_names):
         if name.endswith("fc1"):
             return 2
         return 1
-    if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
+    if mro_names & _PACKED_QKV_FAMILIES:
         if name.endswith(".qkv"):
             return 3
         return 1
@@ -211,6 +218,8 @@ TP_HEAD_SPLIT_MODELS = {
     "Flux",
     "HunyuanVideo",
     "Chroma",
+    "OpenAISignatureMMDITWrapper",
+    "MMDiT",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -322,7 +331,7 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     if original_heads == local_heads:
         return 0
     flux_family = any(
-        cls.__name__ in _DOUBLE_STREAM_QKV_FAMILIES for cls in type(model).__mro__
+        cls.__name__ in _PACKED_QKV_FAMILIES for cls in type(model).__mro__
     )
     synced = 0
     for name, module in model.named_modules():
@@ -331,8 +340,8 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         # Fused single-stream QKV+MLP stays replicated; do not divide heads.
         if type(module).__name__ == "SingleStreamBlock":
             continue
-        # Root Flux/Hunyuan/Chroma num_heads is constructor metadata (PE dim,
-        # TokenRefiner) — blocks own the attention reshape.
+        # Root Flux/Hunyuan/Chroma/SD3 num_heads is constructor metadata
+        # (PE dim, TokenRefiner, depth) — attention modules own the reshape.
         if flux_family and not name:
             continue
         for attr in _HEADS_ATTRS:
@@ -446,6 +455,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(MINIMAX_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
+    if mro_names & _SD3_QKV_FAMILIES:
+        excluded_names = tuple(e for e in excluded_names if e not in _SD3_ATTN_TP)
 
     count = 0
     skipped_dims = 0
