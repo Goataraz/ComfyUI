@@ -29,13 +29,13 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | Chroma | `Chroma` | `double_blocks`, `single_blocks` (same packed QKV as Flux) |
 | ACE-Step 1.0 | `ACEStepTransformer2DModel` | `transformer_blocks` (head-split; conv FF unreplicated) |
 | ACE-Step 1.5 | `AceStepConditionGenerationModel` | `decoder.layers` (head-split + GQA; lyric encoder excluded) |
-| Lumina NextDiT / Z-Image | `NextDiT` | `layers`, `noise_refiner`, `context_refiner`, `siglip_refiner` (MLP-only) |
+| Lumina NextDiT / Z-Image | `NextDiT` | `layers`, `noise_refiner`, `context_refiner`, `siglip_refiner` (packed GQA `attention.qkv`) |
 | Ideogram 4 | `Ideogram4Transformer` | `layers` (packed `attention.qkv`; unfused SwiGLU shards) |
 | MiniMax H3 | `MiniMaxH3Model` | `blocks` (packed QKV + packed SwiGLU, head-split) |
 | JoyImage | `JoyImageTransformer3DModel` | `double_blocks` (packed `img_attn_qkv` / `txt_attn_qkv`) |
 | Lens | `LensTransformer2DModel` | `transformer_blocks` (packed `img_qkv` / `txt_qkv`; unfused SwiGLU) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens.
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3, Flux / HunyuanVideo / Chroma (double-stream only; `SingleStreamBlock.num_heads` stays full because fused `linear1` is unreplicated), SD3 / MMDiT, Ideogram 4, JoyImage, Lens, NextDiT (`n_local_heads` / `n_local_kv_heads`; root `n_heads` stays).
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
 Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos / MiniMax per-head norms stay replicated.
 
@@ -139,7 +139,7 @@ When any rank encounters an error during prompt execution:
 - **LTXV / LTXAV**: MLP-only. RoPE is rebuilt from full `num_attention_heads` × `inner_dim`, so FA/CA (`to_q`/`to_k`/`to_v`/`to_out.0`) stay replicated.
 - **ACE-Step 1.0**: Head-split attention (`transformer_blocks`). FF is `GLUMBConv` and stays replicated.
 - **ACE-Step 1.5**: Head-split + GQA (`decoder.layers` only). Lyric/timbre encoders stay full-width. `num_kv_heads` is divided only under that prefix.
-- **Lumina NextDiT / Z-Image**: MLP-only. Fused GQA `attention.qkv` stays replicated (`n_heads + 2*n_kv_heads` unequal packs); unfused SwiGLU `w1`/`w3`/`w2` shards.
+- **Lumina NextDiT / Z-Image**: Packed GQA colwise on `attention.qkv` via `pack_sizes=(n_heads*d, n_kv*d, n_kv*d)` — equal `pack_count=3` would cut the wider Q pack. `attention.out` is rowwise. Unfused SwiGLU `w1`/`w3`/`w2` shards. `adaLN_modulation` stays. Root `n_heads` is RoPE metadata and is not divided; `n_local_heads` / `n_local_kv_heads` are.
 - **Ideogram 4**: Packed colwise on `attention.qkv` (`[Q|K|V]`, `view(..., 3, heads, head_dim)`); `attention.o` is rowwise. `adaln_modulation` stays replicated.
 - **JoyImage**: Packed colwise on `img_attn_qkv` / `txt_attn_qkv`; `*_attn_proj` rowwise. MLP `net.0.proj` / `net.2` follow Qwen-style colwise/rowwise. `JoyImageModulate` is a Parameter table, not a Linear.
 - **Lens**: Packed colwise on `img_qkv` / `txt_qkv`; `to_out.0` / `to_add_out` rowwise. Unfused SwiGLU `w1`/`w3`/`w2`. `img_mod.1` / `txt_mod.1` stay (global 6-way chunk).

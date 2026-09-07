@@ -142,11 +142,10 @@ LTXV_EXCLUDED_LAYER_NAMES = (
     "to_q", "to_k", "to_v", "to_out.0", "to_gate_logits",
 )
 
-# Lumina NextDiT / Z-Image: fused GQA qkv pack + coupled out. Unfused
-# SwiGLU (w1/w3 colwise, w2 rowwise) still shards. adaLN_modulation.0 is
-# the Z-Image single-Linear Sequential; .1 is already global.
+# Lumina NextDiT / Z-Image: adaLN_modulation.0 is the Z-Image single-Linear
+# Sequential (chunked). Fused GQA qkv uses pack_sizes; attention.out is rowwise.
 NEXTDIT_EXCLUDED_LAYER_NAMES = (
-    "attention.qkv", "attention.out", "adaLN_modulation.0",
+    "adaLN_modulation.0",
 )
 
 # Ideogram 4: adaLN is a bare Linear chunked 4-way. Packed qkv/o un-exclude
@@ -200,6 +199,30 @@ def _packed_colwise_count(name, mro_names):
         return 1
     return 1
 
+
+def _gqa_pack_sizes(name, module, parent, mro_names):
+    """Unequal [Q heads | K kv | V kv] packs for NextDiT fused GQA qkv.
+
+    Equal ``pack_count=3`` is wrong here: Q is wider than K/V when
+    ``n_heads != n_kv_heads``. Returns None when this is not that layer.
+    """
+    if "NextDiT" not in mro_names:
+        return None
+    if not name.endswith("attention.qkv"):
+        return None
+    if parent is None:
+        return None
+    n_q = int(getattr(parent, "n_local_heads", 0) or 0)
+    n_kv = int(getattr(parent, "n_local_kv_heads", 0) or 0)
+    head_dim = int(getattr(parent, "head_dim", 0) or 0)
+    if n_q <= 0 or n_kv <= 0 or head_dim <= 0:
+        return None
+    sizes = (n_q * head_dim, n_kv * head_dim, n_kv * head_dim)
+    if sum(sizes) != module.out_features:
+        return None
+    return sizes
+
+
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
 # channels — i.e., a subset of heads with full per-head dim. The Attention
@@ -232,13 +255,15 @@ TP_HEAD_SPLIT_MODELS = {
     "Ideogram4Transformer",
     "JoyImageTransformer3DModel",
     "LensTransformer2DModel",
+    # Packed GQA qkv via pack_sizes; root n_heads stays (RoPE metadata).
+    "NextDiT",
 }
 
 # Attribute names used for the Q projection across architectures.
 _Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv")
 # Attribute names for head count / head dim.
-_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads")
-_KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads")
+_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
+_KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
 _DIM_HEAD_ATTRS = ("dim_head", "head_dim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
 _FULL_DIM_QK_NORM_ATTRS = (
@@ -342,9 +367,8 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     """
     if original_heads == local_heads:
         return 0
-    flux_family = any(
-        cls.__name__ in _PACKED_QKV_FAMILIES for cls in type(model).__mro__
-    )
+    mro_names = {cls.__name__ for cls in type(model).__mro__}
+    skip_root_heads = bool(mro_names & _PACKED_QKV_FAMILIES) or "NextDiT" in mro_names
     synced = 0
     for name, module in model.named_modules():
         if name and not _name_under_targets(name, targets):
@@ -352,9 +376,9 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         # Fused single-stream QKV+MLP stays replicated; do not divide heads.
         if type(module).__name__ == "SingleStreamBlock":
             continue
-        # Root Flux/Hunyuan/Chroma/SD3 num_heads is constructor metadata
-        # (PE dim, TokenRefiner, depth) — attention modules own the reshape.
-        if flux_family and not name:
+        # Root Flux/Hunyuan/Chroma/SD3 num_heads and NextDiT.n_heads are
+        # constructor / RoPE metadata — attention modules own the reshape.
+        if skip_root_heads and not name:
             continue
         for attr in _HEADS_ATTRS:
             val = getattr(module, attr, None)
@@ -510,27 +534,52 @@ def parallelize_model(model, sd=None, prefix=""):
                     or name.endswith(".net.2")
                     or name.endswith(".o")  # Wan attention output proj
                     or name.endswith(".layer2")  # Cosmos GPT2FeedForward.layer2
+                    or name.endswith(".attention.out")  # NextDiT JointAttention.out
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection
                     # (the GELU+Dropout+Linear ModuleList's index-2 Linear),
                     # matching Flux's `mlp.2` rowwise convention.
                     # `.o` covers Wan's self_attn.o / cross_attn.o.
                     # `.layer2` covers Cosmos GeneralDIT / MiniTrainDIT MLP down.
+                    # `.attention.out` is NextDiT's attention output (not `.o`).
                     mode = "rowwise"
 
-                # Skip layers where the shard dimension isn't evenly divisible
-                pack_count = _packed_colwise_count(name, mro_names) if mode == "colwise" else 1
-                if pack_count > 1:
-                    if module.out_features % pack_count != 0:
+                parent_name, _, child_name = name.rpartition('.')
+                parent = model
+                if parent_name:
+                    parent = comfy.utils.get_attr(model, parent_name)
+
+                pack_sizes = _gqa_pack_sizes(name, module, parent, mro_names) if mode == "colwise" else None
+                is_nextdit_qkv = "NextDiT" in mro_names and name.endswith("attention.qkv")
+                pack_count = 1
+                if is_nextdit_qkv:
+                    # Never fall through to naive colwise — that cuts across [Q|K|V].
+                    n_q = int(getattr(parent, "n_local_heads", 0) or 0)
+                    n_kv = int(getattr(parent, "n_local_kv_heads", 0) or 0)
+                    if (
+                        pack_sizes is None
+                        or n_q % mesh.world_size != 0
+                        or n_kv % mesh.world_size != 0
+                        or any(size % mesh.world_size != 0 for size in pack_sizes)
+                    ):
                         skipped_dims += 1
                         continue
-                    pack_size = module.out_features // pack_count
-                    if pack_size % mesh.world_size != 0:
-                        skipped_dims += 1
-                        continue
+                elif mode == "colwise":
+                    pack_count = _packed_colwise_count(name, mro_names)
+                    if pack_count > 1:
+                        if module.out_features % pack_count != 0:
+                            skipped_dims += 1
+                            continue
+                        pack_size = module.out_features // pack_count
+                        if pack_size % mesh.world_size != 0:
+                            skipped_dims += 1
+                            continue
+                    else:
+                        if module.out_features % mesh.world_size != 0:
+                            skipped_dims += 1
+                            continue
                 else:
-                    dim = module.out_features if mode == "colwise" else module.in_features
-                    if dim % mesh.world_size != 0:
+                    if module.in_features % mesh.world_size != 0:
                         skipped_dims += 1
                         continue
 
@@ -540,12 +589,8 @@ def parallelize_model(model, sd=None, prefix=""):
                     bias=module.bias is not None,
                     mode=mode,
                     pack_count=pack_count,
+                    pack_sizes=pack_sizes,
                 )
-
-                parent_name, _, child_name = name.rpartition('.')
-                parent = model
-                if parent_name:
-                    parent = comfy.utils.get_attr(model, parent_name)
 
                 setattr(parent, child_name, new_layer)
                 count += 1

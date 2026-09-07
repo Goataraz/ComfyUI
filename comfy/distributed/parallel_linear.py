@@ -29,6 +29,8 @@ _TP_SHARD_META_ATTRS = (
     "_tp_rank",
     "_tp_pack_size",
     "_tp_local_pack_size",
+    "_tp_pack_sizes",
+    "_tp_world_size",
     "_tp_mode",
 )
 
@@ -39,6 +41,8 @@ def stamp_tp_shard_meta(tensor, module):
     tensor._tp_rank = int(getattr(module, "rank", 0) or 0)
     tensor._tp_pack_size = getattr(module, "pack_size", None)
     tensor._tp_local_pack_size = getattr(module, "local_pack_size", None)
+    tensor._tp_pack_sizes = getattr(module, "pack_sizes", None)
+    tensor._tp_world_size = getattr(module, "world_size", None)
     tensor._tp_mode = getattr(module, "mode", None)
     return tensor
 
@@ -51,8 +55,18 @@ def copy_tp_shard_meta(src, dst):
     return dst
 
 
-def packed_colwise_row_slices(rank, pack_count, pack_size, local_pack_size):
-    """Output-dim slices for this rank — one per equal-sized pack."""
+def packed_colwise_row_slices(rank, pack_count, pack_size, local_pack_size, pack_sizes=None, world_size=None):
+    """Output-dim slices for this rank — one per pack (equal or GQA-unequal)."""
+    if pack_sizes:
+        ws = world_size or (pack_size // local_pack_size if local_pack_size else 1)
+        slices = []
+        offset = 0
+        for size in pack_sizes:
+            local = size // ws
+            start = offset + rank * local
+            slices.append(slice(start, start + local))
+            offset += size
+        return tuple(slices)
     pack_count = int(pack_count) if pack_count else 1
     if pack_count <= 1:
         start = rank * local_pack_size
@@ -76,6 +90,8 @@ def shard_like_tp_weight(full, shard):
     rank = getattr(shard, "_tp_rank", None)
     pack_size = getattr(shard, "_tp_pack_size", None)
     local_pack_size = getattr(shard, "_tp_local_pack_size", None)
+    pack_sizes = getattr(shard, "_tp_pack_sizes", None)
+    world_size = getattr(shard, "_tp_world_size", None)
     if rank is None or pack_size is None or local_pack_size is None:
         from comfy.distributed.mesh import get_mesh
         mesh = get_mesh()
@@ -91,7 +107,10 @@ def shard_like_tp_weight(full, shard):
         else:
             local_pack_size = shard.shape[0] if pack_count <= 1 else shard.shape[0] // pack_count
             pack_size = full.shape[0] if pack_count <= 1 else full.shape[0] // pack_count
-    slices = packed_colwise_row_slices(rank, pack_count, pack_size, local_pack_size)
+    slices = packed_colwise_row_slices(
+        rank, pack_count, pack_size, local_pack_size,
+        pack_sizes=pack_sizes, world_size=world_size,
+    )
     if full.ndim == 1:
         pieces = [full[s] for s in slices]
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
@@ -113,58 +132,89 @@ class ParallelLinear(nn.Module):
     Can be configured as Colwise or Rowwise.
 
     ``pack_count`` > 1 (colwise only) shards *inside* each equal-sized pack
-    along the output dim, then concatenates. That is the correct layout for
-    fused QKV (pack=3, ``[Q|K|V]``) and fused SwiGLU (pack=2, ``[gate|up]``).
+    along the output dim, then concatenates. ``pack_sizes`` is the GQA form:
+    each pack may have a different width (e.g. ``[Q heads | K kv | V kv]``).
     Naive colwise would cut across packs.
     """
-    def __init__(self, in_features, out_features, bias=True, mode="colwise", pack_count=1):
+    def __init__(self, in_features, out_features, bias=True, mode="colwise", pack_count=1, pack_sizes=None):
         super().__init__()
         self.mesh = get_mesh()
         self.rank = self.mesh.rank
         self.world_size = self.mesh.world_size
         self.mode = mode
-        self.pack_count = int(pack_count) if pack_count else 1
-        if self.pack_count < 1:
-            raise ValueError(f"pack_count must be >= 1, got {pack_count}")
-        if self.pack_count > 1 and mode != "colwise":
-            raise ValueError("pack_count > 1 is only valid for colwise layers")
-
-        # Determine local dimensions based on TP mode
-        if mode == "colwise":
-            if self.pack_count > 1:
-                if out_features % self.pack_count != 0:
+        if pack_sizes is not None:
+            pack_sizes = tuple(int(s) for s in pack_sizes)
+            if not pack_sizes:
+                raise ValueError("pack_sizes must be non-empty")
+            if sum(pack_sizes) != out_features:
+                raise ValueError(
+                    f"[TP] packed colwise: sum(pack_sizes)={sum(pack_sizes)} != "
+                    f"out_features={out_features}"
+                )
+            if mode != "colwise":
+                raise ValueError("pack_sizes is only valid for colwise layers")
+            for size in pack_sizes:
+                if size % self.world_size != 0:
                     raise ValueError(
-                        f"[TP] packed colwise: out_features={out_features} not divisible by "
-                        f"pack_count={self.pack_count}"
-                    )
-                pack_size = out_features // self.pack_count
-                if pack_size % self.world_size != 0:
-                    raise ValueError(
-                        f"[TP] packed colwise: pack_size={pack_size} not divisible by "
+                        f"[TP] packed colwise: pack size {size} not divisible by "
                         f"world_size={self.world_size}"
                     )
-                self.pack_size = pack_size
-                self.local_pack_size = pack_size // self.world_size
-                self.local_out_features = self.pack_count * self.local_pack_size
-                self.local_in_features = in_features
-            else:
-                assert out_features % self.world_size == 0, (
-                    f"[TP] colwise: out_features={out_features} not divisible by world_size={self.world_size}"
-                )
-                self.pack_size = out_features
-                self.local_pack_size = out_features // self.world_size
-                self.local_out_features = out_features // self.world_size
-                self.local_in_features = in_features
-        elif mode == "rowwise":
-            assert in_features % self.world_size == 0, (
-                f"[TP] rowwise: in_features={in_features} not divisible by world_size={self.world_size}"
-            )
-            self.local_in_features = in_features // self.world_size
-            self.local_out_features = out_features
-            self.pack_size = out_features
-            self.local_pack_size = out_features
+            self.pack_sizes = pack_sizes
+            self.pack_count = len(pack_sizes)
+            self.local_pack_sizes = tuple(s // self.world_size for s in pack_sizes)
+            self.pack_size = pack_sizes[0]
+            self.local_pack_size = self.local_pack_sizes[0]
+            self.local_out_features = sum(self.local_pack_sizes)
+            self.local_in_features = in_features
         else:
-            raise ValueError(f"Invalid TP mode: {mode}. Must be 'colwise' or 'rowwise'.")
+            self.pack_count = int(pack_count) if pack_count else 1
+            if self.pack_count < 1:
+                raise ValueError(f"pack_count must be >= 1, got {pack_count}")
+            if self.pack_count > 1 and mode != "colwise":
+                raise ValueError("pack_count > 1 is only valid for colwise layers")
+
+            if mode == "colwise":
+                if self.pack_count > 1:
+                    if out_features % self.pack_count != 0:
+                        raise ValueError(
+                            f"[TP] packed colwise: out_features={out_features} not divisible by "
+                            f"pack_count={self.pack_count}"
+                        )
+                    pack_size = out_features // self.pack_count
+                    if pack_size % self.world_size != 0:
+                        raise ValueError(
+                            f"[TP] packed colwise: pack_size={pack_size} not divisible by "
+                            f"world_size={self.world_size}"
+                        )
+                    self.pack_size = pack_size
+                    self.local_pack_size = pack_size // self.world_size
+                    self.local_out_features = self.pack_count * self.local_pack_size
+                    self.local_in_features = in_features
+                    self.pack_sizes = (pack_size,) * self.pack_count
+                    self.local_pack_sizes = (self.local_pack_size,) * self.pack_count
+                else:
+                    assert out_features % self.world_size == 0, (
+                        f"[TP] colwise: out_features={out_features} not divisible by world_size={self.world_size}"
+                    )
+                    self.pack_size = out_features
+                    self.local_pack_size = out_features // self.world_size
+                    self.local_out_features = out_features // self.world_size
+                    self.local_in_features = in_features
+                    self.pack_sizes = (out_features,)
+                    self.local_pack_sizes = (self.local_out_features,)
+            elif mode == "rowwise":
+                assert in_features % self.world_size == 0, (
+                    f"[TP] rowwise: in_features={in_features} not divisible by world_size={self.world_size}"
+                )
+                self.local_in_features = in_features // self.world_size
+                self.local_out_features = out_features
+                self.pack_size = out_features
+                self.local_pack_size = out_features
+                self.pack_count = 1
+                self.pack_sizes = (out_features,)
+                self.local_pack_sizes = (out_features,)
+            else:
+                raise ValueError(f"Invalid TP mode: {mode}. Must be 'colwise' or 'rowwise'.")
 
         # Allocate on CPU to avoid OOM — shards are moved to GPU in load_shard()
         self.weight = nn.Parameter(torch.empty(
@@ -256,6 +306,7 @@ class ParallelLinear(nn.Module):
         """Slices along the output dim for this rank, one per pack."""
         return packed_colwise_row_slices(
             self.rank, self.pack_count, self.pack_size, self.local_pack_size,
+            pack_sizes=self.pack_sizes, world_size=self.world_size,
         )
 
     def load_shard(self, full_weight_tensor):

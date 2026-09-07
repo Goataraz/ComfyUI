@@ -1607,14 +1607,15 @@ class TestACEStepTP:
         assert model.lyric_encoder.num_kv_heads == kv_heads
 
 
-class TestNextDiTMLPOnly:
-    """Lumina NextDiT / Z-Image: fused GQA qkv stays; unfused SwiGLU w1/w2/w3 shards."""
+class TestNextDiTGQATP:
+    """Lumina NextDiT / Z-Image: packed GQA qkv + unfused SwiGLU; adaLN stays."""
 
-    def test_ffn_shards_fused_qkv_stays(self, monkeypatch):
+    def test_gqa_packed_qkv_and_ffn(self, monkeypatch):
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
         from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
 
         class FakeMesh:
             world_size = 2
@@ -1623,14 +1624,19 @@ class TestNextDiTMLPOnly:
         monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
         monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
 
-        dim, heads = 128, 8
+        dim, heads, kv_heads, head_dim = 128, 8, 4, 16
+        qkv_out = (heads + kv_heads + kv_heads) * head_dim
+        assert "NextDiT" in TP_HEAD_SPLIT_MODELS
 
         class JointAttention(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.n_local_heads = heads
-                self.qkv = nn.Linear(dim, dim * 3, bias=False)
-                self.out = nn.Linear(dim, dim, bias=False)
+                self.n_local_kv_heads = kv_heads
+                self.n_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, qkv_out, bias=False)
+                self.out = nn.Linear(heads * head_dim, dim, bias=False)
 
         class FeedForward(nn.Module):
             def __init__(self):
@@ -1649,19 +1655,28 @@ class TestNextDiTMLPOnly:
         class NextDiT(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.n_heads = heads
                 self.layers = nn.ModuleList([JointTransformerBlock()])
                 self.noise_refiner = nn.ModuleList([JointTransformerBlock()])
 
         model = NextDiT()
         assert patcher.parallelize_model(model) is True
-        assert isinstance(model.layers[0].attention.qkv, nn.Linear)
-        assert isinstance(model.layers[0].attention.out, nn.Linear)
+        qkv = model.layers[0].attention.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_sizes == (heads * head_dim, kv_heads * head_dim, kv_heads * head_dim)
+        assert qkv.local_out_features == qkv_out // 2
+        assert isinstance(model.layers[0].attention.out, ParallelLinear)
+        assert model.layers[0].attention.out.mode == "rowwise"
         assert isinstance(model.layers[0].feed_forward.w1, ParallelLinear)
         assert model.layers[0].feed_forward.w1.mode == "colwise"
         assert isinstance(model.layers[0].feed_forward.w2, ParallelLinear)
         assert model.layers[0].feed_forward.w2.mode == "rowwise"
         assert isinstance(model.layers[0].adaLN_modulation[1], nn.Linear)
-        assert isinstance(model.noise_refiner[0].feed_forward.w1, ParallelLinear)
+        assert model.layers[0].attention.n_local_heads == heads // 2
+        assert model.layers[0].attention.n_local_kv_heads == kv_heads // 2
+        assert model.n_heads == heads
+        assert isinstance(model.noise_refiner[0].attention.qkv, ParallelLinear)
 
 
 class TestIdeogram4TP:
@@ -1915,6 +1930,47 @@ class TestPackedColwise:
             start = p * inner + rank_id * local
             expected.append(full_out_t[..., start:start + local])
         torch.testing.assert_close(got, torch.cat(expected, dim=-1), atol=1e-5, rtol=1e-5)
+
+
+class TestUnequalPackedColwise:
+    """GQA fused QKV: packs are [Q heads | K kv | V kv], not equal thirds."""
+
+    def test_gqa_pack_sizes_rank0_and_rank1(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+
+        hidden, ws = 32, 2
+        q_size, kv_size = 128, 64
+        pack_sizes = (q_size, kv_size, kv_size)
+        full_out = sum(pack_sizes)
+
+        def run(rank_id):
+            class FakeMesh:
+                world_size = ws
+                current_device = "cpu"
+            FakeMesh.rank = rank_id
+            monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+            layer = pl_module.ParallelLinear(
+                hidden, full_out, bias=True, mode="colwise", pack_sizes=pack_sizes,
+            )
+            assert layer.pack_count == 3
+            assert layer.pack_sizes == pack_sizes
+            assert layer.local_out_features == (q_size + kv_size + kv_size) // ws
+            full_w = torch.arange(full_out * hidden, dtype=torch.float32).reshape(full_out, hidden)
+            layer.load_shard(full_w)
+            expected = []
+            offset = 0
+            for size in pack_sizes:
+                local = size // ws
+                start = offset + rank_id * local
+                expected.append(full_w[start:start + local])
+                offset += size
+            torch.testing.assert_close(layer.weight.data, torch.cat(expected, dim=0))
+            naive = full_w[: layer.local_out_features]
+            assert not torch.equal(layer.weight.data, naive)
+
+        run(0)
+        run(1)
 
 
 class TestPackedColwiseLoRA:
