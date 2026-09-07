@@ -238,6 +238,16 @@ class TestGetTPTargets:
         assert get_tp_targets(I4()) == ["layers"]
         assert get_tp_targets(I42D()) == ["layers"]
 
+    def test_joyimage_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Joy = self._make_model_class("JoyImageTransformer3DModel")
+        assert get_tp_targets(Joy()) == ["double_blocks"]
+
+    def test_lens_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Lens = self._make_model_class("LensTransformer2DModel")
+        assert get_tp_targets(Lens()) == ["transformer_blocks"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -1654,12 +1664,13 @@ class TestNextDiTMLPOnly:
         assert isinstance(model.noise_refiner[0].feed_forward.w1, ParallelLinear)
 
 
-class TestIdeogram4MLPOnly:
-    def test_ffn_shards_fused_qkv_stays(self, monkeypatch):
+class TestIdeogram4TP:
+    def test_packed_qkv_and_ffn(self, monkeypatch):
         import torch.nn as nn
         from comfy.distributed import patcher
         from comfy.distributed import parallel_linear as pl_module
         from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
 
         class FakeMesh:
             world_size = 2
@@ -1669,11 +1680,13 @@ class TestIdeogram4MLPOnly:
         monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
 
         dim = 128
+        assert "Ideogram4Transformer" in TP_HEAD_SPLIT_MODELS
 
         class Ideogram4Attention(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.num_heads = 8
+                self.head_dim = 16
                 self.qkv = nn.Linear(dim, dim * 3, bias=False)
                 self.o = nn.Linear(dim, dim, bias=False)
 
@@ -1694,15 +1707,146 @@ class TestIdeogram4MLPOnly:
         class Ideogram4Transformer(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.head_dim = 16
                 self.layers = nn.ModuleList([Ideogram4TransformerBlock()])
 
         model = Ideogram4Transformer()
         assert patcher.parallelize_model(model) is True
-        assert isinstance(model.layers[0].attention.qkv, nn.Linear)
-        assert isinstance(model.layers[0].attention.o, nn.Linear)
+        qkv = model.layers[0].attention.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert qkv.local_out_features == 3 * (dim // 2)
+        assert isinstance(model.layers[0].attention.o, ParallelLinear)
+        assert model.layers[0].attention.o.mode == "rowwise"
         assert isinstance(model.layers[0].adaln_modulation, nn.Linear)
         assert isinstance(model.layers[0].feed_forward.w1, ParallelLinear)
         assert model.layers[0].feed_forward.w2.mode == "rowwise"
+        assert model.layers[0].attention.num_heads == 4
+        assert model.head_dim == 16
+
+
+class TestJoyImageTP:
+    def test_packed_double_stream_qkv(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class JoyImageAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = 8
+                self.img_attn_qkv = nn.Linear(dim, dim * 3, bias=True)
+                self.img_attn_proj = nn.Linear(dim, dim, bias=True)
+                self.txt_attn_qkv = nn.Linear(dim, dim * 3, bias=True)
+                self.txt_attn_proj = nn.Linear(dim, dim, bias=True)
+
+        class JoyImageFeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.ModuleList([
+                    nn.Sequential(nn.Linear(dim, dim * 4)),
+                    nn.Identity(),
+                    nn.Linear(dim * 4, dim),
+                ])
+                self.net[0].proj = self.net[0][0]
+
+        class JoyImageTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = JoyImageAttention()
+                self.img_mlp = JoyImageFeedForward()
+                self.txt_mlp = JoyImageFeedForward()
+
+        class JoyImageTransformer3DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.double_blocks = nn.ModuleList([JoyImageTransformerBlock()])
+
+        model = JoyImageTransformer3DModel()
+        assert patcher.parallelize_model(model) is True
+        qkv = model.double_blocks[0].attn.img_attn_qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert isinstance(model.double_blocks[0].attn.txt_attn_qkv, ParallelLinear)
+        assert model.double_blocks[0].attn.txt_attn_qkv.pack_count == 3
+        assert model.double_blocks[0].attn.img_attn_proj.mode == "rowwise"
+        assert model.double_blocks[0].attn.txt_attn_proj.mode == "rowwise"
+        assert isinstance(model.double_blocks[0].img_mlp.net[2], ParallelLinear)
+        assert model.double_blocks[0].img_mlp.net[2].mode == "rowwise"
+        assert model.double_blocks[0].attn.num_attention_heads == 4
+
+
+class TestLensTP:
+    def test_packed_joint_qkv_and_swiglu(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class LensJointAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = 8
+                self.dim_head = 16
+                self.img_qkv = nn.Linear(dim, 3 * dim, bias=True)
+                self.txt_qkv = nn.Linear(dim, 3 * dim, bias=True)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim), nn.Identity()])
+                self.to_add_out = nn.Linear(dim, dim)
+
+        class GateMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = nn.Linear(dim * 2, dim, bias=False)
+
+        class LensTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = LensJointAttention()
+                self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.img_mlp = GateMLP()
+                self.txt_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.txt_mlp = GateMLP()
+
+        class LensTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([LensTransformerBlock()])
+
+        model = LensTransformer2DModel()
+        assert patcher.parallelize_model(model) is True
+        qkv = model.transformer_blocks[0].attn.img_qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.pack_count == 3
+        assert isinstance(model.transformer_blocks[0].attn.txt_qkv, ParallelLinear)
+        assert model.transformer_blocks[0].attn.to_out[0].mode == "rowwise"
+        assert model.transformer_blocks[0].attn.to_add_out.mode == "rowwise"
+        assert isinstance(model.transformer_blocks[0].img_mod[1], nn.Linear)
+        assert model.transformer_blocks[0].img_mlp.w1.mode == "colwise"
+        assert model.transformer_blocks[0].img_mlp.w2.mode == "rowwise"
+        assert model.transformer_blocks[0].attn.heads == 4
 
 
 class TestPackedColwise:

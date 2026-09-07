@@ -65,6 +65,8 @@ TP_TARGETS = {
     "NextDiT": ["layers", "noise_refiner", "context_refiner", "siglip_refiner"],
     "Ideogram4Transformer": ["layers"],
     "MiniMaxH3Model": ["blocks"],  # packed QKV + packed SwiGLU
+    "JoyImageTransformer3DModel": ["double_blocks"],  # packed img/txt_attn_qkv
+    "LensTransformer2DModel": ["transformer_blocks"],  # packed img_qkv/txt_qkv
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -147,9 +149,10 @@ NEXTDIT_EXCLUDED_LAYER_NAMES = (
     "attention.qkv", "attention.out", "adaLN_modulation.0",
 )
 
-# Ideogram 4: fused qkv, out is `attention.o`, adaLN is a bare Linear.
+# Ideogram 4: adaLN is a bare Linear chunked 4-way. Packed qkv/o un-exclude
+# at runtime (equal-width [Q|K|V], same view as Flux/SD3).
 IDEOGRAM4_EXCLUDED_LAYER_NAMES = (
-    "attention.qkv", "attention.o", "adaln_modulation",
+    "adaln_modulation",
 )
 
 # MiniMax H3 adaLN is a chunked Linear (expand * hidden * modalities).
@@ -170,15 +173,20 @@ _SD3_QKV_FAMILIES = frozenset({"OpenAISignatureMMDITWrapper", "MMDiT"})
 _SD3_ATTN_TP = (
     ".attn.qkv", ".attn.proj", ".attn2.qkv", ".attn2.proj",
 )
-_PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES
+_PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozenset({
+    "Ideogram4Transformer",
+    "JoyImageTransformer3DModel",
+    "LensTransformer2DModel",
+})
 
 
 def _packed_colwise_count(name, mro_names):
     """Equal-sized output packs that must be sharded independently.
 
     MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
-    SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 ``*.qkv`` is
-    ``[Q|K|V]`` (3). Other architectures keep pack_count=1.
+    SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 / Ideogram /
+    JoyImage / Lens fused ``*qkv`` is ``[Q|K|V]`` (3). Other architectures
+    keep pack_count=1.
     """
     if "MiniMaxH3Model" in mro_names:
         if name.endswith("qkv_proj"):
@@ -187,7 +195,7 @@ def _packed_colwise_count(name, mro_names):
             return 2
         return 1
     if mro_names & _PACKED_QKV_FAMILIES:
-        if name.endswith(".qkv"):
+        if name.endswith(".qkv") or name.endswith("_qkv"):
             return 3
         return 1
     return 1
@@ -221,12 +229,15 @@ TP_HEAD_SPLIT_MODELS = {
     "Chroma",
     "OpenAISignatureMMDITWrapper",
     "MMDiT",
+    "Ideogram4Transformer",
+    "JoyImageTransformer3DModel",
+    "LensTransformer2DModel",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv")
 # Attribute names for head count / head dim.
-_HEADS_ATTRS = ("heads", "n_heads", "num_heads")
+_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads")
 _DIM_HEAD_ATTRS = ("dim_head", "head_dim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
