@@ -29,6 +29,8 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | Chroma | `Chroma` | `double_blocks`, `single_blocks` |
 | ACE-Step 1.0 | `ACEStepTransformer2DModel` | `transformer_blocks` (head-split; conv FF unreplicated) |
 | ACE-Step 1.5 | `AceStepConditionGenerationModel` | `decoder.layers` (head-split + GQA; lyric encoder excluded) |
+| Lumina NextDiT / Z-Image | `NextDiT` | `layers`, `noise_refiner`, `context_refiner`, `siglip_refiner` (MLP-only) |
+| Ideogram 4 | `Ideogram4Transformer` | `layers` (MLP-only) |
 
 Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel.
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.

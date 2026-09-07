@@ -226,6 +226,18 @@ class TestGetTPTargets:
         assert get_tp_targets(ACE()) == ["transformer_blocks"]
         assert get_tp_targets(ACE15()) == ["decoder.layers"]
 
+    def test_nextdit_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Next = self._make_model_class("NextDiT")
+        assert get_tp_targets(Next()) == ["layers", "noise_refiner", "context_refiner", "siglip_refiner"]
+
+    def test_ideogram4_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        I4 = self._make_model_class("Ideogram4Transformer")
+        I42D = self._make_model_class("Ideogram4Transformer2DModel", (I4,))
+        assert get_tp_targets(I4()) == ["layers"]
+        assert get_tp_targets(I42D()) == ["layers"]
+
     def test_minimax_h3_denied(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -1473,3 +1485,111 @@ class TestACEStepTP:
         assert isinstance(model.lyric_encoder.q_proj, nn.Linear)
         assert model.lyric_encoder.num_heads == heads
         assert model.lyric_encoder.num_kv_heads == kv_heads
+
+
+class TestNextDiTMLPOnly:
+    """Lumina NextDiT / Z-Image: fused GQA qkv stays; unfused SwiGLU w1/w2/w3 shards."""
+
+    def test_ffn_shards_fused_qkv_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads = 128, 8
+
+        class JointAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_local_heads = heads
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.out = nn.Linear(dim, dim, bias=False)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = nn.Linear(dim * 2, dim, bias=False)
+
+        class JointTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = JointAttention()
+                self.feed_forward = FeedForward()
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(128, 4 * dim))
+
+        class NextDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([JointTransformerBlock()])
+                self.noise_refiner = nn.ModuleList([JointTransformerBlock()])
+
+        model = NextDiT()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.layers[0].attention.qkv, nn.Linear)
+        assert isinstance(model.layers[0].attention.out, nn.Linear)
+        assert isinstance(model.layers[0].feed_forward.w1, ParallelLinear)
+        assert model.layers[0].feed_forward.w1.mode == "colwise"
+        assert isinstance(model.layers[0].feed_forward.w2, ParallelLinear)
+        assert model.layers[0].feed_forward.w2.mode == "rowwise"
+        assert isinstance(model.layers[0].adaLN_modulation[1], nn.Linear)
+        assert isinstance(model.noise_refiner[0].feed_forward.w1, ParallelLinear)
+
+
+class TestIdeogram4MLPOnly:
+    def test_ffn_shards_fused_qkv_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class Ideogram4Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = nn.Linear(dim * 2, dim, bias=False)
+
+        class Ideogram4TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = Ideogram4Attention()
+                self.feed_forward = FeedForward()
+                self.adaln_modulation = nn.Linear(64, 4 * dim)
+
+        class Ideogram4Transformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([Ideogram4TransformerBlock()])
+
+        model = Ideogram4Transformer()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.layers[0].attention.qkv, nn.Linear)
+        assert isinstance(model.layers[0].attention.o, nn.Linear)
+        assert isinstance(model.layers[0].adaln_modulation, nn.Linear)
+        assert isinstance(model.layers[0].feed_forward.w1, ParallelLinear)
+        assert model.layers[0].feed_forward.w2.mode == "rowwise"

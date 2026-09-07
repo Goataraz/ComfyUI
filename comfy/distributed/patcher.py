@@ -62,6 +62,8 @@ TP_TARGETS = {
     "Chroma": ["double_blocks", "single_blocks"],          # Flux blocks, not a Flux subclass
     "ACEStepTransformer2DModel": ["transformer_blocks"],  # ACE-Step 1.0; FF is conv
     "AceStepConditionGenerationModel": ["decoder.layers"],  # ACE-Step 1.5 GQA DiT
+    "NextDiT": ["layers", "noise_refiner", "context_refiner", "siglip_refiner"],
+    "Ideogram4Transformer": ["layers"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -131,6 +133,18 @@ GENERALDIT_EXCLUDED_LAYER_NAMES = (
 # only GELU MLP (`ff.net.0.proj` / `ff.net.2`) shards.
 LTXV_EXCLUDED_LAYER_NAMES = (
     "to_q", "to_k", "to_v", "to_out.0", "to_gate_logits",
+)
+
+# Lumina NextDiT / Z-Image: fused GQA qkv pack + coupled out. Unfused
+# SwiGLU (w1/w3 colwise, w2 rowwise) still shards. adaLN_modulation.0 is
+# the Z-Image single-Linear Sequential; .1 is already global.
+NEXTDIT_EXCLUDED_LAYER_NAMES = (
+    "attention.qkv", "attention.out", "adaLN_modulation.0",
+)
+
+# Ideogram 4: fused qkv, out is `attention.o`, adaLN is a bare Linear.
+IDEOGRAM4_EXCLUDED_LAYER_NAMES = (
+    "attention.qkv", "attention.o", "adaln_modulation",
 )
 
 # Models where TP sharding splits HEADS (not head_dim). For these models
@@ -374,6 +388,10 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(GENERALDIT_EXCLUDED_LAYER_NAMES)
     if "LTXVModel" in mro_names:
         excluded_names = excluded_names + tuple(LTXV_EXCLUDED_LAYER_NAMES)
+    if "NextDiT" in mro_names:
+        excluded_names = excluded_names + tuple(NEXTDIT_EXCLUDED_LAYER_NAMES)
+    if "Ideogram4Transformer" in mro_names:
+        excluded_names = excluded_names + tuple(IDEOGRAM4_EXCLUDED_LAYER_NAMES)
 
     count = 0
     skipped_dims = 0
