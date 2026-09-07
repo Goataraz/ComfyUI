@@ -31,16 +31,17 @@ Each GPU holds a shard of the model and cooperates on every forward pass via NCC
 | ACE-Step 1.5 | `AceStepConditionGenerationModel` | `decoder.layers` (head-split + GQA; lyric encoder excluded) |
 | Lumina NextDiT / Z-Image | `NextDiT` | `layers`, `noise_refiner`, `context_refiner`, `siglip_refiner` (MLP-only) |
 | Ideogram 4 | `Ideogram4Transformer` | `layers` (MLP-only) |
+| MiniMax H3 | `MiniMaxH3Model` | `blocks` (packed QKV + packed SwiGLU, head-split) |
 
-Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel.
+Head-split models (heads divided by world_size): QwenImage, MiniTrainDIT, WanModel (and CausalWan via MRO), HiDreamImageTransformer2DModel, ACE-Step 1.0/1.5, MiniMax H3.
 GeneralDIT is **not** head-split — attention projections are excluded, so only MLP linears shard.
-Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos per-head norms stay replicated.
+Wan / HiDream full-dim QK RMSNorms are sliced to the local shard; QwenImage / Cosmos / MiniMax per-head norms stay replicated.
 
 CausalWan keeps `num_heads` on the outer model (KV cache) and on `WanAttentionBlock` (cross-attn). After Attention modules are head-split, leftover `heads` / `n_heads` / `num_heads` that still equal the pre-split count are synced to the local shard.
 
 HiDream O1 is **not** supported — its integrated Llama2 LLM receives input from non-TP visual/x_embedder components and needs a full-model TP strategy that shards the vision encoder too. The `HiDreamO1Transformer` class is in `TP_UNSUPPORTED` and `get_tp_targets` returns `[]` for it.
 
-MiniMax H3 is **not** supported yet — fused `qkv_proj` (packed Q\|K\|V) and fused SwiGLU `fc1` (`ffn*2` then chunk) cannot be naively colwise-sharded.
+MiniMax H3 uses packed colwise sharding: `qkv_proj` is `[Q|K|V]` and `mlp.fc1` is fused SwiGLU `[gate|up]`. Each pack is head-split independently so `.split(heads * head_dim)` and `chunk(2)` stay correct.
 
 Model matching uses Python's MRO (Method Resolution Order) walk, so subclasses of supported models (e.g., `Anima(MiniTrainDIT)`, `CausalWanModel(WanModel)`) automatically inherit TP support.
 
@@ -130,10 +131,12 @@ When any rank encounters an error during prompt execution:
 - **Dynamic batching**: All ranks must process the same prompt; batch parallelism is not combined with TP
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
 - **HiDream O1**: Disabled — needs full-model TP including vision encoder
-- **MiniMax H3**: Disabled — fused QKV + fused SwiGLU need pack-aware sharding
+- **MiniMax H3**: Packed colwise. `qkv_proj` shards each of `[Q|K|V]` by heads; `fc1` shards each of `[gate|up]`; `fc2`/`out_proj` are rowwise. adaLN stays replicated.
 - **LTXV / LTXAV**: MLP-only. RoPE is rebuilt from full `num_attention_heads` × `inner_dim`, so FA/CA (`to_q`/`to_k`/`to_v`/`to_out.0`) stay replicated.
 - **HunyuanVideo**: Same fused-QKV exclusions as Flux (`img_attn.qkv`, `linear1`/`linear2`); double-stream MLP shards.
 - **Chroma**: Same Flux-style MLP TP as HunyuanVideo (`double_blocks` / `single_blocks`).
 - **ACE-Step 1.0**: Head-split attention (`transformer_blocks`). FF is `GLUMBConv` and stays replicated.
 - **ACE-Step 1.5**: Head-split + GQA (`decoder.layers` only). Lyric/timbre encoders stay full-width. `num_kv_heads` is divided only under that prefix.
+- **Lumina NextDiT / Z-Image**: MLP-only. Fused GQA `attention.qkv` stays replicated; unfused SwiGLU `w1`/`w3`/`w2` shards.
+- **Ideogram 4**: MLP-only. Fused `attention.qkv` + `attention.o` stay; lumina-style `w1`/`w2`/`w3` shards. `adaln_modulation` is a chunked Linear and is excluded.
 - **Cosmos GeneralDIT**: MLP-only. FA/CA Sequential projections (`attn.to_{q,k,v,out}.0`) stay replicated; `adaLN_modulation` is excluded globally.

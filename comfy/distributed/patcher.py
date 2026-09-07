@@ -64,6 +64,7 @@ TP_TARGETS = {
     "AceStepConditionGenerationModel": ["decoder.layers"],  # ACE-Step 1.5 GQA DiT
     "NextDiT": ["layers", "noise_refiner", "context_refiner", "siglip_refiner"],
     "Ideogram4Transformer": ["layers"],
+    "MiniMaxH3Model": ["blocks"],  # packed QKV + packed SwiGLU
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -80,7 +81,7 @@ ROWWISE_KEYWORDS = [
 COLWISE_KEYWORDS = [
     "to_q", "to_k", "to_v", "up", "w1", "w3", "to_q_t", "to_k_t", "to_v_t",
     "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj",
-    "mlp.layer1", "fc1",
+    "mlp.layer1", "fc1", "qkv_proj",
 ]
 
 # Layer names that must NOT be sharded. These are excluded because:
@@ -147,6 +148,26 @@ IDEOGRAM4_EXCLUDED_LAYER_NAMES = (
     "attention.qkv", "attention.o", "adaln_modulation",
 )
 
+# MiniMax H3 adaLN is a chunked Linear (expand * hidden * modalities).
+MINIMAX_EXCLUDED_LAYER_NAMES = (
+    "adaln_proj.linear",
+)
+
+
+def _packed_colwise_count(name, mro_names):
+    """Equal-sized output packs that must be sharded independently.
+
+    MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
+    SwiGLU ``[gate|up]`` (2). Other architectures keep pack_count=1.
+    """
+    if "MiniMaxH3Model" not in mro_names:
+        return 1
+    if name.endswith("qkv_proj"):
+        return 3
+    if name.endswith("fc1"):
+        return 2
+    return 1
+
 # Models where TP sharding splits HEADS (not head_dim). For these models
 # each rank holds a contiguous slice of the colwise projection's output
 # channels — i.e., a subset of heads with full per-head dim. The Attention
@@ -168,10 +189,11 @@ TP_HEAD_SPLIT_MODELS = {
     "HiDreamImageTransformer2DModel",
     "ACEStepTransformer2DModel",
     "AceStepConditionGenerationModel",
+    "MiniMaxH3Model",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads")
@@ -258,9 +280,6 @@ def _slice_full_dim_qk_norms(module, local_heads, dim_head, mesh):
 TP_UNSUPPORTED = {
     # HiDreamO1: integrated Llama2 LLM + vision encoder coupling.
     "HiDreamO1Transformer",
-    # MiniMax H3: fused attn.qkv_proj (packed Q|K|V) and fused SwiGLU
-    # mlp.fc1 (ffn*2 then chunk). Naive colwise cuts across packs.
-    "MiniMaxH3Model",
     # GeneralDIT is allowlisted with MLP-only TP (attn projections stay
     # replicated via GENERALDIT_EXCLUDED_LAYER_NAMES). Full FA/CA head-split
     # needs a dedicated strategy: CA K/V are Linear(context→inner) while FA
@@ -392,6 +411,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(NEXTDIT_EXCLUDED_LAYER_NAMES)
     if "Ideogram4Transformer" in mro_names:
         excluded_names = excluded_names + tuple(IDEOGRAM4_EXCLUDED_LAYER_NAMES)
+    if "MiniMaxH3Model" in mro_names:
+        excluded_names = excluded_names + tuple(MINIMAX_EXCLUDED_LAYER_NAMES)
 
     count = 0
     skipped_dims = 0
@@ -442,16 +463,27 @@ def parallelize_model(model, sd=None, prefix=""):
                     mode = "rowwise"
 
                 # Skip layers where the shard dimension isn't evenly divisible
-                dim = module.out_features if mode == "colwise" else module.in_features
-                if dim % mesh.world_size != 0:
-                    skipped_dims += 1
-                    continue
+                pack_count = _packed_colwise_count(name, mro_names) if mode == "colwise" else 1
+                if pack_count > 1:
+                    if module.out_features % pack_count != 0:
+                        skipped_dims += 1
+                        continue
+                    pack_size = module.out_features // pack_count
+                    if pack_size % mesh.world_size != 0:
+                        skipped_dims += 1
+                        continue
+                else:
+                    dim = module.out_features if mode == "colwise" else module.in_features
+                    if dim % mesh.world_size != 0:
+                        skipped_dims += 1
+                        continue
 
                 new_layer = ParallelLinear(
                     in_features=module.in_features,
                     out_features=module.out_features,
                     bias=module.bias is not None,
-                    mode=mode
+                    mode=mode,
+                    pack_count=pack_count,
                 )
 
                 parent_name, _, child_name = name.rpartition('.')
@@ -503,11 +535,13 @@ def parallelize_model(model, sd=None, prefix=""):
             local_heads = heads // mesh.world_size
             if not isinstance(dim_head, int):
                 # ACE-Step 1.0 Attention stores heads but not dim_head.
-                # After colwise shard, local_out_features is the local slice.
+                # Packed QKV local_out is pack_count * local_heads * dim_head.
                 local_out = getattr(q_proj, "local_out_features", None)
-                if local_heads == 0 or not isinstance(local_out, int) or local_out % local_heads != 0:
+                pack = getattr(q_proj, "pack_count", 1) or 1
+                denom = local_heads * pack
+                if denom == 0 or not isinstance(local_out, int) or local_out % denom != 0:
                     continue
-                dim_head = local_out // local_heads
+                dim_head = local_out // denom
             if heads_attr is not None:
                 setattr(module, heads_attr, local_heads)
             # Also keep sibling aliases in sync (some modules expose both).
@@ -557,9 +591,7 @@ def load_tp_shards(model, sd, prefix=""):
                 if bias_key in sd:
                     full_bias = sd.pop(bias_key)
                     if module.mode == "colwise":
-                        start = mesh.rank * module.local_out_features
-                        end = start + module.local_out_features
-                        module.bias.data = full_bias[start:end].to(mesh.current_device)
+                        module.load_bias_shard(full_bias)
                     else:
                         module.bias.data = full_bias.to(mesh.current_device)
                 else:

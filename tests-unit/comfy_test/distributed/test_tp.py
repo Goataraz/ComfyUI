@@ -238,11 +238,11 @@ class TestGetTPTargets:
         assert get_tp_targets(I4()) == ["layers"]
         assert get_tp_targets(I42D()) == ["layers"]
 
-    def test_minimax_h3_denied(self):
+    def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
-        assert "MiniMaxH3Model" in TP_UNSUPPORTED
-        assert get_tp_targets(MiniMax()) == []
+        assert "MiniMaxH3Model" not in TP_UNSUPPORTED
+        assert get_tp_targets(MiniMax()) == ["blocks"]
 
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -1593,3 +1593,143 @@ class TestIdeogram4MLPOnly:
         assert isinstance(model.layers[0].adaln_modulation, nn.Linear)
         assert isinstance(model.layers[0].feed_forward.w1, ParallelLinear)
         assert model.layers[0].feed_forward.w2.mode == "rowwise"
+
+
+class TestPackedColwise:
+    """Fused QKV / SwiGLU: shard each pack, then concat — not a naive out-dim cut."""
+
+    def test_qkv_pack_slice_rank0_and_rank1(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+
+        pack, heads, head_dim, hidden, ws = 3, 8, 16, 32, 2
+        inner = heads * head_dim
+        full_out = pack * inner
+
+        def run(rank_id):
+            class FakeMesh:
+                world_size = ws
+                current_device = "cpu"
+            FakeMesh.rank = rank_id
+
+            monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+            layer = pl_module.ParallelLinear(hidden, full_out, bias=True, mode="colwise", pack_count=pack)
+            assert layer.pack_count == pack
+            assert layer.local_out_features == pack * (inner // ws)
+            full_w = torch.arange(full_out * hidden, dtype=torch.float32).reshape(full_out, hidden)
+            full_b = torch.arange(full_out, dtype=torch.float32)
+            layer.load_shard(full_w)
+            layer.load_bias_shard(full_b)
+            local_inner = inner // ws
+            expected = []
+            for p in range(pack):
+                start = p * inner + rank_id * local_inner
+                expected.append(full_w[start:start + local_inner])
+            torch.testing.assert_close(layer.weight.data, torch.cat(expected, dim=0))
+            expected_b = []
+            for p in range(pack):
+                start = p * inner + rank_id * local_inner
+                expected_b.append(full_b[start:start + local_inner])
+            torch.testing.assert_close(layer.bias.data, torch.cat(expected_b, dim=0))
+
+        run(0)
+        run(1)
+
+    def test_packed_colwise_forward_matches_per_pack_head_slice(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+
+        pack, inner, hidden, ws, rank_id = 3, 8, 4, 2, 0
+        full_out = pack * inner
+
+        class FakeMesh:
+            world_size = ws
+            current_device = "cpu"
+        FakeMesh.rank = rank_id
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        torch.manual_seed(0)
+        full_w = torch.randn(full_out, hidden)
+        x = torch.randn(2, hidden)
+        full_out_t = x @ full_w.t()
+        layer = pl_module.ParallelLinear(hidden, full_out, bias=False, mode="colwise", pack_count=pack)
+        layer.load_shard(full_w)
+        got = layer(x)
+        local = inner // ws
+        expected = []
+        for p in range(pack):
+            start = p * inner + rank_id * local
+            expected.append(full_out_t[..., start:start + local])
+        torch.testing.assert_close(got, torch.cat(expected, dim=-1), atol=1e-5, rtol=1e-5)
+
+
+class TestMiniMaxH3TP:
+    """MiniMax H3: packed qkv_proj + packed SwiGLU fc1; adaLN stays; heads follow shard."""
+
+    def test_packed_qkv_swiglu_and_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim, ffn = 128, 8, 16, 128
+        inner = heads * head_dim
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.qkv_proj = nn.Linear(dim, inner * 3, bias=False)
+                self.out_proj = nn.Linear(inner, dim, bias=False)
+                self.q_norm = nn.RMSNorm(head_dim)
+                self.k_norm = nn.RMSNorm(head_dim)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(dim, ffn * 2, bias=False)
+                self.fc2 = nn.Linear(ffn, dim, bias=False)
+
+        class AdalnProj(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 6 * dim * 3)
+
+        class DiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.mlp = MLP()
+                self.adaln_proj = AdalnProj()
+
+        class MiniMaxH3Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([DiTBlock()])
+
+        model = MiniMaxH3Model()
+        assert patcher.parallelize_model(model) is True
+        attn = model.blocks[0].attn
+        assert isinstance(attn.qkv_proj, ParallelLinear)
+        assert attn.qkv_proj.mode == "colwise"
+        assert attn.qkv_proj.pack_count == 3
+        assert attn.qkv_proj.local_out_features == 3 * (inner // 2)
+        assert attn.heads == heads // 2
+        assert tuple(attn.q_norm.weight.shape) == (head_dim,)
+        assert isinstance(attn.out_proj, ParallelLinear)
+        assert attn.out_proj.mode == "rowwise"
+        mlp = model.blocks[0].mlp
+        assert isinstance(mlp.fc1, ParallelLinear)
+        assert mlp.fc1.pack_count == 2
+        assert mlp.fc1.local_out_features == 2 * (ffn // 2)
+        assert isinstance(mlp.fc2, ParallelLinear)
+        assert mlp.fc2.mode == "rowwise"
+        assert isinstance(model.blocks[0].adaln_proj.linear, nn.Linear)

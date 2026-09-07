@@ -27,27 +27,59 @@ from comfy.distributed.mesh import get_mesh
 
 class ParallelLinear(nn.Module):
     """A linear layer that supports Tensor Parallelism.
-    Can be configured as Colwise or Rowwise."""
-    def __init__(self, in_features, out_features, bias=True, mode="colwise"):
+    Can be configured as Colwise or Rowwise.
+
+    ``pack_count`` > 1 (colwise only) shards *inside* each equal-sized pack
+    along the output dim, then concatenates. That is the correct layout for
+    fused QKV (pack=3, ``[Q|K|V]``) and fused SwiGLU (pack=2, ``[gate|up]``).
+    Naive colwise would cut across packs.
+    """
+    def __init__(self, in_features, out_features, bias=True, mode="colwise", pack_count=1):
         super().__init__()
         self.mesh = get_mesh()
         self.rank = self.mesh.rank
         self.world_size = self.mesh.world_size
         self.mode = mode
+        self.pack_count = int(pack_count) if pack_count else 1
+        if self.pack_count < 1:
+            raise ValueError(f"pack_count must be >= 1, got {pack_count}")
+        if self.pack_count > 1 and mode != "colwise":
+            raise ValueError("pack_count > 1 is only valid for colwise layers")
 
         # Determine local dimensions based on TP mode
         if mode == "colwise":
-            assert out_features % self.world_size == 0, (
-                f"[TP] colwise: out_features={out_features} not divisible by world_size={self.world_size}"
-            )
-            self.local_out_features = out_features // self.world_size
-            self.local_in_features = in_features
+            if self.pack_count > 1:
+                if out_features % self.pack_count != 0:
+                    raise ValueError(
+                        f"[TP] packed colwise: out_features={out_features} not divisible by "
+                        f"pack_count={self.pack_count}"
+                    )
+                pack_size = out_features // self.pack_count
+                if pack_size % self.world_size != 0:
+                    raise ValueError(
+                        f"[TP] packed colwise: pack_size={pack_size} not divisible by "
+                        f"world_size={self.world_size}"
+                    )
+                self.pack_size = pack_size
+                self.local_pack_size = pack_size // self.world_size
+                self.local_out_features = self.pack_count * self.local_pack_size
+                self.local_in_features = in_features
+            else:
+                assert out_features % self.world_size == 0, (
+                    f"[TP] colwise: out_features={out_features} not divisible by world_size={self.world_size}"
+                )
+                self.pack_size = out_features
+                self.local_pack_size = out_features // self.world_size
+                self.local_out_features = out_features // self.world_size
+                self.local_in_features = in_features
         elif mode == "rowwise":
             assert in_features % self.world_size == 0, (
                 f"[TP] rowwise: in_features={in_features} not divisible by world_size={self.world_size}"
             )
             self.local_in_features = in_features // self.world_size
             self.local_out_features = out_features
+            self.pack_size = out_features
+            self.local_pack_size = out_features
         else:
             raise ValueError(f"Invalid TP mode: {mode}. Must be 'colwise' or 'rowwise'.")
 
@@ -129,14 +161,22 @@ class ParallelLinear(nn.Module):
                 res += b
             return res
 
+    def _packed_colwise_slices(self):
+        """Slices along the output dim for this rank, one per pack."""
+        if self.pack_count <= 1:
+            start = self.rank * self.local_out_features
+            return (slice(start, start + self.local_out_features),)
+        slices = []
+        for p in range(self.pack_count):
+            start = p * self.pack_size + self.rank * self.local_pack_size
+            slices.append(slice(start, start + self.local_pack_size))
+        return tuple(slices)
+
     def load_shard(self, full_weight_tensor):
         """Slices the full weight tensor and loads the shard for this rank."""
-        out_f, in_f = full_weight_tensor.shape
-
         if self.mode == "colwise":
-            start = self.rank * self.local_out_features
-            end = start + self.local_out_features
-            shard = full_weight_tensor[start:end, :]
+            pieces = [full_weight_tensor[s, :] for s in self._packed_colwise_slices()]
+            shard = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
         elif self.mode == "rowwise":
             start = self.rank * self.local_in_features
             end = start + self.local_in_features
@@ -145,3 +185,12 @@ class ParallelLinear(nn.Module):
             raise RuntimeError(f"[TP] load_shard: unexpected mode '{self.mode}'")
 
         self.weight.data = shard.to(device=self.mesh.current_device)
+
+    def load_bias_shard(self, full_bias_tensor):
+        """Slice a full bias the same way as the colwise weight output dim."""
+        if self.mode != "colwise":
+            self.bias.data = full_bias_tensor.to(device=self.mesh.current_device)
+            return
+        pieces = [full_bias_tensor[s] for s in self._packed_colwise_slices()]
+        shard = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        self.bias.data = shard.to(device=self.mesh.current_device)
