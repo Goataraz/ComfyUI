@@ -260,6 +260,13 @@ class TestGetTPTargets:
         Mochi = self._make_model_class("AsymmDiTJoint")
         assert get_tp_targets(Mochi()) == ["blocks"]
 
+    def test_hunyuandit_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        HY = self._make_model_class("HunYuanDiT")
+        Plain = self._make_model_class("HunYuanDiTPlain")
+        assert get_tp_targets(HY()) == ["blocks"]
+        assert get_tp_targets(Plain()) == []
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -2053,6 +2060,81 @@ class TestMochiTP:
         assert model.num_heads == heads
         assert model.pos_frequencies.shape == (3, heads // 2, head_dim // 2)
         torch.testing.assert_close(model.pos_frequencies.data, full_pf[:, : heads // 2])
+
+
+class TestHunYuanDiTTP:
+    """HunyuanDiT: packed Wqkv + packed kv_proj; modulation and skip stay."""
+
+    def test_packed_self_attn_and_cross_kv(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, ctx, heads = 128, 64, 8
+        assert "HunYuanDiT" in TP_HEAD_SPLIT_MODELS
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = dim // heads
+                self.Wqkv = nn.Linear(dim, dim * 3, bias=True)
+                self.out_proj = nn.Linear(dim, dim)
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = dim // heads
+                self.q_proj = nn.Linear(dim, dim, bias=True)
+                self.kv_proj = nn.Linear(ctx, 2 * dim, bias=True)
+                self.out_proj = nn.Linear(dim, dim)
+
+        class HunYuanDiTBlock(nn.Module):
+            def __init__(self, skip=False):
+                super().__init__()
+                self.attn1 = Attention()
+                self.attn2 = CrossAttention()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(dim, dim * 4)
+                self.mlp.fc2 = nn.Linear(dim * 4, dim)
+                self.default_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim))
+                self.skip_linear = nn.Linear(2 * dim, dim) if skip else None
+
+        class HunYuanDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.blocks = nn.ModuleList([HunYuanDiTBlock(skip=False), HunYuanDiTBlock(skip=True)])
+
+        model = HunYuanDiT()
+        assert patcher.parallelize_model(model) is True
+        wqkv = model.blocks[0].attn1.Wqkv
+        assert isinstance(wqkv, ParallelLinear)
+        assert wqkv.pack_count == 3
+        assert model.blocks[0].attn1.out_proj.mode == "rowwise"
+        kv = model.blocks[0].attn2.kv_proj
+        assert isinstance(kv, ParallelLinear)
+        assert kv.pack_count == 2
+        assert isinstance(model.blocks[0].attn2.q_proj, ParallelLinear)
+        assert model.blocks[0].attn2.q_proj.mode == "colwise"
+        assert model.blocks[0].attn2.out_proj.mode == "rowwise"
+        assert isinstance(model.blocks[0].default_modulation[1], nn.Linear)
+        assert isinstance(model.blocks[1].skip_linear, nn.Linear)
+        assert model.blocks[0].attn1.num_heads == heads // 2
+        assert model.blocks[0].attn2.num_heads == heads // 2
+        assert model.num_heads == heads
+        assert isinstance(model.blocks[0].mlp.fc1, ParallelLinear)
+        assert model.blocks[0].mlp.fc2.mode == "rowwise"
 
 
 class TestPackedColwise:

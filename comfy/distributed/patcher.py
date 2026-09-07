@@ -69,6 +69,7 @@ TP_TARGETS = {
     "LensTransformer2DModel": ["transformer_blocks"],  # packed img_qkv/txt_qkv
     "PixDiT_T2I": ["patch_blocks", "pixel_blocks"],  # packed qkv_x/qkv_y + pixel qkv
     "AsymmDiTJoint": ["blocks"],  # Mochi: packed qkv_x/qkv_y + packed SwiGLU w1
+    "HunYuanDiT": ["blocks"],  # HunyuanDiT: packed Wqkv + packed kv_proj
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -178,6 +179,12 @@ MOCHI_EXCLUDED_LAYER_NAMES = (
     "mod_y",
 )
 
+# HunyuanDiT: default_modulation is a full-width shift; skip_linear cats 2*hidden.
+HYDIT_EXCLUDED_LAYER_NAMES = (
+    "default_modulation.1",
+    "skip_linear",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -197,6 +204,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "LensTransformer2DModel",
     "PixDiT_T2I",
     "AsymmDiTJoint",
+    "HunYuanDiT",
 })
 
 
@@ -220,9 +228,12 @@ def _packed_colwise_count(name, mro_names):
             or name.endswith("_qkv")
             or name.endswith(".qkv_x")
             or name.endswith(".qkv_y")
+            or name.endswith(".Wqkv")
         ):
             return 3
         if "AsymmDiTJoint" in mro_names and name.endswith(".w1"):
+            return 2
+        if "HunYuanDiT" in mro_names and name.endswith(".kv_proj"):
             return 2
         return 1
     return 1
@@ -287,10 +298,11 @@ TP_HEAD_SPLIT_MODELS = {
     "NextDiT",
     "PixDiT_T2I",
     "AsymmDiTJoint",
+    "HunYuanDiT",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
@@ -553,6 +565,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = tuple(e for e in excluded_names if e not in (".attn.qkv", ".attn.proj"))
     if "AsymmDiTJoint" in mro_names:
         excluded_names = excluded_names + tuple(MOCHI_EXCLUDED_LAYER_NAMES)
+    if "HunYuanDiT" in mro_names:
+        excluded_names = excluded_names + tuple(HYDIT_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
