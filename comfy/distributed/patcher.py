@@ -103,6 +103,12 @@ TP_TARGETS = {
     # Ernie Image: unfused to_q. Prefix `layers` so x_embedder / text_proj /
     # time embeddings / root adaLN / final_norm / final_linear stay.
     "ErnieImageModel": ["layers"],
+    # TripoSplat: packed attn.qkv. Repo layers shard final_map so RoPE
+    # head count matches; gate_map/content_map stay.
+    "LatentSeqMMFlowModel": [
+        "noise_refiner", "context_refiner", "blocks",
+        "noise_repo_layers", "context_repo_layers", "repo_layers",
+    ],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -251,6 +257,12 @@ KANDINSKY_EXCLUDED_LAYER_NAMES = (
     "modulation.out_layer",
 )
 
+# TripoSplat RePo3D: gate/content maps are a bottleneck consumed by final_map.
+TRIPOSPLAT_EXCLUDED_LAYER_NAMES = (
+    "gate_map",
+    "content_map",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -272,6 +284,7 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "AsymmDiTJoint",
     "HunYuanDiT",
     "PixArtMS",
+    "LatentSeqMMFlowModel",
 })
 
 
@@ -429,6 +442,7 @@ TP_HEAD_SPLIT_MODELS = {
     "Hunyuan3Dv2",
     "Kandinsky5",
     "ErnieImageModel",
+    "LatentSeqMMFlowModel",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -544,6 +558,34 @@ def _slice_mochi_pos_frequencies(model, local_heads, original_heads, mesh):
     )
     model._tp_pos_freq_shard = (start, end)
     return 1
+
+
+def _slice_multihead_rmsnorm(model, local_heads, original_heads, mesh):
+    """Slice TripoSplat MultiHeadRMSNorm.gamma from ``(heads, dim)`` to local heads.
+
+    Applied after packed QKV head-split so ``q * gamma`` broadcasts on the
+    local head axis. ``gamma`` is a Parameter, not a Linear.
+    """
+    if original_heads % mesh.world_size != 0:
+        return 0
+    start = mesh.rank * local_heads
+    end = start + local_heads
+    sliced = 0
+    for module in model.modules():
+        if type(module).__name__ != "MultiHeadRMSNorm":
+            continue
+        gamma = getattr(module, "gamma", None)
+        if gamma is None or not hasattr(gamma, "data"):
+            continue
+        if gamma.ndim != 2 or gamma.shape[0] != original_heads:
+            continue
+        module.gamma = nn.Parameter(
+            gamma.data[start:end].clone(),
+            requires_grad=gamma.requires_grad,
+        )
+        module._tp_mh_rms_shard = (start, end)
+        sliced += 1
+    return sliced
 
 
 # Models whose MRO would match a supported parent but that are NOT safe
@@ -740,6 +782,12 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = excluded_names + tuple(AURA_EXCLUDED_LAYER_NAMES)
     if "Kandinsky5" in mro_names:
         excluded_names = excluded_names + tuple(KANDINSKY_EXCLUDED_LAYER_NAMES)
+    if "LatentSeqMMFlowModel" in mro_names:
+        excluded_names = excluded_names + tuple(TRIPOSPLAT_EXCLUDED_LAYER_NAMES)
+        # RopeMultiHeadAttention.qkv collides with the SD3 `.attn.qkv` suffix.
+        excluded_names = tuple(
+            e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
+        )
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -837,6 +885,13 @@ def parallelize_model(model, sd=None, prefix=""):
                     or (
                         "Kandinsky5" in mro_names
                         and name.endswith(".out_layer")
+                    )
+                    or (
+                        "LatentSeqMMFlowModel" in mro_names
+                        and (
+                            name.endswith(".attn.out")
+                            or name.endswith(".mlp.2")
+                        )
                     )
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection
@@ -965,8 +1020,12 @@ def parallelize_model(model, sd=None, prefix=""):
             synced = _sync_bookkeeping_heads(model, original_heads, local_heads, targets)
             kv_synced = _sync_kv_heads(model, targets, mesh.world_size)
             pos_sliced = 0
-            if "AsymmDiTJoint" in {cls.__name__ for cls in type(model).__mro__}:
+            mh_sliced = 0
+            mro_now = {cls.__name__ for cls in type(model).__mro__}
+            if "AsymmDiTJoint" in mro_now:
                 pos_sliced = _slice_mochi_pos_frequencies(model, local_heads, original_heads, mesh)
+            if "LatentSeqMMFlowModel" in mro_now:
+                mh_sliced = _slice_multihead_rmsnorm(model, local_heads, original_heads, mesh)
             logging.info(
                 f"[TP] Head-split override ({model_class_name}): set heads={local_heads} "
                 f"(from {heads}) on {head_overrides} Attention modules"
@@ -974,6 +1033,7 @@ def parallelize_model(model, sd=None, prefix=""):
                 + (f"; synced {synced} leftover head-count attrs" if synced else "")
                 + (f"; synced {kv_synced} GQA kv-head attrs" if kv_synced else "")
                 + (f"; sliced pos_frequencies heads [{mesh.rank * local_heads}:{mesh.rank * local_heads + local_heads}]" if pos_sliced else "")
+                + (f"; sliced {mh_sliced} MultiHeadRMSNorm gammas" if mh_sliced else "")
             )
     return True
 
@@ -1035,6 +1095,18 @@ def load_tp_shards(model, sd, prefix=""):
                 start, end = pos_range
                 if full.ndim == 3 and end <= full.shape[1]:
                     pf.data = full[:, start:end].to(device=pf.device, dtype=pf.dtype)
+
+        mh_range = getattr(module, "_tp_mh_rms_shard", None)
+        gamma = getattr(module, "gamma", None)
+        if mh_range is not None and gamma is not None:
+            gamma_key = prefix + name + ".gamma"
+            if gamma_key in sd:
+                full = sd.pop(gamma_key)
+                start, end = mh_range
+                if full.ndim == 2 and end <= full.shape[0]:
+                    module.gamma.data = full[start:end].to(
+                        device=gamma.device, dtype=gamma.dtype
+                    )
 
     if missing > 0:
         logging.error(f"[TP] load_tp_shards: {loaded} weights loaded, {missing} MISSING for {model.__class__.__name__} — outputs will be incorrect")

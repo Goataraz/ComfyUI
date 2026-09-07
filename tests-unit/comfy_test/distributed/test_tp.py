@@ -243,6 +243,14 @@ class TestGetTPTargets:
         Ernie = self._make_model_class("ErnieImageModel")
         assert get_tp_targets(Ernie()) == ["layers"]
 
+    def test_triposplat_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Tripo = self._make_model_class("LatentSeqMMFlowModel")
+        assert get_tp_targets(Tripo()) == [
+            "noise_refiner", "context_refiner", "blocks",
+            "noise_repo_layers", "context_repo_layers", "repo_layers",
+        ]
+
     def test_ace_step_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         ACE = self._make_model_class("ACEStepTransformer2DModel")
@@ -3351,6 +3359,120 @@ class TestErnieImageTP:
         assert not isinstance(model.x_embedder, ParallelLinear)
         assert isinstance(model.final_linear, nn.Linear)
         assert not isinstance(model.final_linear, ParallelLinear)
+        assert model.num_heads == heads
+
+
+class TestTripoSplatTP:
+    """TripoSplat: packed attn.qkv; attn.out rowwise; MultiHeadRMSNorm/RePo heads follow shard."""
+
+    def test_packed_qkv_repo_and_mh_rmsnorm(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 128, 8, 16
+        assert "LatentSeqMMFlowModel" in TP_HEAD_SPLIT_MODELS
+
+        class MultiHeadRMSNorm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gamma = nn.Parameter(torch.ones(heads, head_dim))
+
+        class RopeMultiHeadAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.q_norm = MultiHeadRMSNorm()
+                self.k_norm = MultiHeadRMSNorm()
+                self.out = nn.Linear(dim, dim)
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Sequential(
+                    nn.Linear(dim, dim * 4),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim),
+                )
+
+        class UnifiedTransformerBlock(nn.Module):
+            def __init__(self, modulation=True):
+                super().__init__()
+                self.attn = RopeMultiHeadAttention()
+                self.mlp = MLP()
+                if modulation:
+                    self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+
+        class RePo3DRotaryEmbedding(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.gate_map = nn.Linear(dim, dim // 8, bias=False)
+                self.content_map = nn.Linear(dim, dim // 8, bias=False)
+                self.final_map = nn.Linear(dim // 8, 3 * heads, bias=False)
+
+        class LatentSeqMMFlowModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.input_layer = nn.Linear(16, dim)
+                self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.noise_refiner = nn.ModuleList([UnifiedTransformerBlock()])
+                self.context_refiner = nn.ModuleList([UnifiedTransformerBlock(modulation=False)])
+                self.blocks = nn.ModuleList([UnifiedTransformerBlock()])
+                self.noise_repo_layers = nn.ModuleList([RePo3DRotaryEmbedding()])
+                self.context_repo_layers = nn.ModuleList([RePo3DRotaryEmbedding()])
+                self.repo_layers = nn.ModuleList([RePo3DRotaryEmbedding()])
+                self.out_layer = nn.Linear(dim, 16)
+
+        model = LatentSeqMMFlowModel()
+        assert patcher.parallelize_model(model) is True
+        attn = model.blocks[0].attn
+        assert isinstance(attn.qkv, ParallelLinear)
+        assert attn.qkv.mode == "colwise"
+        assert attn.qkv.pack_count == 3
+        assert attn.qkv.local_out_features == 3 * (dim // 2)
+        assert isinstance(attn.out, ParallelLinear)
+        assert attn.out.mode == "rowwise"
+        assert attn.num_heads == heads // 2
+        assert tuple(attn.q_norm.gamma.shape) == (heads // 2, head_dim)
+        assert tuple(attn.k_norm.gamma.shape) == (heads // 2, head_dim)
+        mlp = model.blocks[0].mlp.mlp
+        assert isinstance(mlp[0], ParallelLinear)
+        assert mlp[0].mode == "colwise"
+        assert isinstance(mlp[2], ParallelLinear)
+        assert mlp[2].mode == "rowwise"
+        assert isinstance(model.blocks[0].adaLN_modulation[1], nn.Linear)
+        assert not isinstance(model.blocks[0].adaLN_modulation[1], ParallelLinear)
+        repo = model.repo_layers[0]
+        assert isinstance(repo.gate_map, nn.Linear)
+        assert not isinstance(repo.gate_map, ParallelLinear)
+        assert isinstance(repo.content_map, nn.Linear)
+        assert not isinstance(repo.content_map, ParallelLinear)
+        assert isinstance(repo.final_map, ParallelLinear)
+        assert repo.final_map.mode == "colwise"
+        assert repo.final_map.pack_count == 1
+        assert repo.final_map.local_out_features == 3 * (heads // 2)
+        assert repo.num_heads == heads // 2
+        assert model.noise_refiner[0].attn.qkv.pack_count == 3
+        assert model.context_refiner[0].attn.out.mode == "rowwise"
+        assert isinstance(model.input_layer, nn.Linear)
+        assert not isinstance(model.input_layer, ParallelLinear)
+        assert isinstance(model.out_layer, nn.Linear)
+        assert not isinstance(model.out_layer, ParallelLinear)
         assert model.num_heads == heads
 
 
