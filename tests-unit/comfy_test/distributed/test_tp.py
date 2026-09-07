@@ -290,6 +290,16 @@ class TestGetTPTargets:
         # Production OmniGen2 is 21/7 — neither divides by 2-GPU world_size.
         assert get_tp_targets(Omni()) == []
 
+    def test_krea2_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Krea = self._make_model_class("SingleStreamDiT")
+        assert get_tp_targets(Krea()) == ["blocks"]
+
+    def test_mageflow_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Mage = self._make_model_class("MageFlowTransformer2DModel")
+        assert get_tp_targets(Mage()) == ["transformer_blocks"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -2569,6 +2579,141 @@ class TestBooguTP:
         assert model.double_stream_layers[0].img_self_attn.heads == heads // 2
         assert isinstance(model.x_embedder, nn.Linear)
         assert not isinstance(model.x_embedder, ParallelLinear)
+
+
+class TestKrea2TP:
+    """Krea2 SingleStreamDiT: unfused GQA 48/12 — both divide by 2. Shard Q+KV, keep txtfusion."""
+
+    def test_gqa_wq_wk_and_gate(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, kvheads, headdim = 64, 8, 2, 8
+        assert "SingleStreamDiT" in TP_HEAD_SPLIT_MODELS
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kvheads = kvheads
+                self.headdim = headdim
+                self.wq = nn.Linear(dim, heads * headdim, bias=False)
+                self.wk = nn.Linear(dim, kvheads * headdim, bias=False)
+                self.wv = nn.Linear(dim, kvheads * headdim, bias=False)
+                self.gate = nn.Linear(dim, dim, bias=False)
+                self.wo = nn.Linear(dim, dim, bias=False)
+
+        class SwiGLU(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate = nn.Linear(dim, dim * 2, bias=False)
+                self.up = nn.Linear(dim, dim * 2, bias=False)
+                self.down = nn.Linear(dim * 2, dim, bias=False)
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.mlp = SwiGLU()
+
+        class TextFusionTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+
+        class SingleStreamDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.blocks = nn.ModuleList([SingleStreamBlock()])
+                self.txtfusion = TextFusionTransformer()
+                self.tproj = nn.Sequential(nn.GELU(), nn.Linear(dim, dim * 6))
+
+        model = SingleStreamDiT()
+        assert patcher.parallelize_model(model) is True
+        attn = model.blocks[0].attn
+        assert isinstance(attn.wq, ParallelLinear)
+        assert attn.wq.mode == "colwise"
+        assert isinstance(attn.wk, ParallelLinear)
+        assert isinstance(attn.wv, ParallelLinear)
+        assert isinstance(attn.gate, ParallelLinear)
+        assert attn.gate.mode == "colwise"
+        assert attn.wo.mode == "rowwise"
+        assert attn.heads == heads // 2
+        assert attn.kvheads == kvheads // 2
+        assert isinstance(model.blocks[0].mlp.gate, ParallelLinear)
+        assert model.blocks[0].mlp.down.mode == "rowwise"
+        assert isinstance(model.txtfusion.attn.wq, nn.Linear)
+        assert not isinstance(model.txtfusion.attn.wq, ParallelLinear)
+        assert isinstance(model.tproj[1], nn.Linear)
+        assert not isinstance(model.tproj[1], ParallelLinear)
+        assert model.heads == heads
+
+
+class TestMageFlowTP:
+    """MageFlow wraps QwenImageTransformerBlock under transformer_blocks."""
+
+    def test_qwen_blocks_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads = 64, 8
+        assert "MageFlowTransformer2DModel" in TP_HEAD_SPLIT_MODELS
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.dim_head = dim // heads
+                self.to_q = nn.Linear(dim, dim)
+                self.to_k = nn.Linear(dim, dim)
+                self.to_v = nn.Linear(dim, dim)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim)])
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attn()
+                self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+                self.img_mlp = nn.Module()
+                self.img_mlp.net = nn.ModuleList([nn.Module(), nn.Identity(), nn.Linear(dim * 4, dim)])
+                self.img_mlp.net[0].proj = nn.Linear(dim, dim * 4)
+
+        class MageFlowTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([Block()])
+                self.img_in = nn.Linear(16, dim)
+
+        model = MageFlowTransformer2DModel()
+        assert patcher.parallelize_model(model) is True
+        attn = model.transformer_blocks[0].attn
+        assert isinstance(attn.to_q, ParallelLinear)
+        assert attn.to_out[0].mode == "rowwise"
+        assert attn.heads == heads // 2
+        assert isinstance(model.transformer_blocks[0].img_mod[1], nn.Linear)
+        assert not isinstance(model.transformer_blocks[0].img_mod[1], ParallelLinear)
+        assert isinstance(model.img_in, nn.Linear)
 
 
 class TestPackedColwise:

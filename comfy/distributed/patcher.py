@@ -76,6 +76,12 @@ TP_TARGETS = {
         "noise_refiner", "ref_image_refiner", "context_refiner",
         "double_stream_layers", "single_stream_layers",
     ],  # Q-split; KV stays when kv_heads % world_size != 0
+    # Krea2: unfused GQA 48/12. Prefix `blocks` so txtfusion (txtheads=20)
+    # and tproj (6-way chunk) stay replicated.
+    "SingleStreamDiT": ["blocks"],
+    # MageFlow: 12× QwenImageTransformerBlock, not an MRO subclass of
+    # QwenImageTransformer2DModel.
+    "MageFlowTransformer2DModel": ["transformer_blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -372,14 +378,16 @@ TP_HEAD_SPLIT_MODELS = {
     "PixArtMS",
     "AudioDiffusionTransformer",
     "BooguTransformer2DModel",
+    "SingleStreamDiT",
+    "MageFlowTransformer2DModel",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
-_KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
-_DIM_HEAD_ATTRS = ("dim_head", "head_dim", "dim_heads")
+_KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
+_DIM_HEAD_ATTRS = ("dim_head", "head_dim", "dim_heads", "headdim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
 _FULL_DIM_QK_NORM_ATTRS = (
     "norm_q", "norm_k", "norm_k_img",
@@ -511,7 +519,11 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
     if original_heads == local_heads:
         return 0
     mro_names = {cls.__name__ for cls in type(model).__mro__}
-    skip_root_heads = bool(mro_names & _PACKED_QKV_FAMILIES) or "NextDiT" in mro_names
+    skip_root_heads = (
+        bool(mro_names & _PACKED_QKV_FAMILIES)
+        or "NextDiT" in mro_names
+        or "SingleStreamDiT" in mro_names
+    )
     synced = 0
     for name, module in model.named_modules():
         if name and not _name_under_targets(name, targets):
@@ -529,8 +541,9 @@ def _sync_bookkeeping_heads(model, original_heads, local_heads, targets=()):
         # RoPE metadata (attn_dim // num_heads) and must stay full.
         if type(module).__name__ in ("SingleStreamBlock", "PiTBlock"):
             continue
-        # Root Flux/Hunyuan/Chroma/SD3 num_heads and NextDiT.n_heads are
-        # constructor / RoPE metadata — attention modules own the reshape.
+        # Root Flux/Hunyuan/Chroma/SD3 num_heads, NextDiT.n_heads, and
+        # Krea2 SingleStreamDiT.heads are constructor / RoPE metadata —
+        # attention modules own the reshape.
         if skip_root_heads and not name:
             continue
         for attr in _HEADS_ATTRS:
@@ -708,6 +721,7 @@ def parallelize_model(model, sd=None, prefix=""):
                     any(k in name for k in ROWWISE_KEYWORDS)
                     or name.endswith(".net.2")
                     or name.endswith(".o")  # Wan attention output proj
+                    or name.endswith(".wo")  # Krea2 Attention.wo (not Wan `.o`)
                     or name.endswith(".layer2")  # Cosmos GPT2FeedForward.layer2
                     or name.endswith(".attention.out")  # NextDiT JointAttention.out
                     or (
@@ -727,6 +741,7 @@ def parallelize_model(model, sd=None, prefix=""):
                     # (the GELU+Dropout+Linear ModuleList's index-2 Linear),
                     # matching Flux's `mlp.2` rowwise convention.
                     # `.o` covers Wan's self_attn.o / cross_attn.o.
+                    # `.wo` covers Krea2 Attention.wo (`endswith(".o")` is False).
                     # `.layer2` covers Cosmos GeneralDIT / MiniTrainDIT MLP down.
                     # `.attention.out` is NextDiT's attention output (not `.o`).
                     mode = "rowwise"
