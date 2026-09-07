@@ -94,6 +94,12 @@ TP_TARGETS = {
     # OpenAISignatureMMDITWrapper and matches that key first. Aura's
     # concrete class is MMDiT with double_layers / single_layers.
     "MMDiT": ["double_layers", "single_layers"],
+    # Hunyuan3Dv2: Flux DoubleStreamBlock / SingleStreamBlock, not a Flux
+    # subclass. Packed double-stream QKV; fused linear1 stays.
+    "Hunyuan3Dv2": ["double_blocks", "single_blocks"],
+    # Kandinsky5: unfused to_query/to_key/to_value. Prefixes keep root
+    # OutLayer / embeddings unreplicated. Modulation.out_layer stays.
+    "Kandinsky5": ["text_transformer_blocks", "visual_transformer_blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -236,10 +242,16 @@ AURA_EXCLUDED_LAYER_NAMES = (
     "modCX.1",
 )
 
+# Kandinsky5: Modulation.out_layer is chunked 6-way (text) / 9-way (visual)
+# on full model_dim. Attn/FF `.out_layer` is sharded rowwise instead.
+KANDINSKY_EXCLUDED_LAYER_NAMES = (
+    "modulation.out_layer",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
-_DOUBLE_STREAM_QKV_FAMILIES = frozenset({"Flux", "HunyuanVideo", "Chroma"})
+_DOUBLE_STREAM_QKV_FAMILIES = frozenset({"Flux", "HunyuanVideo", "Chroma", "Hunyuan3Dv2"})
 _DOUBLE_STREAM_ATTN_TP = (
     "img_attn.qkv", "txt_attn.qkv", "img_attn.proj", "txt_attn.proj",
 )
@@ -411,10 +423,12 @@ TP_HEAD_SPLIT_MODELS = {
     "HunYuanDiTPlain",
     "CogVideoXTransformer3DModel",
     "NaDiT",
+    "Hunyuan3Dv2",
+    "Kandinsky5",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q", "to_query")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
@@ -719,6 +733,8 @@ def parallelize_model(model, sd=None, prefix=""):
     if "MMDiT" in mro_names and "OpenAISignatureMMDITWrapper" not in mro_names:
         # AuraFlow concrete class is MMDiT; SD3 wrapper keeps SD3 exclusions.
         excluded_names = excluded_names + tuple(AURA_EXCLUDED_LAYER_NAMES)
+    if "Kandinsky5" in mro_names:
+        excluded_names = excluded_names + tuple(KANDINSKY_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -812,6 +828,10 @@ def parallelize_model(model, sd=None, prefix=""):
                             or name.endswith(".img_out")
                             or name.endswith(".instruct_out")
                         )
+                    )
+                    or (
+                        "Kandinsky5" in mro_names
+                        and name.endswith(".out_layer")
                     )
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection

@@ -219,6 +219,25 @@ class TestGetTPTargets:
         Chroma = self._make_model_class("Chroma")
         assert get_tp_targets(Chroma()) == ["double_blocks", "single_blocks"]
 
+    def test_chroma_radiance_inherits(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Chroma = self._make_model_class("Chroma")
+        Radiance = self._make_model_class("ChromaRadiance", (Chroma,))
+        assert get_tp_targets(Radiance()) == ["double_blocks", "single_blocks"]
+
+    def test_hunyuan3dv2_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        HY3D = self._make_model_class("Hunyuan3Dv2")
+        assert get_tp_targets(HY3D()) == ["double_blocks", "single_blocks"]
+
+    def test_kandinsky5_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        K5 = self._make_model_class("Kandinsky5")
+        assert get_tp_targets(K5()) == [
+            "text_transformer_blocks",
+            "visual_transformer_blocks",
+        ]
+
     def test_ace_step_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         ACE = self._make_model_class("ACEStepTransformer2DModel")
@@ -3071,6 +3090,183 @@ class TestAuraFlowTP:
         assert sattn.n_heads == heads // 2
         assert isinstance(model.init_x_linear, nn.Linear)
         assert not isinstance(model.init_x_linear, ParallelLinear)
+
+
+class TestHunyuan3Dv2TP:
+    """Hunyuan3Dv2 reuses Flux DoubleStreamBlock; packed QKV, fused linear1 stays."""
+
+    def test_packed_qkv_and_head_split(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        assert "Hunyuan3Dv2" in TP_HEAD_SPLIT_MODELS
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_attn = SelfAttention()
+                self.txt_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+                self.txt_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.linear1 = nn.Linear(dim, dim * 3 + dim * 4)
+                self.linear2 = nn.Linear(dim + dim * 4, dim)
+
+        class Hunyuan3Dv2(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.latent_in = nn.Linear(64, dim)
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+                self.single_blocks = nn.ModuleList([SingleStreamBlock()])
+                self.final_layer = nn.Linear(dim, 64)
+
+        model = Hunyuan3Dv2()
+        assert patcher.parallelize_model(model) is True
+        qkv = model.double_blocks[0].img_attn.qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.mode == "colwise"
+        assert qkv.pack_count == 3
+        assert qkv.local_out_features == 3 * (dim // 2)
+        assert isinstance(model.double_blocks[0].img_attn.proj, ParallelLinear)
+        assert model.double_blocks[0].img_attn.proj.mode == "rowwise"
+        txt_attn = model.double_blocks[0].txt_attn
+        assert isinstance(txt_attn.qkv, ParallelLinear)
+        assert txt_attn.qkv.pack_count == 3
+        assert isinstance(model.single_blocks[0].linear1, nn.Linear)
+        assert isinstance(model.double_blocks[0].img_mlp[0], ParallelLinear)
+        assert model.double_blocks[0].img_mlp[0].mode == "colwise"
+        assert isinstance(model.double_blocks[0].img_mlp[2], ParallelLinear)
+        assert model.double_blocks[0].img_mlp[2].mode == "rowwise"
+        assert isinstance(model.latent_in, nn.Linear)
+        assert not isinstance(model.latent_in, ParallelLinear)
+        assert isinstance(model.final_layer, nn.Linear)
+        assert not isinstance(model.final_layer, ParallelLinear)
+        assert model.double_blocks[0].img_attn.num_heads == 4
+        assert model.double_blocks[0].num_heads == 4
+        assert model.single_blocks[0].num_heads == 8
+        assert model.num_heads == 8
+
+
+class TestKandinsky5TP:
+    """Kandinsky5: unfused to_query. Attn/FF out_layer rowwise; modulation.out_layer stays."""
+
+    def test_unfused_qkv_and_modulation_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim, ffn = 128, 8, 16, 256
+        assert "Kandinsky5" in TP_HEAD_SPLIT_MODELS
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.to_query = nn.Linear(dim, dim)
+                self.to_key = nn.Linear(dim, dim)
+                self.to_value = nn.Linear(dim, dim)
+                self.query_norm = nn.RMSNorm(head_dim)
+                self.key_norm = nn.RMSNorm(head_dim)
+                self.out_layer = nn.Linear(dim, dim)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.in_layer = nn.Linear(dim, ffn, bias=False)
+                self.out_layer = nn.Linear(ffn, dim, bias=False)
+
+        class Modulation(nn.Module):
+            def __init__(self, num_params):
+                super().__init__()
+                self.out_layer = nn.Linear(64, num_params * dim)
+
+        class TransformerEncoderBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_modulation = Modulation(6)
+                self.self_attention = SelfAttention()
+                self.feed_forward = FeedForward()
+
+        class TransformerDecoderBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual_modulation = Modulation(9)
+                self.self_attention = SelfAttention()
+                self.cross_attention = SelfAttention()
+                self.feed_forward = FeedForward()
+
+        class Kandinsky5(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.time_embeddings = nn.Linear(dim, 64)
+                self.text_transformer_blocks = nn.ModuleList([TransformerEncoderBlock()])
+                self.visual_transformer_blocks = nn.ModuleList([TransformerDecoderBlock()])
+                self.out_layer = nn.Linear(dim, 16)
+
+        model = Kandinsky5()
+        assert patcher.parallelize_model(model) is True
+        enc = model.text_transformer_blocks[0]
+        attn = enc.self_attention
+        assert isinstance(attn.to_query, ParallelLinear)
+        assert attn.to_query.mode == "colwise"
+        assert attn.to_key.mode == "colwise"
+        assert attn.to_value.mode == "colwise"
+        assert isinstance(attn.out_layer, ParallelLinear)
+        assert attn.out_layer.mode == "rowwise"
+        assert attn.num_heads == heads // 2
+        assert tuple(attn.query_norm.weight.shape) == (head_dim,)
+        ff = enc.feed_forward
+        assert isinstance(ff.in_layer, ParallelLinear)
+        assert ff.in_layer.mode == "colwise"
+        assert isinstance(ff.out_layer, ParallelLinear)
+        assert ff.out_layer.mode == "rowwise"
+        assert isinstance(enc.text_modulation.out_layer, nn.Linear)
+        assert not isinstance(enc.text_modulation.out_layer, ParallelLinear)
+        dec = model.visual_transformer_blocks[0]
+        assert isinstance(dec.self_attention.to_query, ParallelLinear)
+        assert dec.self_attention.out_layer.mode == "rowwise"
+        assert isinstance(dec.cross_attention.to_query, ParallelLinear)
+        assert dec.cross_attention.out_layer.mode == "rowwise"
+        assert isinstance(dec.visual_modulation.out_layer, nn.Linear)
+        assert not isinstance(dec.visual_modulation.out_layer, ParallelLinear)
+        assert isinstance(model.time_embeddings, nn.Linear)
+        assert not isinstance(model.time_embeddings, ParallelLinear)
+        assert isinstance(model.out_layer, nn.Linear)
+        assert not isinstance(model.out_layer, ParallelLinear)
 
 
 class TestPackedColwise:
