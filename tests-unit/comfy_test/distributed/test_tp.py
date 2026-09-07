@@ -274,6 +274,11 @@ class TestGetTPTargets:
         assert get_tp_targets(PixArt()) == ["blocks"]
         assert get_tp_targets(Sigma()) == ["blocks"]
 
+    def test_audio_dit_matches(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Audio = self._make_model_class("AudioDiffusionTransformer")
+        assert get_tp_targets(Audio()) == ["transformer.layers"]
+
     def test_minimax_h3_matches(self):
         from comfy.distributed.patcher import get_tp_targets, TP_UNSUPPORTED
         MiniMax = self._make_model_class("MiniMaxH3Model")
@@ -2309,6 +2314,119 @@ class TestPixArtTP:
         cond = torch.randn(2, 8, dim)
         out = ca(x, cond)
         assert out.shape == (2, 16, dim)
+
+
+class TestAudioDitTP:
+    """Stable Audio DiT: packed to_qkv / to_kv / GLU; conformer and adaLN stay."""
+
+    def test_packed_self_cross_glu_and_exclusions(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+        from comfy.distributed.patcher import TP_HEAD_SPLIT_MODELS
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim, inner = 64, 8, 8, 256
+        assert "AudioDiffusionTransformer" in TP_HEAD_SPLIT_MODELS
+
+        class GLU(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(dim, inner * 2)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ff = nn.Sequential(GLU(), nn.Identity(), nn.Linear(inner, dim), nn.Identity())
+
+        class SelfAttention(nn.Module):
+            def __init__(self, differential=False):
+                super().__init__()
+                self.num_heads = heads
+                self.kv_heads = heads
+                self.dim_heads = head_dim
+                pack = 5 if differential else 3
+                self.to_qkv = nn.Linear(dim, dim * pack, bias=False)
+                self.to_out = nn.Linear(dim, dim, bias=False)
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.kv_heads = heads
+                self.dim_heads = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.to_kv = nn.Linear(dim, dim * 2, bias=False)
+                self.to_out = nn.Linear(dim, dim, bias=False)
+
+        class ConformerModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.glu = GLU()
+
+        class TransformerBlock(nn.Module):
+            def __init__(self, differential=False, conformer=False):
+                super().__init__()
+                self.self_attn = SelfAttention(differential=differential)
+                self.cross_attn = CrossAttention()
+                self.ff = FeedForward()
+                self.to_scale_shift_gate = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6, bias=False))
+                self.conformer = ConformerModule() if conformer else None
+
+        class ContinuousTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.project_in = nn.Linear(32, dim, bias=False)
+                self.project_out = nn.Linear(dim, 32, bias=False)
+                self.layers = nn.ModuleList([
+                    TransformerBlock(),
+                    TransformerBlock(differential=True, conformer=True),
+                ])
+
+        class AudioDiffusionTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = ContinuousTransformer()
+
+        model = AudioDiffusionTransformer()
+        assert patcher.parallelize_model(model) is True
+
+        packed = model.transformer.layers[0]
+        qkv = packed.self_attn.to_qkv
+        assert isinstance(qkv, ParallelLinear)
+        assert qkv.pack_count == 3
+        assert packed.self_attn.to_out.mode == "rowwise"
+        assert packed.self_attn.num_heads == heads // 2
+        assert packed.self_attn.kv_heads == heads // 2
+        kv = packed.cross_attn.to_kv
+        assert isinstance(kv, ParallelLinear)
+        assert kv.pack_count == 2
+        assert isinstance(packed.cross_attn.to_q, ParallelLinear)
+        assert packed.cross_attn.to_q.mode == "colwise"
+        assert packed.cross_attn.to_out.mode == "rowwise"
+        glu = packed.ff.ff[0].proj
+        assert isinstance(glu, ParallelLinear)
+        assert glu.pack_count == 2
+        assert glu.mode == "colwise"
+        assert packed.ff.ff[2].mode == "rowwise"
+        assert isinstance(packed.to_scale_shift_gate[1], nn.Linear)
+        assert not isinstance(packed.to_scale_shift_gate[1], ParallelLinear)
+
+        diff_block = model.transformer.layers[1]
+        assert isinstance(diff_block.self_attn.to_qkv, ParallelLinear)
+        assert diff_block.self_attn.to_qkv.pack_count == 5
+        assert isinstance(diff_block.conformer.glu.proj, nn.Linear)
+        assert not isinstance(diff_block.conformer.glu.proj, ParallelLinear)
+        assert isinstance(model.transformer.project_in, nn.Linear)
+        assert not isinstance(model.transformer.project_in, ParallelLinear)
+        assert isinstance(model.transformer.project_out, nn.Linear)
 
 
 class TestPackedColwise:

@@ -71,6 +71,7 @@ TP_TARGETS = {
     "AsymmDiTJoint": ["blocks"],  # Mochi: packed qkv_x/qkv_y + packed SwiGLU w1
     "HunYuanDiT": ["blocks"],  # HunyuanDiT: packed Wqkv + packed kv_proj
     "PixArtMS": ["blocks"],  # packed attn.qkv + packed kv_linear; KV-compress stays
+    "AudioDiffusionTransformer": ["transformer.layers"],  # packed to_qkv / to_kv / GLU
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -186,6 +187,13 @@ HYDIT_EXCLUDED_LAYER_NAMES = (
     "skip_linear",
 )
 
+# Stable Audio DiT: adaLN is a 6-way chunk; local cond embed stays full-width.
+AUDIO_EXCLUDED_LAYER_NAMES = (
+    "to_scale_shift_gate.1",
+    "to_local_embed.0",
+    "to_local_embed.2",
+)
+
 
 # Flux-family double-stream attention: equal-width packed [Q|K|V].
 # Single-stream linear1 is QKV+MLP (unequal packs) and stays excluded.
@@ -210,13 +218,15 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
 })
 
 
-def _packed_colwise_count(name, mro_names):
+def _packed_colwise_count(name, mro_names, module=None):
     """Equal-sized output packs that must be sharded independently.
 
     MiniMax Attention.qkv_proj is ``[Q|K|V]`` (3). MiniMax MLP.fc1 is fused
     SwiGLU ``[gate|up]`` (2). Flux / Hunyuan / Chroma / SD3 / Ideogram /
     JoyImage / Lens / PixArt fused ``*qkv`` is ``[Q|K|V]`` (3). PixArt
-    ``kv_linear`` is packed ``[K|V]`` (2). Other architectures keep pack_count=1.
+    ``kv_linear`` is packed ``[K|V]`` (2). Audio DiT ``to_qkv`` is 3 or 5
+    equal packs, ``to_kv`` is 2 or 3, GLU ``ff.ff.0.proj`` is 2. Other
+    architectures keep pack_count=1.
     """
     if "MiniMaxH3Model" in mro_names:
         if name.endswith("qkv_proj"):
@@ -224,6 +234,16 @@ def _packed_colwise_count(name, mro_names):
         if name.endswith("fc1"):
             return 2
         return 1
+    if "AudioDiffusionTransformer" in mro_names and module is not None:
+        if name.endswith((".to_qkv", ".to_kv")):
+            if module.in_features and module.out_features % module.in_features == 0:
+                pack = module.out_features // module.in_features
+                if pack > 1:
+                    return pack
+        if name.endswith(".to_q") and module.out_features == 2 * module.in_features:
+            return 2
+        if name.endswith("ff.ff.0.proj"):
+            return 2
     if mro_names & _PACKED_QKV_FAMILIES:
         if (
             name.endswith(".qkv")
@@ -325,14 +345,15 @@ TP_HEAD_SPLIT_MODELS = {
     "AsymmDiTJoint",
     "HunYuanDiT",
     "PixArtMS",
+    "AudioDiffusionTransformer",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv")
 # Attribute names for head count / head dim.
 _HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads")
-_DIM_HEAD_ATTRS = ("dim_head", "head_dim")
+_DIM_HEAD_ATTRS = ("dim_head", "head_dim", "dim_heads")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
 _FULL_DIM_QK_NORM_ATTRS = (
     "norm_q", "norm_k", "norm_k_img",
@@ -603,6 +624,8 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = tuple(
             e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
         )
+    if "AudioDiffusionTransformer" in mro_names:
+        excluded_names = excluded_names + tuple(AUDIO_EXCLUDED_LAYER_NAMES)
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -616,6 +639,8 @@ def parallelize_model(model, sd=None, prefix=""):
             if _is_linear_layer(module):
                 # Skip layers that can't be simply sharded (fused layers, modulation layers)
                 if any(name.endswith(excl) for excl in excluded_names):
+                    continue
+                if "AudioDiffusionTransformer" in mro_names and ".conformer." in name:
                     continue
 
                 # Skip scaled/quantized linears — ParallelLinear has no weight_scale
@@ -637,6 +662,9 @@ def parallelize_model(model, sd=None, prefix=""):
                     # GELU/MLP first-Linear in a ModuleList (QwenImage) —
                     # structurally an up-projection, colwise with gather.
                     mode = "colwise"
+                elif "AudioDiffusionTransformer" in mro_names and name.endswith("ff.ff.0.proj"):
+                    # SwiGLU up-projection (chunk(2)); generic `proj` is rowwise.
+                    mode = "colwise"
                 elif name.endswith((".q", ".k", ".v", ".k_img", ".v_img")):
                     # Wan uses bare `.q`/`.k`/`.v` (not to_q / q_proj).
                     mode = "colwise"
@@ -649,6 +677,10 @@ def parallelize_model(model, sd=None, prefix=""):
                     or name.endswith(".o")  # Wan attention output proj
                     or name.endswith(".layer2")  # Cosmos GPT2FeedForward.layer2
                     or name.endswith(".attention.out")  # NextDiT JointAttention.out
+                    or (
+                        "AudioDiffusionTransformer" in mro_names
+                        and name.endswith("ff.ff.2")
+                    )
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection
                     # (the GELU+Dropout+Linear ModuleList's index-2 Linear),
@@ -682,7 +714,7 @@ def parallelize_model(model, sd=None, prefix=""):
                         skipped_dims += 1
                         continue
                 elif mode == "colwise":
-                    pack_count = _packed_colwise_count(name, mro_names)
+                    pack_count = _packed_colwise_count(name, mro_names, module)
                     if pack_count > 1:
                         if module.out_features % pack_count != 0:
                             skipped_dims += 1
