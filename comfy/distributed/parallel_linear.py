@@ -24,6 +24,89 @@ import torch.distributed as dist
 import logging
 from comfy.distributed.mesh import get_mesh
 
+_TP_SHARD_META_ATTRS = (
+    "_tp_pack_count",
+    "_tp_rank",
+    "_tp_pack_size",
+    "_tp_local_pack_size",
+    "_tp_mode",
+)
+
+
+def stamp_tp_shard_meta(tensor, module):
+    """Copy ParallelLinear shard layout onto a tensor for LoRA slicing."""
+    tensor._tp_pack_count = int(getattr(module, "pack_count", 1) or 1)
+    tensor._tp_rank = int(getattr(module, "rank", 0) or 0)
+    tensor._tp_pack_size = getattr(module, "pack_size", None)
+    tensor._tp_local_pack_size = getattr(module, "local_pack_size", None)
+    tensor._tp_mode = getattr(module, "mode", None)
+    return tensor
+
+
+def copy_tp_shard_meta(src, dst):
+    """Preserve TP layout across ``.to(copy=True)`` / cast copies."""
+    for attr in _TP_SHARD_META_ATTRS:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+    return dst
+
+
+def packed_colwise_row_slices(rank, pack_count, pack_size, local_pack_size):
+    """Output-dim slices for this rank — one per equal-sized pack."""
+    pack_count = int(pack_count) if pack_count else 1
+    if pack_count <= 1:
+        start = rank * local_pack_size
+        return (slice(start, start + local_pack_size),)
+    slices = []
+    for p in range(pack_count):
+        start = p * pack_size + rank * local_pack_size
+        slices.append(slice(start, start + local_pack_size))
+    return tuple(slices)
+
+
+def shard_like_tp_weight(full, shard):
+    """Slice a full-width LoRA diff to match a TP weight/bias shard.
+
+    Packed colwise concatenates per-pack slices (same layout as
+    ``ParallelLinear.load_shard``). Missing metadata falls back to a naive
+    contiguous cut using mesh rank.
+    """
+    mode = getattr(shard, "_tp_mode", None)
+    pack_count = int(getattr(shard, "_tp_pack_count", 1) or 1)
+    rank = getattr(shard, "_tp_rank", None)
+    pack_size = getattr(shard, "_tp_pack_size", None)
+    local_pack_size = getattr(shard, "_tp_local_pack_size", None)
+    if rank is None or pack_size is None or local_pack_size is None:
+        from comfy.distributed.mesh import get_mesh
+        mesh = get_mesh()
+        rank = mesh.rank
+        if full.ndim == 1:
+            local_pack_size = shard.shape[0]
+            pack_size = full.shape[0] if pack_count <= 1 else full.shape[0] // pack_count
+        elif mode == "rowwise" or (
+            full.ndim == 2 and full.shape[0] == shard.shape[0] and full.shape[1] != shard.shape[1]
+        ):
+            start = rank * shard.shape[1]
+            return full[:, start:start + shard.shape[1]]
+        else:
+            local_pack_size = shard.shape[0] if pack_count <= 1 else shard.shape[0] // pack_count
+            pack_size = full.shape[0] if pack_count <= 1 else full.shape[0] // pack_count
+    slices = packed_colwise_row_slices(rank, pack_count, pack_size, local_pack_size)
+    if full.ndim == 1:
+        pieces = [full[s] for s in slices]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+    if mode == "rowwise":
+        start = rank * shard.shape[1]
+        return full[:, start:start + shard.shape[1]]
+    pieces = [full[s, :] for s in slices]
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+
+def slice_colwise_activation(tensor, module):
+    """Slice a full last-dim activation to this rank's packed colwise shard."""
+    pieces = [tensor[..., s] for s in module._packed_colwise_slices()]
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-1)
+
 
 class ParallelLinear(nn.Module):
     """A linear layer that supports Tensor Parallelism.
@@ -89,6 +172,7 @@ class ParallelLinear(nn.Module):
             dtype=torch.float32,
             device="cpu"
         ))
+        stamp_tp_shard_meta(self.weight, self)
 
         self.is_tp_parallelized = True
 
@@ -103,6 +187,7 @@ class ParallelLinear(nn.Module):
                 dtype=torch.float32,
                 device="cpu"
             ))
+            stamp_tp_shard_meta(self.bias, self)
         else:
             self.register_parameter('bias', None)
 
@@ -123,8 +208,14 @@ class ParallelLinear(nn.Module):
         # a same-dtype .to() returns the real Parameter storage and the patch
         # mutates a throwaway tensor rather than accumulating into it every forward.
         w = self.weight.to(dtype=x.dtype, copy=True) if len(weight_function) > 0 else self.weight.to(x.dtype)
+        if len(weight_function) > 0:
+            stamp_tp_shard_meta(w, self)
+            copy_tp_shard_meta(self.weight, w)
         if self.bias is not None:
             b = self.bias.to(dtype=x.dtype, copy=True) if len(bias_function) > 0 else self.bias.to(x.dtype)
+            if len(bias_function) > 0:
+                stamp_tp_shard_meta(b, self)
+                copy_tp_shard_meta(self.bias, b)
         else:
             b = None
 
@@ -163,14 +254,9 @@ class ParallelLinear(nn.Module):
 
     def _packed_colwise_slices(self):
         """Slices along the output dim for this rank, one per pack."""
-        if self.pack_count <= 1:
-            start = self.rank * self.local_out_features
-            return (slice(start, start + self.local_out_features),)
-        slices = []
-        for p in range(self.pack_count):
-            start = p * self.pack_size + self.rank * self.local_pack_size
-            slices.append(slice(start, start + self.local_pack_size))
-        return tuple(slices)
+        return packed_colwise_row_slices(
+            self.rank, self.pack_count, self.pack_size, self.local_pack_size,
+        )
 
     def load_shard(self, full_weight_tensor):
         """Slices the full weight tensor and loads the shard for this rank."""

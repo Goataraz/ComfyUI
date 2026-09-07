@@ -195,10 +195,8 @@ class BypassForwardHook:
                     import torch.distributed as dist
                     mesh = get_mesh()
                     if self.module.mode == "colwise":
-                        local_out = self.module.local_out_features
-                        start = mesh.rank * local_out
-                        end = start + local_out
-                        h_out = h_out[..., start:end]
+                        from comfy.distributed.parallel_linear import slice_colwise_activation
+                        h_out = slice_colwise_activation(h_out, self.module)
                     elif self.module.mode == "rowwise":
                         # Recompute h_out with sliced down matrix.
                         # The adapter's h() already ran with full down —

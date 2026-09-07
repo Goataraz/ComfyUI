@@ -127,7 +127,7 @@ When any rank encounters an error during prompt execution:
 ## Limitations
 
 - **NCCL only**: Currently requires NVIDIA GPUs with NCCL backend
-- **LoRA**: DynamicVRAM now attaches LowVramPatch to ParallelLinear.weight_function. Flux+LoRA verified; Qwen/Cosmos/Wan LoRA e2e still being expanded. DoRA/LoHa/OFT under TP are not yet fully supported.
+- **LoRA**: DynamicVRAM attaches LowVramPatch to ParallelLinear.weight_function. Packed colwise layers (Flux/Hunyuan/Chroma `*.qkv`, MiniMax `qkv_proj`/`fc1`) slice LoRA diffs per pack — a naive row cut would mix Q/K/V. Flux+LoRA verified on unreplicated QKV; packed QKV LoRA is unit-tested. Qwen/Cosmos/Wan LoRA e2e still being expanded. DoRA/LoHa/OFT under TP are not yet fully supported.
 - **Dynamic batching**: All ranks must process the same prompt; batch parallelism is not combined with TP
 - **Model saving**: Only rank 0 saves output; worker ranks skip file I/O
 - **HiDream O1**: Disabled — needs full-model TP including vision encoder

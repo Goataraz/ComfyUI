@@ -914,6 +914,12 @@ class ModelPatcher:
         if convert_func is not None:
             temp_weight = convert_func(temp_weight, inplace=True)
 
+        try:
+            from comfy.distributed.parallel_linear import copy_tp_shard_meta
+            copy_tp_shard_meta(weight, temp_weight)
+        except ImportError:
+            pass
+
         out_weight = comfy.lora.calculate_weight(self.patches[key], temp_weight, key) if key in self.patches else temp_weight
         if set_func is None:
             if key in self.patches:
@@ -1670,6 +1676,12 @@ class ModelPatcher:
         temp_weight = comfy.model_management.cast_to_device(weight, weight.device, torch.float32, copy=True)
         if convert_func is not None:
             temp_weight = convert_func(temp_weight, inplace=True)
+
+        try:
+            from comfy.distributed.parallel_linear import copy_tp_shard_meta
+            copy_tp_shard_meta(weight, temp_weight)
+        except ImportError:
+            pass
 
         out_weight = comfy.lora.calculate_weight(combined_patches[key],
                                                  temp_weight,

@@ -1762,6 +1762,92 @@ class TestPackedColwise:
         torch.testing.assert_close(got, torch.cat(expected, dim=-1), atol=1e-5, rtol=1e-5)
 
 
+class TestPackedColwiseLoRA:
+    """LoRA diffs on packed QKV must follow load_shard, not a naive row cut."""
+
+    def test_shard_like_tp_weight_packed_not_naive(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+
+        pack, inner, hidden, ws, rank_id = 3, 8, 4, 2, 0
+        full_out = pack * inner
+
+        class FakeMesh:
+            world_size = ws
+            current_device = "cpu"
+        FakeMesh.rank = rank_id
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        layer = pl_module.ParallelLinear(hidden, full_out, bias=False, mode="colwise", pack_count=pack)
+        full = torch.arange(full_out * hidden, dtype=torch.float32).reshape(full_out, hidden)
+        layer.load_shard(full)
+        packed = layer.weight.data.clone()
+        naive = full[: packed.shape[0]]
+        assert not torch.equal(packed, naive)
+
+        from comfy.distributed.parallel_linear import shard_like_tp_weight, stamp_tp_shard_meta
+        stamp_tp_shard_meta(layer.weight, layer)
+        got = shard_like_tp_weight(full, layer.weight)
+        torch.testing.assert_close(got, packed)
+
+    def test_lora_adapter_calculate_weight_uses_packed_slice(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.weight_adapter.lora import LoRAAdapter
+
+        pack, inner, hidden, ws, rank_id = 3, 8, 4, 2, 0
+        full_out = pack * inner
+
+        class FakeMesh:
+            world_size = ws
+            current_device = "cpu"
+        FakeMesh.rank = rank_id
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr("comfy.distributed.utils.is_tp_active", lambda: True)
+
+        layer = pl_module.ParallelLinear(hidden, full_out, bias=False, mode="colwise", pack_count=pack)
+        full = torch.arange(full_out * hidden, dtype=torch.float32).reshape(full_out, hidden)
+        layer.load_shard(full)
+        packed = layer.weight.data.clone()
+
+        # mm(eye, full) == full LoRA diff, then TP-sliced onto a zero shard.
+        up = torch.eye(full_out, dtype=torch.float32)
+        adapter = LoRAAdapter(set(), (up, full, None, None, None, None))
+        shard = torch.zeros_like(layer.weight.data)
+        from comfy.distributed.parallel_linear import stamp_tp_shard_meta
+        stamp_tp_shard_meta(shard, layer)
+        out = adapter.calculate_weight(
+            shard, "img_attn.qkv.weight", 1.0, 1.0, None, lambda x: x,
+        )
+        torch.testing.assert_close(out, packed)
+        naive = full[: packed.shape[0]]
+        assert not torch.equal(out, naive)
+
+    def test_packed_colwise_activation_slice(self, monkeypatch):
+        import torch
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import slice_colwise_activation
+
+        pack, inner, hidden, ws, rank_id = 3, 8, 4, 2, 0
+        full_out = pack * inner
+
+        class FakeMesh:
+            world_size = ws
+            current_device = "cpu"
+        FakeMesh.rank = rank_id
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        layer = pl_module.ParallelLinear(hidden, full_out, bias=False, mode="colwise", pack_count=pack)
+        h_out = torch.arange(full_out, dtype=torch.float32).reshape(1, full_out)
+        got = slice_colwise_activation(h_out, layer)
+        local = inner // ws
+        expected = []
+        for p in range(pack):
+            start = p * inner + rank_id * local
+            expected.append(h_out[..., start:start + local])
+        torch.testing.assert_close(got, torch.cat(expected, dim=-1))
+
+
 class TestMiniMaxH3TP:
     """MiniMax H3: packed qkv_proj + packed SwiGLU fc1; adaLN stays; heads follow shard."""
 

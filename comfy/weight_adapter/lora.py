@@ -270,35 +270,15 @@ class LoRAAdapter(WeightAdapterBase):
             )
             del mat1, mat2
             # TP: slice LoRA diff to match the sharded weight shape.
-            # ParallelLinear shards the weight: colwise splits output dim
-            # (rows), rowwise splits input dim (cols). The full LoRA diff
-            # has the original (out, in) shape — slice it for this rank.
+            # Packed colwise (Flux/MiniMax QKV) concatenates per-pack slices;
+            # naive rank*local_out would cut across [Q|K|V] packs.
             if lora_diff.shape != weight.shape:
                 try:
                     from comfy.distributed.utils import is_tp_active
-                    if is_tp_active():
-                        from comfy.distributed.mesh import get_mesh
-                        mesh = get_mesh()
-                        if (len(weight.shape) == 2 and
-                                lora_diff.shape[0] != weight.shape[0] and
-                                lora_diff.shape[1] == weight.shape[1]):
-                            # Colwise: slice output dimension (rows)
-                            start = mesh.rank * weight.shape[0]
-                            end = start + weight.shape[0]
-                            lora_diff = lora_diff[start:end, :]
-                        elif (len(weight.shape) == 2 and
-                              lora_diff.shape[1] != weight.shape[1] and
-                              lora_diff.shape[0] == weight.shape[0]):
-                            # Rowwise: slice input dimension (cols)
-                            start = mesh.rank * weight.shape[1]
-                            end = start + weight.shape[1]
-                            lora_diff = lora_diff[:, start:end]
-                        elif (len(weight.shape) == 1 and
-                              lora_diff.shape[0] != weight.shape[0]):
-                            # Colwise bias: slice to this rank's shard
-                            start = mesh.rank * weight.shape[0]
-                            end = start + weight.shape[0]
-                            lora_diff = lora_diff[start:end]
+                    has_tp_meta = getattr(weight, "_tp_mode", None) is not None
+                    if has_tp_meta or is_tp_active():
+                        from comfy.distributed.parallel_linear import shard_like_tp_weight
+                        lora_diff = shard_like_tp_weight(lora_diff, weight)
                 except ImportError:
                     pass
             lora_diff = lora_diff.reshape(weight.shape)
