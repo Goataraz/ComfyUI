@@ -382,10 +382,10 @@ class TestGetTPTargets:
     def test_mro_subclass_inherits(self):
         from comfy.distributed.patcher import get_tp_targets
         """Subclass of a matched class should inherit the TP targets."""
-        # Use WanModel — MRO inheritance also covered by VaceWanModel / Wan tests.
+        # CausalWan has no own TP_TARGETS entry; VaceWanModel does (vace_blocks).
         Wan = self._make_model_class("WanModel")
-        Vace = self._make_model_class("VaceWanModel", (Wan,))
-        assert get_tp_targets(Vace()) == ["blocks"]
+        Causal = self._make_model_class("CausalWanModel", (Wan,))
+        assert get_tp_targets(Causal()) == ["blocks"]
 
     def test_unknown_model_returns_empty(self):
         from comfy.distributed.patcher import get_tp_targets
@@ -1153,7 +1153,7 @@ class TestWanModelTP:
         Wan = type("WanModel", (), {})
         Vace = type("VaceWanModel", (Wan,), {})
         assert get_tp_targets(Wan()) == ["blocks"]
-        assert get_tp_targets(Vace()) == ["blocks"]  # MRO inherit
+        assert get_tp_targets(Vace()) == ["blocks", "vace_blocks"]
         assert "WanModel" in TP_HEAD_SPLIT_MODELS
 
     def test_sharding_modes_head_split_and_norm_slice(self, monkeypatch):
@@ -1291,6 +1291,224 @@ class TestWanModelTP:
         assert not isinstance(model.img_emb.proj[3], ParallelLinear)
         assert isinstance(model.blocks[0].self_attn.q, ParallelLinear)
         assert model.blocks[0].self_attn.q.mode == "colwise"
+
+
+class TestVaceWanTP:
+    """VaceWanModel: sibling ``vace_blocks`` is a full WanAttentionBlock stack.
+
+    Residual is ``x += after_proj(c)``. Prefixes must include ``vace_blocks``
+    or VACE attention stays full-width while main ``blocks`` head-split.
+    ``vace_patch_embedding`` is a root Conv3d and must stay unreplicated.
+    ``before_proj`` / ``after_proj`` are Linear(dim, dim); generic ``proj``
+    makes them rowwise so the residual stays full-width after all-reduce.
+    """
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Wan = type("WanModel", (), {})
+        Vace = type("VaceWanModel", (Wan,), {})
+        assert get_tp_targets(Vace()) == ["blocks", "vace_blocks"]
+        assert get_tp_targets(Wan()) == ["blocks"]
+        assert "WanModel" in TP_HEAD_SPLIT_MODELS
+
+    def test_vace_blocks_shard_with_main_blocks(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 1
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = dim // n_heads
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class Block(nn.Module):
+            def __init__(self, *, vace_block0=False):
+                super().__init__()
+                self.num_heads = n_heads
+                self.self_attn = Attn()
+                self.cross_attn = Attn()
+                self.ffn = nn.ModuleList([
+                    nn.Linear(dim, dim * 4, bias=True),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim, bias=True),
+                ])
+                if vace_block0:
+                    self.before_proj = nn.Linear(dim, dim, bias=True)
+                self.after_proj = nn.Linear(dim, dim, bias=True)
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.patch_embedding = nn.Conv3d(16, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.blocks = nn.ModuleList([Block()])
+
+        class VaceWanModel(WanModel):
+            def __init__(self):
+                super().__init__()
+                self.vace_patch_embedding = nn.Conv3d(32, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.vace_blocks = nn.ModuleList([Block(vace_block0=True)])
+
+        model = VaceWanModel()
+        orig_vace_norm = model.vace_blocks[0].self_attn.norm_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+
+        modes = {n: m.mode for n, m in model.named_modules() if isinstance(m, ParallelLinear)}
+        expected = {
+            "blocks.0.self_attn.q": "colwise",
+            "blocks.0.self_attn.o": "rowwise",
+            "blocks.0.cross_attn.q": "colwise",
+            "blocks.0.cross_attn.o": "rowwise",
+            "blocks.0.ffn.0": "colwise",
+            "blocks.0.ffn.2": "rowwise",
+            "vace_blocks.0.self_attn.q": "colwise",
+            "vace_blocks.0.self_attn.o": "rowwise",
+            "vace_blocks.0.cross_attn.q": "colwise",
+            "vace_blocks.0.cross_attn.o": "rowwise",
+            "vace_blocks.0.ffn.0": "colwise",
+            "vace_blocks.0.ffn.2": "rowwise",
+            "vace_blocks.0.before_proj": "rowwise",
+            "vace_blocks.0.after_proj": "rowwise",
+        }
+        for name, mode in expected.items():
+            assert name in modes, f"{name} not sharded"
+            assert modes[name] == mode, f"{name}: expected {mode}, got {modes[name]}"
+
+        local = n_heads // 2
+        assert model.blocks[0].self_attn.num_heads == local
+        assert model.vace_blocks[0].self_attn.num_heads == local
+        assert model.vace_blocks[0].cross_attn.num_heads == local
+        assert model.vace_blocks[0].num_heads == local
+
+        # Root Conv3d stays; extra VACE in_dim must not be cut.
+        assert isinstance(model.vace_patch_embedding, nn.Conv3d)
+        assert not isinstance(model.vace_patch_embedding, ParallelLinear)
+        assert model.vace_patch_embedding.weight.shape[1] == 32
+        assert isinstance(model.patch_embedding, nn.Conv3d)
+        assert model.patch_embedding.weight.shape[1] == 16
+
+        local_dim = local * head_dim
+        import torch
+        assert tuple(model.vace_blocks[0].self_attn.norm_q.weight.shape) == (local_dim,)
+        assert torch.allclose(
+            model.vace_blocks[0].self_attn.norm_q.weight.data,
+            orig_vace_norm[local_dim:],
+        )
+        assert model.vace_blocks[0].before_proj.local_out_features == dim
+        assert model.vace_blocks[0].after_proj.local_out_features == dim
+
+
+class TestWanS2VTP:
+    """WanModel_S2V: sibling ``audio_injector`` is WanT2VCrossAttention.
+
+    Prefix ``blocks`` alone leaves injector Q full-width. AdaLN on the
+    injector chunks 2*dim and must stay unreplicated.
+    """
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Wan = type("WanModel", (), {})
+        S2V = type("WanModel_S2V", (Wan,), {})
+        assert get_tp_targets(S2V()) == ["blocks", "audio_injector"]
+
+    def test_audio_injector_shards_adain_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = dim // n_heads
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attn()
+
+        class AdaLayerNorm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(dim, dim * 2, bias=True)
+
+        class AudioInjector(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.injector = nn.ModuleList([Attn()])
+                self.injector_adain_layers = nn.ModuleList([AdaLayerNorm()])
+                self.injector_adain_output_layers = nn.ModuleList([
+                    nn.Linear(dim, dim, bias=True)
+                ])
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.blocks = nn.ModuleList([Block()])
+
+        class WanModel_S2V(WanModel):
+            def __init__(self):
+                super().__init__()
+                self.audio_injector = AudioInjector()
+
+        model = WanModel_S2V()
+        assert patcher.parallelize_model(model) is True
+
+        inj = model.audio_injector.injector[0]
+        assert isinstance(inj.q, ParallelLinear)
+        assert inj.q.mode == "colwise"
+        assert isinstance(inj.o, ParallelLinear)
+        assert inj.o.mode == "rowwise"
+        assert inj.num_heads == n_heads // 2
+        assert model.blocks[0].self_attn.num_heads == n_heads // 2
+
+        adain = model.audio_injector.injector_adain_layers[0].linear
+        assert isinstance(adain, nn.Linear)
+        assert not isinstance(adain, ParallelLinear)
+        assert adain.out_features == dim * 2
+
+        out_lin = model.audio_injector.injector_adain_output_layers[0]
+        assert isinstance(out_lin, nn.Linear)
+        assert not isinstance(out_lin, ParallelLinear)
+        assert out_lin.out_features == dim
 
 
 class TestHumoWanTP:

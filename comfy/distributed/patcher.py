@@ -42,8 +42,9 @@ def _is_linear_layer(module):
 
 # Mapping of inner diffusion model class names to their TP target prefixes.
 # Keys must match the __name__ of the inner diffusion model class (not the BaseModel wrapper).
-# Subclasses are handled via MRO walk, so e.g. Anima(MiniTrainDIT) / VaceWanModel(WanModel)
-# inherit the parent entry.
+# Subclasses are handled via MRO walk, so e.g. Anima(MiniTrainDIT) /
+# CausalWanModel(WanModel) inherit the parent entry. VaceWanModel and
+# WanModel_S2V have their own entries so sibling attention stacks shard.
 TP_TARGETS = {
     "Flux": ["double_blocks", "single_blocks"],
     "OpenAISignatureMMDITWrapper": ["joint_blocks"],  # SD3 MMDiT (not "blocks")
@@ -58,6 +59,15 @@ TP_TARGETS = {
     "QwenImageTransformer2DModel": ["transformer_blocks"],
     "Llama2": ["layers"],
     "WanModel": ["blocks"],                            # WanVideo T2V/I2V + subclasses
+    # Vace: sibling vace_blocks is a full WanAttentionBlock stack. Residual
+    # is x += after_proj(c); both stacks must head-split together. Prefix
+    # keeps vace_patch_embedding (Conv3d, extra in_dim) unreplicated.
+    # before_proj / after_proj are Linear(dim, dim); generic `proj` →
+    # rowwise all-reduce so the residual stays full-width.
+    "VaceWanModel": ["blocks", "vace_blocks"],
+    # S2V: sibling audio_injector is WanT2VCrossAttention. AdaLN on the
+    # injector chunks 2*dim and is skipped by name (see parallelize_model).
+    "WanModel_S2V": ["blocks", "audio_injector"],
     "LTXVModel": ["transformer_blocks"],               # LTXV + LTXAV (MLP-only)
     "HunyuanVideo": ["double_blocks", "single_blocks"],  # packed double-stream QKV; linear1 stays
     "Chroma": ["double_blocks", "single_blocks"],          # Flux blocks, not a Flux subclass
@@ -812,6 +822,11 @@ def parallelize_model(model, sd=None, prefix=""):
                     continue
                 if "HunYuanDiTPlain" in mro_names and ".moe." in name:
                     # Last 6 layers: experts, shared FF, and gate stay full-width.
+                    continue
+                if "WanModel_S2V" in mro_names and "injector_adain" in name:
+                    # AdaLayerNorm.linear is Linear(dim, 2*dim) then chunk(2).
+                    # injector_adain_output_layers is Linear(dim, dim) added
+                    # onto full-width x. Both stay replicated.
                     continue
 
                 # Skip scaled/quantized linears — ParallelLinear has no weight_scale
