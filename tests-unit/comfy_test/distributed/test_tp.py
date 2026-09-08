@@ -184,6 +184,18 @@ class TestGetTPTargets:
         CosmosP2 = self._make_model_class("MiniTrainDIT")
         assert get_tp_targets(CosmosP2()) == ["blocks"]
 
+    def test_anima_inherits_minitraindit(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Mini = self._make_model_class("MiniTrainDIT")
+        Anima = self._make_model_class("Anima", (Mini,))
+        assert get_tp_targets(Anima()) == ["blocks"]
+
+    def test_flux2_inherits_flux(self):
+        from comfy.distributed.patcher import get_tp_targets
+        Flux = self._make_model_class("Flux")
+        Flux2 = self._make_model_class("Flux2", (Flux,))
+        assert get_tp_targets(Flux2()) == ["double_blocks", "single_blocks"]
+
     def test_hidream_image_matches(self):
         from comfy.distributed.patcher import get_tp_targets
         HiDream = self._make_model_class("HiDreamImageTransformer2DModel")
@@ -4178,3 +4190,120 @@ class TestParallelizeModelLoRA:
         torch.testing.assert_close(got, expected)
         naive = full_q[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
+
+    def test_minitraindit_q_proj_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(dim, dim, bias=False)
+                self.k_proj = nn.Linear(dim, dim, bias=False)
+                self.v_proj = nn.Linear(dim, dim, bias=False)
+                self.o_proj = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.mlp = nn.Module()
+                self.mlp.layer1 = nn.Linear(dim, dim * 4, bias=False)
+                self.mlp.layer2 = nn.Linear(dim * 4, dim, bias=False)
+
+        class MiniTrainDIT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = MiniTrainDIT()
+        full_q = model.blocks[0].self_attn.q_proj.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].self_attn.q_proj
+        assert isinstance(layer, ParallelLinear)
+        got, expected = self._identity_lora(layer, full_q, "blocks.0.self_attn.q_proj.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+
+class TestAnimaTP:
+    """Anima is MiniTrainDIT plus an unreplicated llm_adapter outside `blocks`."""
+
+    def test_blocks_head_split_adapter_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, heads, head_dim = 64, 8, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(dim, dim, bias=False)
+                self.k_proj = nn.Linear(dim, dim, bias=False)
+                self.v_proj = nn.Linear(dim, dim, bias=False)
+                self.o_proj = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+                self.cross_attn = Attention()
+                self.mlp = nn.Module()
+                self.mlp.layer1 = nn.Linear(dim, dim * 4, bias=False)
+                self.mlp.layer2 = nn.Linear(dim * 4, dim, bias=False)
+                self.adaln_modulation_self_attn = nn.Sequential(
+                    nn.SiLU(), nn.Linear(dim, 3 * dim, bias=False)
+                )
+
+        class MiniTrainDIT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        class LLMAdapter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(dim, dim, bias=False)
+                self.n_heads = 16
+
+        class Anima(MiniTrainDIT):
+            def __init__(self):
+                super().__init__()
+                self.llm_adapter = LLMAdapter()
+
+        model = Anima()
+        assert patcher.parallelize_model(model) is True
+        attn = model.blocks[0].self_attn
+        assert isinstance(attn.q_proj, ParallelLinear)
+        assert attn.q_proj.mode == "colwise"
+        assert attn.k_proj.mode == "colwise"
+        assert attn.v_proj.mode == "colwise"
+        assert attn.o_proj.mode == "rowwise"
+        assert attn.n_heads == heads // 2
+        assert isinstance(model.blocks[0].mlp.layer1, ParallelLinear)
+        assert model.blocks[0].mlp.layer1.mode == "colwise"
+        assert model.blocks[0].mlp.layer2.mode == "rowwise"
+        assert isinstance(model.blocks[0].adaln_modulation_self_attn[1], nn.Linear)
+        assert not isinstance(model.blocks[0].adaln_modulation_self_attn[1], ParallelLinear)
+        assert isinstance(model.llm_adapter.q_proj, nn.Linear)
+        assert not isinstance(model.llm_adapter.q_proj, ParallelLinear)
+        assert model.llm_adapter.n_heads == 16
