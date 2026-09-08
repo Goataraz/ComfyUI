@@ -4281,6 +4281,50 @@ class TestParallelizeModelLoRA:
         naive = full_qkv[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
+    def test_ideogram_packed_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 128, 8, 16
+
+        class Ideogram4Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class Ideogram4TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = Ideogram4Attention()
+                self.feed_forward = nn.Module()
+                self.feed_forward.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.feed_forward.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.feed_forward.w2 = nn.Linear(dim * 2, dim, bias=False)
+                self.adaln_modulation = nn.Linear(64, 4 * dim)
+
+        class Ideogram4Transformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head_dim = head_dim
+                self.layers = nn.ModuleList([Ideogram4TransformerBlock()])
+
+        model = Ideogram4Transformer()
+        full_qkv = model.layers[0].attention.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.layers[0].attention.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "layers.0.attention.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
 
 class TestAnimaTP:
     """Anima is MiniTrainDIT plus an unreplicated llm_adapter outside `blocks`."""
