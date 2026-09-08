@@ -1511,6 +1511,123 @@ class TestWanS2VTP:
         assert out_lin.out_features == dim
 
 
+class TestAnimateWanFaceAdapterTP:
+    """AnimateWanModel: sibling ``face_adapter`` is FaceBlock attention.
+
+    ``linear1_q`` is unfused Q, ``linear1_kv`` is packed [K|V], ``linear2``
+    is the out-proj (global Flux ``linear2`` exclude must not apply).
+    ``heads_num`` drives the rearrange. Root ``face_encoder.out_proj`` and
+    ``pose_patch_embedding`` stay unreplicated.
+    """
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Wan = type("WanModel", (), {})
+        Animate = type("AnimateWanModel", (Wan,), {})
+        assert get_tp_targets(Animate()) == ["blocks", "face_adapter"]
+        assert "WanModel" in TP_HEAD_SPLIT_MODELS
+
+    def test_face_adapter_packed_kv_and_linear2_rowwise(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = dim // n_heads
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = SelfAttn()
+
+        class FaceBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads_num = n_heads
+                self.head_dim = head_dim
+                self.linear1_kv = nn.Linear(dim, dim * 2, bias=True)
+                self.linear1_q = nn.Linear(dim, dim, bias=True)
+                self.linear2 = nn.Linear(dim, dim, bias=True)
+                self.q_norm = nn.RMSNorm(head_dim)
+                self.k_norm = nn.RMSNorm(head_dim)
+
+        class FaceAdapter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads_num = n_heads
+                self.fuser_blocks = nn.ModuleList([FaceBlock()])
+
+        class FaceEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 4
+                self.out_proj = nn.Linear(1024, dim, bias=True)
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.blocks = nn.ModuleList([Block()])
+
+        class AnimateWanModel(WanModel):
+            def __init__(self):
+                super().__init__()
+                self.pose_patch_embedding = nn.Conv3d(16, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.face_adapter = FaceAdapter()
+                self.face_encoder = FaceEncoder()
+
+        model = AnimateWanModel()
+        orig_kv = model.face_adapter.fuser_blocks[0].linear1_kv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+
+        fb = model.face_adapter.fuser_blocks[0]
+        assert isinstance(fb.linear1_q, ParallelLinear)
+        assert fb.linear1_q.mode == "colwise"
+        assert fb.linear1_q.pack_count == 1
+        assert isinstance(fb.linear1_kv, ParallelLinear)
+        assert fb.linear1_kv.mode == "colwise"
+        assert fb.linear1_kv.pack_count == 2
+        assert fb.linear1_kv.local_out_features == dim
+        assert isinstance(fb.linear2, ParallelLinear)
+        assert fb.linear2.mode == "rowwise"
+        assert fb.heads_num == n_heads // 2
+        assert model.face_adapter.heads_num == n_heads // 2
+        assert model.blocks[0].self_attn.num_heads == n_heads // 2
+
+        # Per-head QK norms stay full head_dim.
+        assert tuple(fb.q_norm.weight.shape) == (head_dim,)
+        assert not isinstance(model.face_encoder.out_proj, ParallelLinear)
+        assert model.face_encoder.num_heads == 4
+        assert isinstance(model.pose_patch_embedding, nn.Conv3d)
+
+        # Packed [K|V]: rank 0 holds the first half of each pack, concatenated.
+        import torch
+        fb.linear1_kv.load_shard(orig_kv)
+        k_pack, v_pack = orig_kv[:dim], orig_kv[dim:]
+        local = dim // 2
+        expected = torch.cat([k_pack[:local], v_pack[:local]], dim=0)
+        assert torch.allclose(fb.linear1_kv.weight.data, expected)
+
+
 class TestHumoWanTP:
     """HumoWanModel: Wan Q-split plus audio cross-attn under blocks.
 

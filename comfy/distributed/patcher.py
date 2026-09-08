@@ -43,8 +43,9 @@ def _is_linear_layer(module):
 # Mapping of inner diffusion model class names to their TP target prefixes.
 # Keys must match the __name__ of the inner diffusion model class (not the BaseModel wrapper).
 # Subclasses are handled via MRO walk, so e.g. Anima(MiniTrainDIT) /
-# CausalWanModel(WanModel) inherit the parent entry. VaceWanModel and
-# WanModel_S2V have their own entries so sibling attention stacks shard.
+# CausalWanModel(WanModel) inherit the parent entry. VaceWanModel,
+# WanModel_S2V, and AnimateWanModel have their own entries so sibling
+# attention stacks shard.
 TP_TARGETS = {
     "Flux": ["double_blocks", "single_blocks"],
     "OpenAISignatureMMDITWrapper": ["joint_blocks"],  # SD3 MMDiT (not "blocks")
@@ -68,6 +69,10 @@ TP_TARGETS = {
     # S2V: sibling audio_injector is WanT2VCrossAttention. AdaLN on the
     # injector chunks 2*dim and is skipped by name (see parallelize_model).
     "WanModel_S2V": ["blocks", "audio_injector"],
+    # Animate: sibling face_adapter FaceBlocks. Packed linear1_kv [K|V],
+    # linear1_q colwise, linear2 rowwise (un-exclude Flux fused linear2).
+    # face_encoder / pose_patch_embedding stay unreplicated.
+    "AnimateWanModel": ["blocks", "face_adapter"],
     "LTXVModel": ["transformer_blocks"],               # LTXV + LTXAV (MLP-only)
     "HunyuanVideo": ["double_blocks", "single_blocks"],  # packed double-stream QKV; linear1 stays
     "Chroma": ["double_blocks", "single_blocks"],          # Flux blocks, not a Flux subclass
@@ -329,6 +334,8 @@ def _packed_colwise_count(name, mro_names, module=None):
             return 2
     if "NaDiT" in mro_names and ".proj_qkv." in name:
         return 3
+    if "AnimateWanModel" in mro_names and name.endswith(".linear1_kv"):
+        return 2
     if mro_names & _PACKED_QKV_FAMILIES:
         if (
             name.endswith(".qkv")
@@ -459,9 +466,9 @@ TP_HEAD_SPLIT_MODELS = {
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q", "to_query")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q", "to_query", "linear1_q")
 # Attribute names for head count / head dim.
-_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads")
+_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads", "heads_num")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
 _DIM_HEAD_ATTRS = ("dim_head", "head_dim", "dim_heads", "headdim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).
@@ -804,6 +811,9 @@ def parallelize_model(model, sd=None, prefix=""):
         excluded_names = tuple(
             e for e in excluded_names if e not in (".attn.qkv", ".attn.proj")
         )
+    if "AnimateWanModel" in mro_names:
+        # FaceBlock.linear2 is the attention out-proj, not Flux fused linear2.
+        excluded_names = tuple(e for e in excluded_names if e != "linear2")
     if mro_names & _DOUBLE_STREAM_QKV_FAMILIES:
         excluded_names = tuple(e for e in excluded_names if e not in _DOUBLE_STREAM_ATTN_TP)
     if mro_names & _SD3_QKV_FAMILIES:
@@ -913,6 +923,10 @@ def parallelize_model(model, sd=None, prefix=""):
                             name.endswith(".attn.out")
                             or name.endswith(".mlp.2")
                         )
+                    )
+                    or (
+                        "AnimateWanModel" in mro_names
+                        and name.endswith(".linear2")
                     )
                 ):
                     # `.net.2` covers QwenImage's MLP down-projection
