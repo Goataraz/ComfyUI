@@ -4459,6 +4459,52 @@ class TestParallelizeModelLoRA:
         naive = full_qkv[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
+    def test_nadit_packed_proj_qkv_vid_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class MMLinear(nn.Module):
+            def __init__(self, in_f, out_f):
+                super().__init__()
+                self.vid = nn.Linear(in_f, out_f, bias=False)
+                self.txt = nn.Linear(in_f, out_f, bias=False)
+
+        class NaMMAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.proj_qkv = MMLinear(dim, dim * 3)
+                self.proj_out = MMLinear(dim, dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = NaMMAttention()
+
+        class NaDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = NaDiT()
+        full_qkv = model.blocks[0].attn.proj_qkv.vid.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn.proj_qkv.vid
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(
+            layer, full_qkv, "blocks.0.attn.proj_qkv.vid.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
 
 class TestAnimaTP:
     """Anima is MiniTrainDIT plus an unreplicated llm_adapter outside `blocks`."""
