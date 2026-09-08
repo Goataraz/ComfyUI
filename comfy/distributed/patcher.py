@@ -129,6 +129,11 @@ TP_TARGETS = {
     # so input_proj / cond_embed / ada_ln_blocks (chunk 6) / final_layer stay.
     "TransEncoder": ["res_blocks"],
     "DiffHead": ["net.res_blocks"],
+    # Wan Uni3C controlnet: standalone WanSelfAttention stack. Prefix
+    # controlnet_blocks so patch embedding / proj_in / proj_out stay —
+    # proj_out residual adds onto full-width main Wan hidden. AdaLN
+    # norm*.linear (chunk 3*dim) is skipped by name.
+    "WanUni3CControlnet": ["controlnet_blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -476,6 +481,7 @@ TP_HEAD_SPLIT_MODELS = {
     "HiDreamO1Transformer",
     "TransEncoder",
     "DiffHead",
+    "WanUni3CControlnet",
 }
 
 # Attribute names used for the Q projection across architectures.
@@ -850,6 +856,10 @@ def parallelize_model(model, sd=None, prefix=""):
                     # AdaLayerNorm.linear is Linear(dim, 2*dim) then chunk(2).
                     # injector_adain_output_layers is Linear(dim, dim) added
                     # onto full-width x. Both stay replicated.
+                    continue
+                if "WanUni3CControlnet" in mro_names and name.endswith(".linear"):
+                    # Uni3CLayerNormZero.linear is Linear(time_dim, 3*dim)
+                    # then chunk(3). Stay full-width.
                     continue
 
                 # Skip scaled/quantized linears — ParallelLinear has no weight_scale

@@ -331,8 +331,19 @@ class ModelPatchLoader:
             if denoise_encoder_sd:
                 model.denoise_encoder_sd = denoise_encoder_sd
 
-        model_patcher = comfy.model_patcher.CoreModelPatcher(model, load_device=comfy.model_management.get_torch_device(), offload_device=comfy.model_management.unet_offload_device())
-        model.load_state_dict(sd, assign=model_patcher.is_dynamic())
+        from comfy.sd import _apply_tensor_parallelism
+        tp_load, tp_off = _apply_tensor_parallelism(model, sd, prefix="")
+        if tp_load is not None:
+            model_patcher = comfy.model_patcher.CoreModelPatcher(
+                model, load_device=tp_load, offload_device=tp_off)
+            model.load_state_dict(sd, assign=model_patcher.is_dynamic(), strict=False)
+        else:
+            model_patcher = comfy.model_patcher.CoreModelPatcher(
+                model,
+                load_device=comfy.model_management.get_torch_device(),
+                offload_device=comfy.model_management.unet_offload_device(),
+            )
+            model.load_state_dict(sd, assign=model_patcher.is_dynamic())
         return (model_patcher,)
 
 

@@ -1773,6 +1773,107 @@ class TestBitDanceTransEncoderTP:
         assert not isinstance(model.net.ada_ln_blocks[0], ParallelLinear)
 
 
+class TestWanUni3CTP:
+    """WanUni3CControlnet is a standalone WanSelfAttention stack, not a WanModel.
+
+    Prefix ``controlnet_blocks`` so patch embedding / proj_in / proj_out stay
+    full-width (proj_out residual adds onto the main Wan hidden). AdaLN
+    ``norm*.linear`` chunks 3*dim and must stay unreplicated.
+    """
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Uni = type("WanUni3CControlnet", (), {})
+        assert get_tp_targets(Uni()) == ["controlnet_blocks"]
+        assert "WanUni3CControlnet" in TP_HEAD_SPLIT_MODELS
+
+    def test_controlnet_blocks_shard_proj_and_adain_stay(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = dim // n_heads
+        time_dim = 256
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class AdaLN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(time_dim, dim * 3, bias=True)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm1 = AdaLN()
+                self.self_attn = SelfAttn()
+                self.norm2 = AdaLN()
+                self.ffn = nn.ModuleList([
+                    nn.Linear(dim, dim * 4, bias=True),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim, bias=True),
+                ])
+
+        class WanUni3CControlnet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.controlnet_patch_embedding = nn.Conv3d(36, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.proj_in = nn.Linear(dim, dim)
+                self.controlnet_blocks = nn.ModuleList([Block()])
+                self.proj_out = nn.ModuleList([nn.Linear(dim, 256)])
+
+        model = WanUni3CControlnet()
+        orig_norm = model.controlnet_blocks[0].self_attn.norm_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+
+        attn = model.controlnet_blocks[0].self_attn
+        assert isinstance(attn.q, ParallelLinear)
+        assert attn.q.mode == "colwise"
+        assert isinstance(attn.o, ParallelLinear)
+        assert attn.o.mode == "rowwise"
+        assert attn.num_heads == n_heads // 2
+        assert isinstance(model.controlnet_blocks[0].ffn[0], ParallelLinear)
+        assert model.controlnet_blocks[0].ffn[0].mode == "colwise"
+        assert isinstance(model.controlnet_blocks[0].ffn[2], ParallelLinear)
+        assert model.controlnet_blocks[0].ffn[2].mode == "rowwise"
+
+        adaln = model.controlnet_blocks[0].norm1.linear
+        assert isinstance(adaln, nn.Linear)
+        assert not isinstance(adaln, ParallelLinear)
+        assert adaln.out_features == dim * 3
+        assert isinstance(model.proj_in, nn.Linear)
+        assert not isinstance(model.proj_in, ParallelLinear)
+        assert isinstance(model.proj_out[0], nn.Linear)
+        assert not isinstance(model.proj_out[0], ParallelLinear)
+        assert model.proj_out[0].out_features == 256
+        assert isinstance(model.controlnet_patch_embedding, nn.Conv3d)
+
+        local_dim = (n_heads // 2) * head_dim
+        import torch
+        assert tuple(attn.norm_q.weight.shape) == (local_dim,)
+        assert torch.allclose(attn.norm_q.weight.data, orig_norm[:local_dim])
+
+
 class TestHumoWanTP:
     """HumoWanModel: Wan Q-split plus audio cross-attn under blocks.
 
@@ -4851,6 +4952,104 @@ class TestParallelizeModelLoRA:
         got, expected = self._identity_lora(layer, full_q, "blocks.0.self_attn.q.weight")
         torch.testing.assert_close(got, expected)
         naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_bitdance_packed_wqkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, n_heads, head_dim = 64, 8, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_head = n_heads
+                self.head_dim = head_dim
+                self.wqkv = nn.Linear(dim, dim * 3, bias=False)
+                self.wo = nn.Linear(dim, dim, bias=False)
+
+        class TransBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = nn.Linear(dim, dim, bias=False)
+
+        class TransEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.res_blocks = nn.ModuleList([TransBlock()])
+
+        model = TransEncoder()
+        full_qkv = model.res_blocks[0].attn.wqkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.res_blocks[0].attn.wqkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "res_blocks.0.attn.wqkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_animate_packed_linear1_kv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, n_heads, head_dim = 64, 8, 8
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class FaceBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads_num = n_heads
+                self.head_dim = head_dim
+                self.linear1_kv = nn.Linear(dim, dim * 2, bias=False)
+                self.linear1_q = nn.Linear(dim, dim, bias=False)
+                self.linear2 = nn.Linear(dim, dim, bias=False)
+
+        class FaceAdapter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads_num = n_heads
+                self.fuser_blocks = nn.ModuleList([FaceBlock()])
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Module()])
+                self.blocks[0].self_attn = SelfAttn()
+
+        class AnimateWanModel(WanModel):
+            def __init__(self):
+                super().__init__()
+                self.face_adapter = FaceAdapter()
+
+        model = AnimateWanModel()
+        full_kv = model.face_adapter.fuser_blocks[0].linear1_kv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.face_adapter.fuser_blocks[0].linear1_kv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 2
+        got, expected = self._identity_lora(
+            layer, full_kv, "face_adapter.fuser_blocks.0.linear1_kv.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_kv[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
     def test_hidream_o1_vision_packed_qkv_lora(self, monkeypatch):
