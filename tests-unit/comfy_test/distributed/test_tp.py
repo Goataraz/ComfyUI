@@ -3969,10 +3969,10 @@ class TestParallelizeModelLoRA:
     """LoRA diffs must follow ParallelLinear shards after parallelize_model.
 
     Packed-colwise LoRA is already covered at ParallelLinear. These tests
-    run the real patcher on unfused Qwen/Wan/Kandinsky/MiniTrainDIT, packed
-    HiDreamO1 vision QKV, and NextDiT fused GQA qkv (pack_sizes), then apply
-    LoRAAdapter.calculate_weight to the resulting shards — the path live
-    LoRA e2e still needs.
+    run the real patcher on unfused Qwen/Wan/Kandinsky/MiniTrainDIT/ACE 1.5,
+    packed HiDreamO1 vision / NextDiT GQA / Ideogram / Flux / MiniMax H3 QKV,
+    then apply LoRAAdapter.calculate_weight to the resulting shards — the
+    path live LoRA e2e still needs.
     """
 
     def _mesh(self, monkeypatch, rank=0, world_size=2):
@@ -4414,6 +4414,50 @@ class TestParallelizeModelLoRA:
         naive = full_q[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
         assert isinstance(model.lyric_encoder.q_proj, nn.Linear)
+
+    def test_minimax_packed_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim, ffn = 128, 8, 16, 128
+        inner = heads * head_dim
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.qkv_proj = nn.Linear(dim, inner * 3, bias=False)
+                self.out_proj = nn.Linear(inner, dim, bias=False)
+
+        class DiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.mlp = nn.Module()
+                self.mlp.fc1 = nn.Linear(dim, ffn * 2, bias=False)
+                self.mlp.fc2 = nn.Linear(ffn, dim, bias=False)
+                self.adaln_proj = nn.Module()
+                self.adaln_proj.linear = nn.Linear(64, 6 * dim * 3)
+
+        class MiniMaxH3Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([DiTBlock()])
+
+        model = MiniMaxH3Model()
+        full_qkv = model.blocks[0].attn.qkv_proj.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn.qkv_proj
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "blocks.0.attn.qkv_proj.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
 
 
 class TestAnimaTP:
