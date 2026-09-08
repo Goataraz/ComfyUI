@@ -3969,9 +3969,10 @@ class TestParallelizeModelLoRA:
     """LoRA diffs must follow ParallelLinear shards after parallelize_model.
 
     Packed-colwise LoRA is already covered at ParallelLinear. These tests
-    run the real patcher on unfused Qwen/Wan/Kandinsky and packed HiDreamO1
-    vision QKV, then apply LoRAAdapter.calculate_weight to the resulting
-    shards — the path Qwen/Wan LoRA e2e still needs.
+    run the real patcher on unfused Qwen/Wan/Kandinsky/MiniTrainDIT, packed
+    HiDreamO1 vision QKV, and NextDiT fused GQA qkv (pack_sizes), then apply
+    LoRAAdapter.calculate_weight to the resulting shards — the path live
+    LoRA e2e still needs.
     """
 
     def _mesh(self, monkeypatch, rank=0, world_size=2):
@@ -4231,6 +4232,53 @@ class TestParallelizeModelLoRA:
         got, expected = self._identity_lora(layer, full_q, "blocks.0.self_attn.q_proj.weight")
         torch.testing.assert_close(got, expected)
         naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_nextdit_packed_gqa_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, kv_heads, head_dim = 128, 8, 4, 16
+        qkv_out = (heads + kv_heads + kv_heads) * head_dim
+
+        class JointAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_local_heads = heads
+                self.n_local_kv_heads = kv_heads
+                self.n_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, qkv_out, bias=False)
+                self.out = nn.Linear(heads * head_dim, dim, bias=False)
+
+        class JointTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = JointAttention()
+                self.feed_forward = nn.Module()
+                self.feed_forward.w1 = nn.Linear(dim, dim * 2, bias=False)
+                self.feed_forward.w3 = nn.Linear(dim, dim * 2, bias=False)
+                self.feed_forward.w2 = nn.Linear(dim * 2, dim, bias=False)
+
+        class NextDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_heads = heads
+                self.layers = nn.ModuleList([JointTransformerBlock()])
+
+        model = NextDiT()
+        full_qkv = model.layers[0].attention.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.layers[0].attention.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_sizes == (heads * head_dim, kv_heads * head_dim, kv_heads * head_dim)
+        assert getattr(layer.weight, "_tp_pack_sizes", None) == layer.pack_sizes
+        got, expected = self._identity_lora(layer, full_qkv, "layers.0.attention.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
 
