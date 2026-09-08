@@ -3969,10 +3969,12 @@ class TestParallelizeModelLoRA:
     """LoRA diffs must follow ParallelLinear shards after parallelize_model.
 
     Packed-colwise LoRA is already covered at ParallelLinear. These tests
-    run the real patcher on unfused Qwen/Wan/Kandinsky/MiniTrainDIT/ACE 1.5,
-    packed HiDreamO1 vision / NextDiT GQA / Ideogram / Flux / MiniMax H3 QKV,
-    then apply LoRAAdapter.calculate_weight to the resulting shards — the
-    path live LoRA e2e still needs.
+    run the real patcher on unfused Qwen/Wan/Kandinsky/MiniTrainDIT/ACE 1.0/1.5
+    / Krea / Ernie / Boogu Q-split, packed HiDreamO1 vision / NextDiT GQA /
+    Ideogram / Flux / MiniMax H3 / PixArt / HunyuanDiT Wqkv / TripoSplat /
+    SD3 joint QKV / Audio DiT to_qkv (pack 3 and differential pack 5), then
+    apply LoRAAdapter.calculate_weight to the resulting shards — the path
+    live LoRA e2e still needs.
     """
 
     def _mesh(self, monkeypatch, rank=0, world_size=2):
@@ -4500,6 +4502,499 @@ class TestParallelizeModelLoRA:
         assert layer.pack_count == 3
         got, expected = self._identity_lora(
             layer, full_qkv, "blocks.0.attn.proj_qkv.vid.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_boogu_q_split_to_q_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, kv_heads, head_dim = 64, 8, 1, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kv_heads = kv_heads
+                self.dim_head = head_dim
+                self.to_q = nn.Linear(dim, heads * head_dim, bias=False)
+                self.to_k = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.to_v = nn.Linear(dim, kv_heads * head_dim, bias=False)
+                self.to_out = nn.Sequential(nn.Linear(heads * head_dim, dim, bias=False))
+
+        class OmniGen2TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+
+        class BooguTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.single_stream_layers = nn.ModuleList([OmniGen2TransformerBlock()])
+
+        model = BooguTransformer2DModel()
+        full_q = model.single_stream_layers[0].attn.to_q.weight.data.clone()
+        full_k = model.single_stream_layers[0].attn.to_k.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.single_stream_layers[0].attn.to_q
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        kv = model.single_stream_layers[0].attn.to_k
+        assert isinstance(kv, nn.Linear)
+        assert not isinstance(kv, ParallelLinear)
+        assert getattr(kv.weight, "_tp_mode", None) is None
+        torch.testing.assert_close(kv.weight.data, full_k)
+        got, expected = self._identity_lora(
+            layer, full_q, "single_stream_layers.0.attn.to_q.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_pixart_packed_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class AttentionKVCompress(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.sr_ratio = 1
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim, bias=False)
+
+        class PixArtMSBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = AttentionKVCompress()
+                self.cross_attn = nn.Module()
+                self.cross_attn.num_heads = heads
+                self.cross_attn.head_dim = head_dim
+                self.cross_attn.q_linear = nn.Linear(dim, dim, bias=False)
+                self.cross_attn.kv_linear = nn.Linear(dim, dim * 2, bias=False)
+                self.cross_attn.proj = nn.Linear(dim, dim, bias=False)
+
+        class PixArtMS(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.blocks = nn.ModuleList([PixArtMSBlock()])
+
+        model = PixArtMS()
+        full_qkv = model.blocks[0].attn.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "blocks.0.attn.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_pixart_packed_kv_linear_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class AttentionKVCompress(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.sr_ratio = 1
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim, bias=False)
+
+        class PixArtMSBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = AttentionKVCompress()
+                self.cross_attn = nn.Module()
+                self.cross_attn.num_heads = heads
+                self.cross_attn.head_dim = head_dim
+                self.cross_attn.q_linear = nn.Linear(dim, dim, bias=False)
+                self.cross_attn.kv_linear = nn.Linear(dim, dim * 2, bias=False)
+                self.cross_attn.proj = nn.Linear(dim, dim, bias=False)
+
+        class PixArtMS(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.blocks = nn.ModuleList([PixArtMSBlock()])
+
+        model = PixArtMS()
+        full_kv = model.blocks[0].cross_attn.kv_linear.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].cross_attn.kv_linear
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 2
+        got, expected = self._identity_lora(
+            layer, full_kv, "blocks.0.cross_attn.kv_linear.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_kv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_hunyuandit_packed_wqkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads = 64, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = dim // heads
+                self.Wqkv = nn.Linear(dim, dim * 3, bias=False)
+                self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        class HunYuanDiTBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn1 = Attention()
+
+        class HunYuanDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.blocks = nn.ModuleList([HunYuanDiTBlock()])
+
+        model = HunYuanDiT()
+        full_qkv = model.blocks[0].attn1.Wqkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn1.Wqkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "blocks.0.attn1.Wqkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_triposplat_packed_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class RopeMultiHeadAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.out = nn.Linear(dim, dim, bias=False)
+
+        class UnifiedTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = RopeMultiHeadAttention()
+
+        class LatentSeqMMFlowModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.blocks = nn.ModuleList([UnifiedTransformerBlock()])
+
+        model = LatentSeqMMFlowModel()
+        full_qkv = model.blocks[0].attn.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "blocks.0.attn.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_krea_unfused_wq_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, kvheads, headdim = 64, 8, 2, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.kvheads = kvheads
+                self.headdim = headdim
+                self.wq = nn.Linear(dim, heads * headdim, bias=False)
+                self.wk = nn.Linear(dim, kvheads * headdim, bias=False)
+                self.wv = nn.Linear(dim, kvheads * headdim, bias=False)
+                self.wo = nn.Linear(dim, dim, bias=False)
+
+        class SingleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+
+        class SingleStreamDiT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.blocks = nn.ModuleList([SingleStreamBlock()])
+
+        model = SingleStreamDiT()
+        full_q = model.blocks[0].attn.wq.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].attn.wq
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        got, expected = self._identity_lora(layer, full_q, "blocks.0.attn.wq.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_ernie_unfused_to_q_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.head_dim = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.to_k = nn.Linear(dim, dim, bias=False)
+                self.to_v = nn.Linear(dim, dim, bias=False)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attention = Attention()
+
+        class ErnieImageModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.layers = nn.ModuleList([Block()])
+
+        model = ErnieImageModel()
+        full_q = model.layers[0].self_attention.to_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.layers[0].self_attention.to_q
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        got, expected = self._identity_lora(
+            layer, full_q, "layers.0.self_attention.to_q.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_ace10_unfused_to_q_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads = 64, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.to_k = nn.Linear(dim, dim, bias=False)
+                self.to_v = nn.Linear(dim, dim, bias=False)
+                self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+
+        class LinearTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+
+        class ACEStepTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = heads
+                self.transformer_blocks = nn.ModuleList([LinearTransformerBlock()])
+
+        model = ACEStepTransformer2DModel()
+        full_q = model.transformer_blocks[0].attn.to_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.transformer_blocks[0].attn.to_q
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        got, expected = self._identity_lora(
+            layer, full_q, "transformer_blocks.0.attn.to_q.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_sd3_packed_joint_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attn()
+
+        class JointBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.x_block = Block()
+                self.context_block = Block()
+
+        class OpenAISignatureMMDITWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.joint_blocks = nn.ModuleList([JointBlock()])
+
+        model = OpenAISignatureMMDITWrapper()
+        full_qkv = model.joint_blocks[0].x_block.attn.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.joint_blocks[0].x_block.attn.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(
+            layer, full_qkv, "joint_blocks.0.x_block.attn.qkv.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_audio_dit_packed_to_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class SelfAttention(nn.Module):
+            def __init__(self, pack=3):
+                super().__init__()
+                self.num_heads = heads
+                self.kv_heads = heads
+                self.dim_heads = head_dim
+                self.to_qkv = nn.Linear(dim, dim * pack, bias=False)
+                self.to_out = nn.Linear(dim, dim, bias=False)
+
+        class TransformerBlock(nn.Module):
+            def __init__(self, pack=3):
+                super().__init__()
+                self.self_attn = SelfAttention(pack=pack)
+
+        class ContinuousTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([
+                    TransformerBlock(pack=3),
+                    TransformerBlock(pack=5),
+                ])
+
+        class AudioDiffusionTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = ContinuousTransformer()
+
+        model = AudioDiffusionTransformer()
+        full_qkv = model.transformer.layers[0].self_attn.to_qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.transformer.layers[0].self_attn.to_qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(
+            layer, full_qkv, "transformer.layers.0.self_attn.to_qkv.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_audio_dit_differential_to_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class SelfAttention(nn.Module):
+            def __init__(self, pack=3):
+                super().__init__()
+                self.num_heads = heads
+                self.kv_heads = heads
+                self.dim_heads = head_dim
+                self.to_qkv = nn.Linear(dim, dim * pack, bias=False)
+                self.to_out = nn.Linear(dim, dim, bias=False)
+
+        class TransformerBlock(nn.Module):
+            def __init__(self, pack=3):
+                super().__init__()
+                self.self_attn = SelfAttention(pack=pack)
+
+        class ContinuousTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([
+                    TransformerBlock(pack=3),
+                    TransformerBlock(pack=5),
+                ])
+
+        class AudioDiffusionTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = ContinuousTransformer()
+
+        model = AudioDiffusionTransformer()
+        full_qkv = model.transformer.layers[1].self_attn.to_qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.transformer.layers[1].self_attn.to_qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 5
+        got, expected = self._identity_lora(
+            layer, full_qkv, "transformer.layers.1.self_attn.to_qkv.weight",
         )
         torch.testing.assert_close(got, expected)
         naive = full_qkv[: layer.weight.shape[0]]
