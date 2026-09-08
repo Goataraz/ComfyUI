@@ -3977,7 +3977,8 @@ class TestParallelizeModelLoRA:
     JoyImage img_attn_qkv / Lens img_qkv / PixelDiT qkv_x / Mochi qkv_x+w1,
     then apply LoRAAdapter.calculate_weight to the resulting shards — the
     path live LoRA e2e still needs. Colwise Q/QKV plus rowwise output
-    projections (Qwen to_out, Flux img_attn.proj, SD3 attn.proj).
+    projections (Qwen to_out, Flux img_attn.proj, SD3 attn.proj). MLP-only
+    LTX / GeneralDIT: LoRA shards the MLP and leaves attention unreplicated.
     """
 
     def _mesh(self, monkeypatch, rank=0, world_size=2):
@@ -5569,6 +5570,123 @@ class TestParallelizeModelLoRA:
         )
         torch.testing.assert_close(got, expected)
         naive = full_proj[:, : layer.weight.shape[1]]
+        assert not torch.equal(got, naive)
+
+    def test_ltx_mlp_only_ff_proj_lora_attn_unreplicated(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+        inner_ff = dim * 4
+
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.heads = heads
+                self.dim_head = head_dim
+                self.to_q = nn.Linear(dim, dim, bias=False)
+                self.to_k = nn.Linear(dim, dim, bias=False)
+                self.to_v = nn.Linear(dim, dim, bias=False)
+                self.to_out = nn.Sequential(nn.Linear(dim, dim, bias=False))
+
+        class GELUApprox(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(dim, inner_ff, bias=False)
+
+        class FeedForward(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(GELUApprox(), nn.Identity(), nn.Linear(inner_ff, dim, bias=False))
+
+        class BasicTransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn1 = CrossAttention()
+                self.ff = FeedForward()
+
+        class LTXVModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([BasicTransformerBlock()])
+
+        model = LTXVModel()
+        full_ff = model.transformer_blocks[0].ff.net[0].proj.weight.data.clone()
+        full_q = model.transformer_blocks[0].attn1.to_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.transformer_blocks[0].ff.net[0].proj
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        attn_q = model.transformer_blocks[0].attn1.to_q
+        assert isinstance(attn_q, nn.Linear)
+        assert not isinstance(attn_q, ParallelLinear)
+        assert getattr(attn_q.weight, "_tp_mode", None) is None
+        torch.testing.assert_close(attn_q.weight.data, full_q)
+        got, expected = self._identity_lora(
+            layer, full_ff, "transformer_blocks.0.ff.net.0.proj.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_ff[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_generaldit_mlp_only_layer1_lora_attn_unreplicated(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim = 64
+
+        class Attn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.to_q = nn.Sequential(nn.Linear(dim, dim, bias=False))
+                self.to_out = nn.Sequential(nn.Linear(dim, dim, bias=False))
+
+        class BuildingBlock(nn.Module):
+            def __init__(self, kind):
+                super().__init__()
+                if kind == "mlp":
+                    self.block = nn.Module()
+                    self.block.layer1 = nn.Linear(dim, dim * 4, bias=False)
+                    self.block.layer2 = nn.Linear(dim * 4, dim, bias=False)
+                else:
+                    self.block = nn.Module()
+                    self.block.attn = Attn()
+
+        class TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([
+                    BuildingBlock("fa"), BuildingBlock("mlp"),
+                ])
+
+        class GeneralDIT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleDict({"block0": TransformerBlock()})
+
+        model = GeneralDIT()
+        full_mlp = model.blocks["block0"].blocks[1].block.layer1.weight.data.clone()
+        full_q = model.blocks["block0"].blocks[0].block.attn.to_q[0].weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks["block0"].blocks[1].block.layer1
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        attn_q = model.blocks["block0"].blocks[0].block.attn.to_q[0]
+        assert isinstance(attn_q, nn.Linear)
+        assert not isinstance(attn_q, ParallelLinear)
+        assert getattr(attn_q.weight, "_tp_mode", None) is None
+        torch.testing.assert_close(attn_q.weight.data, full_q)
+        got, expected = self._identity_lora(
+            layer, full_mlp, "blocks.block0.blocks.1.block.layer1.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_mlp[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
 
