@@ -4325,6 +4325,96 @@ class TestParallelizeModelLoRA:
         naive = full_qkv[: layer.weight.shape[0]]
         assert not torch.equal(got, naive)
 
+    def test_flux_packed_double_stream_qkv_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim = 128
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_attn = SelfAttention()
+                self.txt_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+                self.txt_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class Flux(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+
+        model = Flux()
+        full_qkv = model.double_blocks[0].img_attn.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.double_blocks[0].img_attn.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        got, expected = self._identity_lora(layer, full_qkv, "double_blocks.0.img_attn.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_ace15_unfused_q_proj_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        hidden, heads, kv_heads, head_dim = 128, 16, 8, 8
+        q_dim = heads * head_dim
+        kv_dim = kv_heads * head_dim
+
+        class AceStepAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.num_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(hidden, q_dim, bias=False)
+                self.k_proj = nn.Linear(hidden, kv_dim, bias=False)
+                self.v_proj = nn.Linear(hidden, kv_dim, bias=False)
+                self.o_proj = nn.Linear(q_dim, hidden, bias=False)
+
+        class AceStepDiTLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = AceStepAttention()
+
+        class AceStepConditionGenerationModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.decoder = nn.Module()
+                self.decoder.layers = nn.ModuleList([AceStepDiTLayer()])
+                self.lyric_encoder = nn.Module()
+                self.lyric_encoder.q_proj = nn.Linear(hidden, q_dim, bias=False)
+
+        model = AceStepConditionGenerationModel()
+        full_q = model.decoder.layers[0].self_attn.q_proj.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.decoder.layers[0].self_attn.q_proj
+        assert isinstance(layer, ParallelLinear)
+        got, expected = self._identity_lora(
+            layer, full_q, "decoder.layers.0.self_attn.q_proj.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+        assert isinstance(model.lyric_encoder.q_proj, nn.Linear)
+
 
 class TestAnimaTP:
     """Anima is MiniTrainDIT plus an unreplicated llm_adapter outside `blocks`."""
