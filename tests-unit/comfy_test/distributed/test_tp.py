@@ -1177,6 +1177,70 @@ class TestWanModelTP:
         import torch
         assert torch.allclose(attn.norm_q.weight.data, orig_norm[local_dim:])
 
+    def test_i2v_patch_embedding_and_img_emb_stay_unreplicated(self, monkeypatch):
+        """Wan I2V concat lives on root ``patch_embedding`` (Conv3d, extra
+        in_dim) and CLIP vision on ``img_emb.proj`` (name matches generic
+        rowwise ``proj``). Prefixes are ``blocks`` only — sharding either
+        would cut concat channels or CLIP vision width.
+        """
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.head_dim = 16
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = SelfAttn()
+
+        class MLPProj(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Sequential(
+                    nn.LayerNorm(1280),
+                    nn.Linear(1280, dim),
+                    nn.GELU(),
+                    nn.Linear(dim, dim),
+                )
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patch_embedding = nn.Conv3d(36, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.img_emb = MLPProj()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = WanModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.patch_embedding, nn.Conv3d)
+        assert not isinstance(model.patch_embedding, ParallelLinear)
+        assert model.patch_embedding.weight.shape[1] == 36
+        assert isinstance(model.img_emb.proj[1], nn.Linear)
+        assert not isinstance(model.img_emb.proj[1], ParallelLinear)
+        assert isinstance(model.img_emb.proj[3], nn.Linear)
+        assert not isinstance(model.img_emb.proj[3], ParallelLinear)
+        assert isinstance(model.blocks[0].self_attn.q, ParallelLinear)
+        assert model.blocks[0].self_attn.q.mode == "colwise"
+
 
 class TestTPParamNamesAndDeny:
     def test_sliced_norms_included_in_tp_param_names(self, monkeypatch):
