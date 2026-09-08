@@ -1093,6 +1093,57 @@ class TestCosmosGeneralDITTP:
         assert not isinstance(model.blocks["block0"].blocks[0].block.attn.to_q[0], ParallelLinear)
         assert model.blocks["block0"].blocks[1].block.attn.to_k[0].in_features == 1024
 
+    def test_i2v_x_embedder_proj_stays_unreplicated(self, monkeypatch):
+        """CosmosI2V (in_channels=17 + mask) uses PatchEmbed.proj Linear
+        whose name matches generic rowwise ``proj``. Prefixes are ``blocks``
+        so the extra concat stays full-width while MLP still shards.
+        """
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class PatchEmbed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # 72 = 18 in_ch * 2 * 2 * 1 patch (Video2World header)
+                self.proj = nn.Sequential(nn.Identity(), nn.Linear(72, dim))
+
+        class BuildingBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block = nn.Module()
+                self.block.layer1 = nn.Linear(dim, dim * 4)
+                self.block.layer2 = nn.Linear(dim * 4, dim)
+
+        class TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([BuildingBlock()])
+
+        class GeneralDIT(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.x_embedder = PatchEmbed()
+                self.blocks = nn.ModuleDict({"block0": TransformerBlock()})
+
+        model = GeneralDIT()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.x_embedder.proj[1], nn.Linear)
+        assert not isinstance(model.x_embedder.proj[1], ParallelLinear)
+        assert model.x_embedder.proj[1].in_features == 72
+        assert isinstance(model.blocks["block0"].blocks[0].block.layer1, ParallelLinear)
+        assert model.blocks["block0"].blocks[0].block.layer1.mode == "colwise"
+
 
 class TestWanModelTP:
     """WanModel: bare .q/.k/.v/.o naming, ffn.0/ffn.2, full-dim QK norm slice."""
@@ -1240,6 +1291,113 @@ class TestWanModelTP:
         assert not isinstance(model.img_emb.proj[3], ParallelLinear)
         assert isinstance(model.blocks[0].self_attn.q, ParallelLinear)
         assert model.blocks[0].self_attn.q.mode == "colwise"
+
+
+class TestHumoWanTP:
+    """HumoWanModel: Wan Q-split plus audio cross-attn under blocks.
+
+    Production 17B: dim=5120, 40 heads (divisible by 2), patch_embedding
+    in_dim=36, audio_proj at root, audio_cross_attn K/V from 1536.
+    """
+
+    def test_inherits_wan_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Wan = type("WanModel", (), {})
+        Humo = type("HumoWanModel", (Wan,), {})
+        assert get_tp_targets(Humo()) == ["blocks"]
+        assert "WanModel" in TP_HEAD_SPLIT_MODELS
+
+    def test_audio_cross_attn_shards_proj_stays(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        kv_dim = 48  # 1536-scale stand-in
+        n_heads = 8
+        head_dim = dim // n_heads
+
+        class DummyAdapterLayer(nn.Module):
+            def __init__(self, layer):
+                super().__init__()
+                self.layer = layer
+
+        class AudioProj(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.audio_proj_glob_1 = DummyAdapterLayer(nn.Linear(64, 32))
+                self.audio_proj_glob_3 = DummyAdapterLayer(nn.Linear(32, 16 * kv_dim))
+
+        class WanSelfAttention(nn.Module):
+            def __init__(self, in_kv=None):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                kv = dim if in_kv is None else in_kv
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(kv, dim, bias=False)
+                self.v = nn.Linear(kv, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+                self.norm_q = nn.RMSNorm(dim)
+                self.norm_k = nn.RMSNorm(dim)
+
+        class AudioCrossAttentionWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.audio_cross_attn = WanSelfAttention(in_kv=kv_dim)
+                self.norm1_audio = nn.LayerNorm(dim)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = WanSelfAttention()
+                self.audio_cross_attn_wrapper = AudioCrossAttentionWrapper()
+                self.ffn = nn.ModuleList([
+                    nn.Linear(dim, dim * 4),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim),
+                ])
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patch_embedding = nn.Conv3d(36, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+                self.audio_proj = AudioProj()
+                self.blocks = nn.ModuleList([Block()])
+
+        class HumoWanModel(WanModel):
+            pass
+
+        model = HumoWanModel()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.patch_embedding, nn.Conv3d)
+        assert model.patch_embedding.weight.shape[1] == 36
+        assert isinstance(model.audio_proj.audio_proj_glob_1.layer, nn.Linear)
+        assert not isinstance(model.audio_proj.audio_proj_glob_1.layer, ParallelLinear)
+        assert isinstance(model.audio_proj.audio_proj_glob_3.layer, nn.Linear)
+        assert not isinstance(model.audio_proj.audio_proj_glob_3.layer, ParallelLinear)
+        assert model.audio_proj.audio_proj_glob_3.layer.out_features == 16 * kv_dim
+
+        attn = model.blocks[0].self_attn
+        assert isinstance(attn.q, ParallelLinear) and attn.q.mode == "colwise"
+        assert attn.num_heads == n_heads // 2
+
+        audio = model.blocks[0].audio_cross_attn_wrapper.audio_cross_attn
+        assert isinstance(audio.q, ParallelLinear) and audio.q.mode == "colwise"
+        assert isinstance(audio.k, ParallelLinear) and audio.k.mode == "colwise"
+        assert audio.k.local_in_features == kv_dim
+        assert audio.k.local_out_features == dim // 2
+        assert isinstance(audio.o, ParallelLinear) and audio.o.mode == "rowwise"
+        assert audio.num_heads == n_heads // 2
+        assert tuple(audio.norm_q.weight.shape) == (dim // 2,)
 
 
 class TestTPParamNamesAndDeny:
