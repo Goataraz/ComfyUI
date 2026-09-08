@@ -1567,6 +1567,68 @@ class TestHunyuanVideoTP:
         assert model.single_blocks[0].num_heads == 8
         assert model.num_heads == 8
 
+    def test_i2v_img_in_proj_stays_unreplicated(self, monkeypatch):
+        """HunyuanVideoI2V (in_channels=33) still uses HunyuanVideo as the
+        diffusion class. ``img_in.proj`` is a Conv3d whose name matches the
+        generic rowwise ``proj`` keyword, but TP prefixes are
+        ``double_blocks`` / ``single_blocks`` so the extra concat channels
+        stay full-width. Sharding it would cut the 33-channel I2V concat.
+        """
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim)
+
+        class DoubleStreamBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_attn = SelfAttention()
+                self.txt_attn = SelfAttention()
+                self.img_mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+
+        class PatchEmbed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # 33 = HunyuanVideoI2V concat (16 latent + 16 image + 1 mask)
+                self.proj = nn.Conv3d(33, dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+
+        class HunyuanVideo(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 8
+                self.img_in = PatchEmbed()
+                self.double_blocks = nn.ModuleList([DoubleStreamBlock()])
+                self.single_blocks = nn.ModuleList()
+
+        model = HunyuanVideo()
+        assert patcher.parallelize_model(model) is True
+        assert isinstance(model.img_in.proj, nn.Conv3d)
+        assert not isinstance(model.img_in.proj, ParallelLinear)
+        assert model.img_in.proj.weight.shape[1] == 33
+        img_attn = model.double_blocks[0].img_attn
+        assert isinstance(img_attn.qkv, ParallelLinear)
+        assert img_attn.qkv.mode == "colwise"
+        assert img_attn.qkv.pack_count == 3
+        assert isinstance(img_attn.proj, ParallelLinear)
+        assert img_attn.proj.mode == "rowwise"
+
 
 class TestChromaTP:
     def test_chroma_packed_qkv_like_flux(self, monkeypatch):
