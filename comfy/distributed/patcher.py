@@ -125,6 +125,10 @@ TP_TARGETS = {
         "noise_refiner", "context_refiner", "blocks",
         "noise_repo_layers", "context_repo_layers", "repo_layers",
     ],
+    # BitDance 14B DiffHead.net: packed wqkv + SwiGLU w1. Prefix res_blocks
+    # so input_proj / cond_embed / ada_ln_blocks (chunk 6) / final_layer stay.
+    "TransEncoder": ["res_blocks"],
+    "DiffHead": ["net.res_blocks"],
 }
 
 # Keywords for determining TP sharding mode (rowwise = split input dim, colwise = split output dim)
@@ -302,6 +306,8 @@ _PACKED_QKV_FAMILIES = _DOUBLE_STREAM_QKV_FAMILIES | _SD3_QKV_FAMILIES | frozens
     "PixArtMS",
     "LatentSeqMMFlowModel",
     "HiDreamO1Transformer",
+    "TransEncoder",
+    "DiffHead",
 })
 
 
@@ -343,9 +349,14 @@ def _packed_colwise_count(name, mro_names, module=None):
             or name.endswith(".qkv_x")
             or name.endswith(".qkv_y")
             or name.endswith(".Wqkv")
+            or name.endswith(".wqkv")
         ):
             return 3
         if "AsymmDiTJoint" in mro_names and name.endswith(".w1"):
+            return 2
+        if "TransEncoder" in mro_names and name.endswith(".w1"):
+            return 2
+        if "DiffHead" in mro_names and name.endswith(".w1"):
             return 2
         if "HunYuanDiT" in mro_names and name.endswith(".kv_proj"):
             return 2
@@ -463,12 +474,14 @@ TP_HEAD_SPLIT_MODELS = {
     "ErnieImageModel",
     "LatentSeqMMFlowModel",
     "HiDreamO1Transformer",
+    "TransEncoder",
+    "DiffHead",
 }
 
 # Attribute names used for the Q projection across architectures.
-_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q", "to_query", "linear1_q")
+_Q_PROJ_ATTRS = ("to_q", "q_proj", "q", "qkv_proj", "qkv", "img_attn_qkv", "img_qkv", "qkv_x", "Wqkv", "q_linear", "to_qkv", "img_to_q", "instruct_to_q", "wq", "proj_qkv", "w1q", "w2q", "to_query", "linear1_q", "wqkv")
 # Attribute names for head count / head dim.
-_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads", "heads_num")
+_HEADS_ATTRS = ("heads", "n_heads", "num_heads", "num_attention_heads", "n_local_heads", "heads_num", "n_head")
 _KV_HEADS_ATTRS = ("num_kv_heads", "n_kv_heads", "kv_heads", "n_local_kv_heads", "kvheads")
 _DIM_HEAD_ATTRS = ("dim_head", "head_dim", "dim_heads", "headdim")
 # Full-dim QK norms that must be sliced under head-split (Wan / HiDream).

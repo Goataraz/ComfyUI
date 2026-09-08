@@ -1628,6 +1628,151 @@ class TestAnimateWanFaceAdapterTP:
         assert torch.allclose(fb.linear1_kv.weight.data, expected)
 
 
+class TestBitDanceTransEncoderTP:
+    """BitDance 14B DiffHead.net is TransEncoder: packed wqkv + SwiGLU.
+
+    Production: ch_latent=5120, 40 heads (÷2), wqkv.bias [15360],
+    use_swiglu=True. Prefix ``res_blocks`` so input_proj / cond_embed /
+    ada_ln_blocks (chunk 6) / final_layer stay full-width.
+    """
+
+    def test_targets(self):
+        from comfy.distributed.patcher import get_tp_targets, TP_HEAD_SPLIT_MODELS
+        Enc = type("TransEncoder", (), {})
+        Head = type("DiffHead", (), {})
+        assert get_tp_targets(Enc()) == ["res_blocks"]
+        assert get_tp_targets(Head()) == ["net.res_blocks"]
+        assert "TransEncoder" in TP_HEAD_SPLIT_MODELS
+        assert "DiffHead" in TP_HEAD_SPLIT_MODELS
+
+    def test_packed_wqkv_swiglu_ada_ln_stays(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim = 128
+        n_heads = 8
+        head_dim = dim // n_heads
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_head = n_heads
+                self.head_dim = head_dim
+                self.wqkv = nn.Linear(dim, dim * 3, bias=True)
+                self.wo = nn.Linear(dim, dim, bias=True)
+
+        class TransBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.w1 = nn.Linear(dim, dim * 2, bias=True)  # SwiGLU packed 2
+                self.w2 = nn.Linear(dim, dim, bias=True)
+
+        class TransEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.input_proj = nn.Linear(32, dim)
+                self.cond_embed = nn.Linear(dim, dim)
+                self.ada_ln_blocks = nn.ModuleList([nn.Linear(dim, dim * 6)])
+                self.res_blocks = nn.ModuleList([TransBlock()])
+
+        model = TransEncoder()
+        orig_qkv = model.res_blocks[0].attn.wqkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+
+        attn = model.res_blocks[0].attn
+        assert isinstance(attn.wqkv, ParallelLinear)
+        assert attn.wqkv.mode == "colwise"
+        assert attn.wqkv.pack_count == 3
+        assert attn.wqkv.local_out_features == dim * 3 // 2
+        assert isinstance(attn.wo, ParallelLinear)
+        assert attn.wo.mode == "rowwise"
+        assert attn.n_head == n_heads // 2
+
+        blk = model.res_blocks[0]
+        assert isinstance(blk.w1, ParallelLinear)
+        assert blk.w1.mode == "colwise"
+        assert blk.w1.pack_count == 2
+        assert isinstance(blk.w2, ParallelLinear)
+        assert blk.w2.mode == "rowwise"
+
+        assert isinstance(model.input_proj, nn.Linear)
+        assert not isinstance(model.input_proj, ParallelLinear)
+        assert isinstance(model.ada_ln_blocks[0], nn.Linear)
+        assert not isinstance(model.ada_ln_blocks[0], ParallelLinear)
+        assert model.ada_ln_blocks[0].out_features == dim * 6
+
+        attn.wqkv.load_shard(orig_qkv)
+        packs = [orig_qkv[i * dim:(i + 1) * dim] for i in range(3)]
+        local = dim // 2
+        expected = torch.cat([p[:local] for p in packs], dim=0)
+        assert torch.allclose(attn.wqkv.weight.data, expected)
+
+    def test_diffhead_shards_net_res_blocks(self, monkeypatch):
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        class FakeMesh:
+            world_size = 2
+            rank = 0
+            current_device = "cpu"
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+
+        dim, n_heads, head_dim = 64, 8, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.n_head = n_heads
+                self.head_dim = head_dim
+                self.wqkv = nn.Linear(dim, dim * 3, bias=True)
+                self.wo = nn.Linear(dim, dim, bias=True)
+
+        class TransBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = Attention()
+                self.w1 = nn.Linear(dim, dim * 2, bias=True)
+                self.w2 = nn.Linear(dim, dim, bias=True)
+
+        class Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.input_proj = nn.Linear(32, dim)
+                self.ada_ln_blocks = nn.ModuleList([nn.Linear(dim, dim * 6)])
+                self.res_blocks = nn.ModuleList([TransBlock()])
+
+        class DiffHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.net = Net()
+
+        model = DiffHead()
+        assert patcher.parallelize_model(model) is True
+        attn = model.net.res_blocks[0].attn
+        assert isinstance(attn.wqkv, ParallelLinear)
+        assert attn.wqkv.pack_count == 3
+        assert attn.n_head == n_heads // 2
+        assert isinstance(model.net.res_blocks[0].w1, ParallelLinear)
+        assert model.net.res_blocks[0].w1.pack_count == 2
+        assert isinstance(model.net.input_proj, nn.Linear)
+        assert not isinstance(model.net.input_proj, ParallelLinear)
+        assert not isinstance(model.net.ada_ln_blocks[0], ParallelLinear)
+
+
 class TestHumoWanTP:
     """HumoWanModel: Wan Q-split plus audio cross-attn under blocks.
 
