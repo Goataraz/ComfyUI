@@ -3951,3 +3951,230 @@ class TestMiniMaxH3TP:
         assert isinstance(mlp.fc2, ParallelLinear)
         assert mlp.fc2.mode == "rowwise"
         assert isinstance(model.blocks[0].adaln_proj.linear, nn.Linear)
+
+
+class TestParallelizeModelLoRA:
+    """LoRA diffs must follow ParallelLinear shards after parallelize_model.
+
+    Packed-colwise LoRA is already covered at ParallelLinear. These tests
+    run the real patcher on unfused Qwen/Wan/Kandinsky and packed HiDreamO1
+    vision QKV, then apply LoRAAdapter.calculate_weight to the resulting
+    shards — the path Qwen/Wan LoRA e2e still needs.
+    """
+
+    def _mesh(self, monkeypatch, rank=0, world_size=2):
+        from comfy.distributed import patcher
+        from comfy.distributed import parallel_linear as pl_module
+
+        class FakeMesh:
+            current_device = "cpu"
+        FakeMesh.world_size = world_size
+        FakeMesh.rank = rank
+        monkeypatch.setattr(patcher, "get_mesh", lambda: FakeMesh())
+        monkeypatch.setattr(pl_module, "get_mesh", lambda: FakeMesh())
+        # Production LoRA slicing keys off Parameter._tp_mode stamped by
+        # parallelize_model, not a global is_tp_active monkeypatch.
+
+    def _identity_lora(self, layer, full_weight, key):
+        import torch
+        from comfy.weight_adapter.lora import LoRAAdapter
+        from comfy.distributed.parallel_linear import copy_tp_shard_meta, shard_like_tp_weight
+
+        assert getattr(layer.weight, "_tp_mode", None) == layer.mode
+        full_out = full_weight.shape[0]
+        up = torch.eye(full_out, dtype=torch.float32)
+        adapter = LoRAAdapter(set(), (up, full_weight.detach().float().cpu(), None, None, None, None))
+        shard = torch.zeros_like(layer.weight.data)
+        copy_tp_shard_meta(layer.weight, shard)
+        got = adapter.calculate_weight(
+            shard, key, 1.0, 1.0, None, lambda x: x,
+        )
+        expected = shard_like_tp_weight(full_weight.detach().float().cpu(), layer.weight)
+        return got, expected
+
+    def test_qwen_unfused_to_q_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim = 64
+
+        class QwenBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = nn.Module()
+                self.attn.to_q = nn.Linear(dim, dim, bias=False)
+                self.attn.to_k = nn.Linear(dim, dim, bias=False)
+                self.attn.to_v = nn.Linear(dim, dim, bias=False)
+                self.attn.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+
+        class QwenImageTransformer2DModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([QwenBlock()])
+
+        model = QwenImageTransformer2DModel()
+        full_q = model.transformer_blocks[0].attn.to_q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.transformer_blocks[0].attn.to_q
+        assert isinstance(layer, ParallelLinear)
+        assert layer.mode == "colwise"
+        got, expected = self._identity_lora(layer, full_q, "transformer_blocks.0.attn.to_q.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_wan_unfused_q_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, n_heads, head_dim = 64, 8, 8
+
+        class SelfAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = n_heads
+                self.head_dim = head_dim
+                self.q = nn.Linear(dim, dim, bias=False)
+                self.k = nn.Linear(dim, dim, bias=False)
+                self.v = nn.Linear(dim, dim, bias=False)
+                self.o = nn.Linear(dim, dim, bias=False)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = SelfAttn()
+                self.ffn = nn.ModuleList([
+                    nn.Linear(dim, dim * 4, bias=False),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim, bias=False),
+                ])
+
+        class WanModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block()])
+
+        model = WanModel()
+        full_q = model.blocks[0].self_attn.q.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.blocks[0].self_attn.q
+        assert isinstance(layer, ParallelLinear)
+        got, expected = self._identity_lora(layer, full_q, "blocks.0.self_attn.q.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_hidream_o1_vision_packed_qkv_lora(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=0)
+        hidden, q_heads, kv_heads, head_dim = 64, 8, 4, 8
+        vis_dim, vis_heads = 64, 8
+
+        class Attention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = q_heads
+                self.num_kv_heads = kv_heads
+                self.head_dim = head_dim
+                self.q_proj = nn.Linear(hidden, q_heads * head_dim, bias=False)
+                self.k_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
+                self.v_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
+                self.o_proj = nn.Linear(q_heads * head_dim, hidden, bias=False)
+
+        class TransformerBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = Attention()
+
+        class Llama2_(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([TransformerBlock()])
+
+        class VisionAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = vis_heads
+                self.head_dim = vis_dim // vis_heads
+                self.qkv = nn.Linear(vis_dim, vis_dim * 3, bias=False)
+                self.proj = nn.Linear(vis_dim, vis_dim, bias=False)
+
+        class VisionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = VisionAttention()
+
+        class Qwen35VisionModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([VisionBlock()])
+
+        class HiDreamO1Transformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual = Qwen35VisionModel()
+                self.language_model = Llama2_()
+
+        model = HiDreamO1Transformer()
+        full_qkv = model.visual.blocks[0].attn.qkv.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.visual.blocks[0].attn.qkv
+        assert isinstance(layer, ParallelLinear)
+        assert layer.pack_count == 3
+        assert getattr(layer.weight, "_tp_pack_count", None) == 3
+        got, expected = self._identity_lora(layer, full_qkv, "visual.blocks.0.attn.qkv.weight")
+        torch.testing.assert_close(got, expected)
+        naive = full_qkv[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
+
+    def test_kandinsky_to_query_lora_rank1(self, monkeypatch):
+        import torch
+        import torch.nn as nn
+        from comfy.distributed import patcher
+        from comfy.distributed.parallel_linear import ParallelLinear
+
+        self._mesh(monkeypatch, rank=1)
+        dim, heads, head_dim = 64, 8, 8
+
+        class SelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = heads
+                self.head_dim = head_dim
+                self.to_query = nn.Linear(dim, dim, bias=False)
+                self.to_key = nn.Linear(dim, dim, bias=False)
+                self.to_value = nn.Linear(dim, dim, bias=False)
+                self.out_layer = nn.Linear(dim, dim, bias=False)
+
+        class TransformerEncoderBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attention = SelfAttention()
+
+        class Kandinsky5(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_transformer_blocks = nn.ModuleList([TransformerEncoderBlock()])
+                self.visual_transformer_blocks = nn.ModuleList([TransformerEncoderBlock()])
+
+        model = Kandinsky5()
+        full_q = model.text_transformer_blocks[0].self_attention.to_query.weight.data.clone()
+        assert patcher.parallelize_model(model) is True
+        layer = model.text_transformer_blocks[0].self_attention.to_query
+        assert isinstance(layer, ParallelLinear)
+        got, expected = self._identity_lora(
+            layer, full_q, "text_transformer_blocks.0.self_attention.to_query.weight",
+        )
+        torch.testing.assert_close(got, expected)
+        naive = full_q[: layer.weight.shape[0]]
+        assert not torch.equal(got, naive)
